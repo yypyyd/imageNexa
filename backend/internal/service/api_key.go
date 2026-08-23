@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"strings"
 	"time"
 
@@ -65,48 +64,6 @@ func (s *APIKeyService) Mint(ctx context.Context, userID string) (map[string]any
 
 func (s *APIKeyService) Revoke(ctx context.Context, userID string) error {
 	return s.keys.DeleteByUserID(ctx, userID)
-}
-
-func (s *APIKeyService) MintNamed(ctx context.Context, userID, name string, replace bool) (map[string]any, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = "default"
-	}
-	plain, err := generatePlainAPIKey()
-	if err != nil {
-		return nil, err
-	}
-	key := &model.APIKey{
-		ID:         "k-" + time.Now().Format("150405") + randomSuffix(2),
-		UserID:     userID,
-		Name:       name,
-		KeyPreview: previewAPIKey(plain),
-		KeyHash:    hashAPIKey(plain),
-		CreatedAt:  time.Now(),
-	}
-	if replace {
-		if err := s.keys.ReplaceForUser(ctx, userID, key); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := s.keys.Create(ctx, key); err != nil {
-			return nil, err
-		}
-	}
-	return map[string]any{
-		"ok":      true,
-		"key":     plain,
-		"preview": key.KeyPreview,
-		"id":      key.ID,
-		"name":    key.Name,
-	}, nil
-}
-
-func (s *APIKeyService) DeleteOne(ctx context.Context, userID, keyID string) error {
-	if strings.TrimSpace(keyID) == "" {
-		return errors.New("key id required")
-	}
-	return s.keys.DeleteByID(ctx, userID, keyID)
 }
 
 func generatePlainAPIKey() (string, error) {

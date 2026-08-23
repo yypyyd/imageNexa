@@ -156,12 +156,6 @@ func NewClient(apiKey, proxy string) *Client {
 	}
 }
 
-func (c *Client) SetProxy(proxy string) {
-	c.proxyMu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
-	c.proxyMu.Unlock()
-}
-
 func (c *Client) proxyValue() string {
 	c.proxyMu.RLock()
 	defer c.proxyMu.RUnlock()

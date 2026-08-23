@@ -114,20 +114,53 @@ func (c *Client) proxyValue() string {
 }
 
 func (c *Client) httpClient(useProxy bool) *http.Client {
-	if !useProxy && c.directClient != nil {
-		return c.directClient
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if useProxy {
-		if raw := c.proxyValue(); raw != "" {
-			if parsed, err := url.Parse(raw); err == nil {
-				transport.Proxy = http.ProxyURL(parsed)
-			}
+	if !useProxy {
+		if c.directClient != nil {
+			return c.directClient
 		}
-	} else {
-		transport.Proxy = nil
+		return c.httpClientVia("")
+	}
+	return c.httpClientVia(c.proxyValue())
+}
+
+// httpClientVia sends through one specific proxy URL, which the video path uses
+// to keep every request of a generation on the exit IP that minted its token.
+func (c *Client) httpClientVia(proxyURL string) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	if raw := strings.TrimSpace(proxyURL); raw != "" {
+		if parsed, err := url.Parse(raw); err == nil {
+			transport.Proxy = http.ProxyURL(parsed)
+		}
 	}
 	return &http.Client{Transport: transport}
+}
+
+// egressProxy reports the proxy a request has to leave through: the session
+// pinned to a token when the caller has one, otherwise the configured proxy.
+func (c *Client) egressProxy(proxyURL string) string {
+	if raw := strings.TrimSpace(proxyURL); raw != "" {
+		return raw
+	}
+	return c.proxyValue()
+}
+
+func (c *Client) egressClient(proxyURL string) *http.Client {
+	return c.httpClientVia(c.egressProxy(proxyURL))
+}
+
+// signHot mints a token together with the proxy session its requests must use.
+// Signers without a warm pool (tests) fall back to the plain signature and the
+// configured proxy.
+func (c *Client) signHot(ctx context.Context, account Account) (hotSignature, error) {
+	if hot, ok := c.signer.(hotSigner); ok {
+		return hot.SignHot(ctx, account)
+	}
+	sig, err := c.signer.Sign(ctx, account)
+	if err != nil {
+		return hotSignature{}, err
+	}
+	return hotSignature{Signature: sig, Proxy: c.proxyValue()}, nil
 }
 
 func setHeaders(req *http.Request, account Account, accept string) {

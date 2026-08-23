@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +25,8 @@ import (
 )
 
 const (
-	appBase       = "https://app.leonardo.ai"
-	graphqlURL    = "https://api.leonardo.ai/v1/graphql"
+	appBase    = "https://app.leonardo.ai"
+	graphqlURL = "https://api.leonardo.ai/v1/graphql"
 	// schemaVersion must track the web app's x-leo-schema-version header: the
 	// GraphQL gateway rejects a stale version with a generic
 	// INTERNAL_SERVER_ERROR / "An error occurred." on the Generate mutation.
@@ -53,12 +52,6 @@ type Client struct {
 
 func NewClient(proxy string) *Client {
 	return &Client{proxy: strings.TrimSpace(proxy), sessions: map[string]*Session{}}
-}
-
-func (c *Client) SetProxy(proxy string) {
-	c.proxyMu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
-	c.proxyMu.Unlock()
 }
 
 func (c *Client) proxyValue() string {
@@ -415,37 +408,6 @@ func (c *Client) downloadImage(ctx context.Context, imageURL string) ([]byte, er
 		return nil, fmt.Errorf("%w: image download http %d", ErrTemporaryUpstream, resp.StatusCode)
 	}
 	return body, nil
-}
-
-func stringValue(v any) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case nil:
-		return ""
-	default:
-		b, _ := json.Marshal(x)
-		return strings.TrimSpace(string(b))
-	}
-}
-
-func intValue(v any) int {
-	switch x := v.(type) {
-	case int:
-		return x
-	case int64:
-		return int(x)
-	case float64:
-		return int(x)
-	case json.Number:
-		n, _ := x.Int64()
-		return int(n)
-	case string:
-		n, _ := strconv.Atoi(strings.TrimSpace(x))
-		return n
-	default:
-		return 0
-	}
 }
 
 func emptyStringNil(v string) any {

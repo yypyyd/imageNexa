@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"backend/internal/model"
+
 	"gorm.io/gorm"
 )
 
@@ -259,15 +260,6 @@ func (r *EventRepository) CountBetween(ctx context.Context, start, end time.Time
 	return n, err
 }
 
-// CountPendingByUser returns how many generations the user currently has
-// in-flight (status=pending) — used to enforce the per-user concurrency limit.
-func (r *EventRepository) CountPendingByUser(ctx context.Context, userID string) (int64, error) {
-	var n int64
-	err := r.db.WithContext(ctx).Model(&model.EventLog{}).
-		Where("user_id = ? AND status = ?", userID, "pending").Count(&n).Error
-	return n, err
-}
-
 // DistinctUsersSince counts distinct (non-empty) user_ids active since `since`.
 func (r *EventRepository) DistinctUsersSince(ctx context.Context, since time.Time) (int64, error) {
 	var n int64
@@ -418,16 +410,6 @@ func (r *EventRepository) ClearFiles(ctx context.Context, relPaths []string) (in
 		return 0, result.Error
 	}
 	return result.RowsAffected, nil
-}
-
-// ClearRefFiles blanks the ref_files paths on one event (called after a
-// successful generation once the reference images are deleted from storage, so no
-// dangling reference_urls remain). The `refs` COUNT is kept for the log record.
-func (r *EventRepository) ClearRefFiles(ctx context.Context, eventID string) error {
-	return r.db.WithContext(ctx).
-		Model(&model.EventLog{}).
-		Where("id = ?", eventID).
-		Update("ref_files", nil).Error
 }
 
 // StaleEvent identifies a purged pending event so the caller can refund the
@@ -690,48 +672,6 @@ func (r *EventRepository) RecentByFile(ctx context.Context, limit int) ([]model.
 	return items, nil
 }
 
-func (r *EventRepository) ModelSuccessCounts(ctx context.Context) (map[string]int64, error) {
-	type row struct {
-		Model string `gorm:"column:model"`
-		Count int64  `gorm:"column:count"`
-	}
-	var rows []row
-	if err := r.db.WithContext(ctx).
-		Model(&model.EventLog{}).
-		Select("model, COUNT(*) AS count").
-		Where("status = ? AND model <> ''", "success").
-		Group("model").
-		Scan(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64, len(rows))
-	for _, item := range rows {
-		out[item.Model] = item.Count
-	}
-	return out, nil
-}
-
-func (r *EventRepository) UserSuccessCounts(ctx context.Context) (map[string]int64, error) {
-	type row struct {
-		UserID string `gorm:"column:user_id"`
-		Count  int64  `gorm:"column:count"`
-	}
-	var rows []row
-	if err := r.db.WithContext(ctx).
-		Model(&model.EventLog{}).
-		Select("user_id, COUNT(*) AS count").
-		Where("status = ? AND user_id <> ''", "success").
-		Group("user_id").
-		Scan(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64, len(rows))
-	for _, item := range rows {
-		out[item.UserID] = item.Count
-	}
-	return out, nil
-}
-
 func (r *EventRepository) DeleteAll(ctx context.Context) (int64, error) {
 	result := r.db.WithContext(ctx).Where("1 = 1").Delete(&model.EventLog{})
 	if result.Error != nil {
@@ -781,4 +721,3 @@ func (r *EventRepository) PendingByUser(ctx context.Context, userID, onlySource 
 	}
 	return &item, nil
 }
-

@@ -58,12 +58,6 @@ func NewClient(proxy string) *Client {
 	return &Client{proxy: strings.TrimSpace(proxy), creds: map[string]string{}, locks: map[string]*sync.Mutex{}}
 }
 
-func (c *Client) SetProxy(proxy string) {
-	c.proxyMu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
-	c.proxyMu.Unlock()
-}
-
 func (c *Client) proxyValue() string {
 	c.proxyMu.RLock()
 	defer c.proxyMu.RUnlock()
@@ -119,15 +113,6 @@ func buildCred(token, refresh, email, parentID string) string {
 		ParentID:     strings.TrimSpace(parentID),
 	})
 	return string(b)
-}
-
-// ParentIDFromCred returns the canvas parent node id supplied at import.
-func ParentIDFromCred(cred string) string {
-	cr, ok := parseCred(cred)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(cr.ParentID)
 }
 
 func looksLikeJWT(s string) bool {
@@ -193,15 +178,6 @@ func EmailFromCred(cred string) string {
 	}
 	if e := strings.TrimSpace(cr.Email); e != "" {
 		return e
-	}
-	return userIDFromToken(cr.Token)
-}
-
-// UserIDFromCred returns the JWT userId (== org_id used for credit/generation).
-func UserIDFromCred(cred string) string {
-	cr, ok := parseCred(cred)
-	if !ok {
-		return ""
 	}
 	return userIDFromToken(cr.Token)
 }
@@ -344,10 +320,6 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cred string) (map[stri
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
-
-func (c *Client) apiGet(ctx context.Context, token, url string) ([]byte, int, error) {
-	return c.apiGetP(ctx, token, url, false)
-}
 
 // apiGetP keeps the route explicit: account refresh/quota can use the proxy,
 // while polling and asset retrieval remain direct.

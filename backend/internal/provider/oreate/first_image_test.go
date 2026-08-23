@@ -34,6 +34,7 @@ func TestParseImageSSEErrors(t *testing.T) {
 
 func TestClaimFirstImageBonus(t *testing.T) {
 	var request imageRequest
+	var streamCookie string
 	bonusCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -44,6 +45,7 @@ func TestClaimFirstImageBonus(t *testing.T) {
 			}
 			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-img"}}`)
 		case "/oreate/sse/stream":
+			streamCookie = r.Header.Get("Cookie")
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Errorf("decode image request: %v", err)
 			}
@@ -58,7 +60,7 @@ func TestClaimFirstImageBonus(t *testing.T) {
 	defer server.Close()
 	client := NewClient("")
 	client.baseURL = server.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed", BID: "browser-bid"}})
+	client.SetSigner(stubSigner{sig: Signature{JT: "signed", BID: "browser-bid", Cookie: "_ga=GA1; __bid_n=fresh; OUID=browser-ouid"}})
 	url, err := client.ClaimFirstImageBonus(context.Background(), Account{Cookie: "OUID=device-1; ouss=session", Email: "user@example.com"})
 	if err != nil || url != "https://cdn.example/first" {
 		t.Fatalf("ClaimFirstImageBonus() = %q, %v", url, err)
@@ -71,6 +73,11 @@ func TestClaimFirstImageBonus(t *testing.T) {
 	}
 	if request.JT != "signed" || request.Extra.BID != "browser-bid" || request.Extra.DeviceID != "device-1" {
 		t.Fatalf("request identity = %#v", request)
+	}
+	// The request carries the tracking cookies the signer browser minted on top of
+	// the stored auth cookies; stored values win on name conflicts.
+	if streamCookie != "OUID=device-1; ouss=session; _ga=GA1; __bid_n=fresh" {
+		t.Fatalf("stream cookie = %q", streamCookie)
 	}
 }
 

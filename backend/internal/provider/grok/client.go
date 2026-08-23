@@ -100,17 +100,6 @@ func SessionIDFromToken(token string) string {
 	return strings.TrimSpace(stringValue(decodeJWTPayload(token)["session_id"]))
 }
 
-// ExtractAccountInfo returns the free (no-network) account view. grok sso has no
-// email/exp claim, so identity falls back to the session id.
-func ExtractAccountInfo(token string) map[string]any {
-	sid := SessionIDFromToken(token)
-	return map[string]any{
-		"email":      emptyStringNil(sid),
-		"session_id": emptyStringNil(sid),
-		"expires_at": nil,
-	}
-}
-
 // FetchCreditsBalance reads the account's live credit balance via the billing
 // gRPC-web endpoint GetGrokCreditsConfig (empty request). The response carries
 // the remaining credits (field 1, a float32) and the weekly reset timestamp
@@ -190,75 +179,6 @@ type Subscription struct {
 	Status           string // e.g. SUBSCRIPTION_STATUS_ACTIVE
 	BillingPeriodEnd string // RFC3339; when the plan renews / credits reset
 	FreeTrial        bool   // currently in a free-trial offer
-}
-
-// FetchSubscription reads GET /rest/subscriptions and reports the account's
-// membership. Member is true only when an entry with SUBSCRIPTION_STATUS_ACTIVE
-// exists: a lapsed membership keeps its entry but flips to
-// SUBSCRIPTION_STATUS_INACTIVE, and an empty array means never subscribed —
-// both read as Member=false (the entry's tier/status are still surfaced).
-// A 401/403 maps to ErrAuth; other transport/HTTP errors are returned so callers
-// can treat them as best-effort (they already have the credit balance).
-func (c *Client) FetchSubscription(ctx context.Context, token string) (*Subscription, error) {
-	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
-	if token == "" {
-		return nil, ErrAuth
-	}
-	client, err := c.newProxyTLSClient()
-	if err != nil {
-		return nil, err
-	}
-	c.ensureChallenge(ctx, client, token)
-	req, err := http.NewRequest(http.MethodGet, apiBase+"/rest/subscriptions", nil)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	c.applyHeaders(req, token, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, ErrAuth
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("%w: subscriptions http %d", ErrTemporaryUpstream, resp.StatusCode)
-	}
-	var body struct {
-		Subscriptions []struct {
-			Tier             string `json:"tier"`
-			Status           string `json:"status"`
-			BillingPeriodEnd string `json:"billingPeriodEnd"`
-			ActiveOffer      struct {
-				FreeTrial *struct {
-					TrialDays int `json:"trialDays"`
-				} `json:"freeTrial"`
-			} `json:"activeOffer"`
-		} `json:"subscriptions"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, fmt.Errorf("%w: subscriptions non-json", ErrTemporaryUpstream)
-	}
-	out := &Subscription{}
-	// Surface the ACTIVE subscription if any (falling back to the first entry
-	// for tier/status info), but only an ACTIVE one sets Member.
-	for i, s := range body.Subscriptions {
-		active := strings.EqualFold(s.Status, "SUBSCRIPTION_STATUS_ACTIVE")
-		if i == 0 || active {
-			out.Member = active
-			out.Tier = strings.TrimSpace(s.Tier)
-			out.Status = strings.TrimSpace(s.Status)
-			out.BillingPeriodEnd = strings.TrimSpace(s.BillingPeriodEnd)
-			out.FreeTrial = s.ActiveOffer.FreeTrial != nil
-			if active {
-				break
-			}
-		}
-	}
-	return out, nil
 }
 
 // FetchSession reads the account profile via GET /api/auth/session and returns

@@ -8,6 +8,7 @@ import (
 
 	"backend/internal/model"
 	"backend/internal/service"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -68,114 +69,6 @@ func (h *AdminReadHandler) Models(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": items})
-}
-
-func (h *AdminReadHandler) Logs(c *gin.Context) {
-	limit := parseInt(c.Query("limit"), 50)
-	offset := parseInt(c.Query("offset"), 0)
-	kind := c.Query("kind")
-	status := c.Query("status")
-	var since *time.Time
-	if raw := c.Query("since"); raw != "" {
-		if f, err := strconv.ParseFloat(raw, 64); err == nil {
-			t := time.Unix(int64(f), 0)
-			since = &t
-		}
-	}
-
-	// ?user= — server-side 用户搜索: resolve the term to matching user ids
-	// (name/email/id contains, case-insensitive) and filter rows to those users.
-	// A term that matches nobody must return zero rows, not the unfiltered list.
-	var userIDs []string
-	if term := strings.TrimSpace(c.Query("user")); term != "" {
-		ids, uerr := h.admin.MatchUserIDs(c.Request.Context(), term)
-		if uerr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
-			return
-		}
-		if len(ids) == 0 {
-			ids = []string{"__no_match__"}
-		}
-		userIDs = ids
-	}
-
-	items, total, stats, err := h.admin.Logs(c.Request.Context(), limit, offset, kind, status, nil, since, "", userIDs, strings.TrimSpace(c.Query("q")), "", c.Query("source"), false, false, false)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
-		return
-	}
-	// Resolve user_id -> display name once for the page (mirrors admin.py).
-	nameByID, err := h.admin.UserNameMap(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
-		return
-	}
-	// Resolve account_id -> account label (email) so the log table can show which
-	// provider account fulfilled each generation under the user.
-	accountByID, err := h.admin.AccountNameMap(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
-		return
-	}
-	modelByID, err := h.admin.ModelNameMap(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
-		return
-	}
-	out := make([]gin.H, 0, len(items))
-	for _, item := range items {
-		var userName any
-		if item.UserID == "" {
-			userName = "匿名"
-		} else if name, ok := nameByID[item.UserID]; ok {
-			userName = name
-		} else {
-			userName = item.UserID
-		}
-		var accountName any
-		if item.AccountEmail != "" {
-			// Email stamped on the row itself survives account deletion/re-import.
-			accountName = item.AccountEmail
-		} else if item.AccountID != "" {
-			if label, ok := accountByID[item.AccountID]; ok {
-				accountName = label
-			} else {
-				accountName = item.AccountID
-			}
-		}
-		out = append(out, gin.H{
-			"id":         item.ID,
-			"ts":         item.TS.Unix(),
-			"kind":       item.Kind,
-			"status":     item.Status,
-			"model":      displayModelName(modelByID, item.Model),
-			"provider":   item.Provider,
-			"prompt":     item.Prompt,
-			"ratio":      item.Ratio,
-			"resolution": item.Resolution,
-			"duration":   item.Duration,
-			"refs":       item.Refs,
-			"deai":       item.DeAI,
-			"source":     item.Source,
-			"user_id":    emptyStringNil(item.UserID),
-			"user_name":  userName,
-			"account_id": emptyStringNil(item.AccountID),
-			"account":    accountName,
-			"cost":       item.Cost,
-			"elapsed_ms": item.ElapsedMS,
-			"file":       emptyStringNil(item.File),
-			"error":      emptyStringNil(item.Error),
-			"created_at": unixSec(item.CreatedAt),
-			"updated_at": unixSec(item.UpdatedAt),
-		})
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"data":   out,
-		"total":  total,
-		"limit":  limit,
-		"offset": offset,
-		"stats":  stats,
-	})
 }
 
 func (h *AdminReadHandler) Stats(c *gin.Context) {

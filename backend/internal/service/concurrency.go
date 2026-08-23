@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -80,42 +79,4 @@ func (c *ConcurrencyService) NextCursor(ctx context.Context, key string) (uint64
 		return 0, false
 	}
 	return uint64(n - 1), true
-}
-
-// Count returns the live (non-expired) slot count under `key` — for display.
-func (c *ConcurrencyService) Count(ctx context.Context, key string) int {
-	if c == nil || c.redis == nil {
-		return 0
-	}
-	now := time.Now().Unix()
-	_ = c.redis.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(now, 10)).Err()
-	n, err := c.redis.ZCard(ctx, key).Result()
-	if err != nil {
-		return 0
-	}
-	return int(n)
-}
-
-// CountUsers returns live concurrency for many users in one round-trip
-// (group_id display etc. don't need this, but the user list does). Keyed by the
-// raw subject id passed in.
-func (c *ConcurrencyService) CountMany(ctx context.Context, prefix string, ids []string) map[string]int {
-	out := make(map[string]int, len(ids))
-	if c == nil || c.redis == nil || len(ids) == 0 {
-		return out
-	}
-	pipe := c.redis.Pipeline()
-	cmds := make(map[string]*redis.IntCmd, len(ids))
-	for _, id := range ids {
-		cmds[id] = pipe.ZCard(ctx, prefix+id)
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return out
-	}
-	for id, cmd := range cmds {
-		if n, err := cmd.Result(); err == nil && n > 0 {
-			out[id] = int(n)
-		}
-	}
-	return out
 }

@@ -53,53 +53,6 @@ func NewAuthService(
 	}
 }
 
-func (s *AuthService) IsAuthorizedForPrivateImage(ctx context.Context, sessionCookie, owner string) (bool, error) {
-	// Private images are viewable ONLY via a logged-in session cookie (no Bearer
-	// token / API key). A regular user may view only their OWN images; an admin
-	// may view anyone's. `owner` is the /images/<owner>/... path segment.
-	if sessionCookie == "" {
-		return false, nil
-	}
-	payload, err := s.sessions.Validate(ctx, sessionCookie)
-	if err != nil {
-		return false, err
-	}
-	if payload == nil {
-		return false, nil
-	}
-	user, err := s.users.GetByID(ctx, payload.UserID)
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return false, nil
-		}
-		return false, err
-	}
-	if user.Role == "admin" {
-		return true, nil
-	}
-	return ownsImageDir(user, owner), nil
-}
-
-// ownsImageDir reports whether `owner` (the /images/<owner>/... directory) is one
-// of the names this user's outputs are stored under. Mirrors the candidates
-// V1Service.userDir picks from: sanitized name → sanitized email-local → id.
-func ownsImageDir(user *model.User, owner string) bool {
-	owner = strings.TrimSpace(owner)
-	if owner == "" || user == nil {
-		return false
-	}
-	if owner == user.ID {
-		return true
-	}
-	if d := sanitizeOwnerName(user.Name); d != "" && d == owner {
-		return true
-	}
-	if d := sanitizeOwnerName(strings.Split(user.Email, "@")[0]); d != "" && d == owner {
-		return true
-	}
-	return false
-}
-
 func (s *AuthService) CurrentUserFromBearer(ctx context.Context, authHeader string) (*model.User, *SessionPayload, error) {
 	token := ParseBearer(authHeader)
 	return s.currentUserFromToken(ctx, token)
@@ -110,10 +63,6 @@ func (s *AuthService) CurrentUserFromRequest(ctx context.Context, authHeader, co
 		return user, session, err
 	}
 	return s.currentUserFromToken(ctx, cookieToken)
-}
-
-func (s *AuthService) CurrentUserFromToken(ctx context.Context, token string) (*model.User, *SessionPayload, error) {
-	return s.currentUserFromToken(ctx, token)
 }
 
 func (s *AuthService) currentUserFromToken(ctx context.Context, token string) (*model.User, *SessionPayload, error) {
@@ -450,21 +399,21 @@ func (s *AuthService) PublicUser(ctx context.Context, user *model.User) (map[str
 		}
 	}
 	return map[string]any{
-		"id":             user.ID,
-		"email":          user.Email,
-		"name":           user.Name,
-		"role":           user.Role,
-		"status":         user.Status,
-		"credits":        user.Credits,
-		"recharge_total": user.RechargeTotal,
+		"id":                user.ID,
+		"email":             user.Email,
+		"name":              user.Name,
+		"role":              user.Role,
+		"status":            user.Status,
+		"credits":           user.Credits,
+		"recharge_total":    user.RechargeTotal,
 		"concurrency_group": concName,
 		"concurrency_limit": concMax,
-		"checkin_last":   user.CheckinLast,
-		"checkin_streak": user.CheckinStreak,
-		"checkin_today":  user.CheckinLast == time.Now().Format("2006-01-02"),
-		"invite_code":    user.InviteCode,
-		"invite_count":   stats.InviteCount,
-		"invite_earned":  stats.InviteEarned,
+		"checkin_last":      user.CheckinLast,
+		"checkin_streak":    user.CheckinStreak,
+		"checkin_today":     user.CheckinLast == time.Now().Format("2006-01-02"),
+		"invite_code":       user.InviteCode,
+		"invite_count":      stats.InviteCount,
+		"invite_earned":     stats.InviteEarned,
 	}, nil
 }
 

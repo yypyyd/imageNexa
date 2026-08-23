@@ -278,12 +278,6 @@ func toInt64(v any) int64 {
 	}
 }
 
-func (c *Client) SetProxy(proxy string) {
-	c.proxyMu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
-	c.proxyMu.Unlock()
-}
-
 func (c *Client) proxyValue() string {
 	c.proxyMu.RLock()
 	defer c.proxyMu.RUnlock()
@@ -401,11 +395,6 @@ func accountKey(cookie string) string {
 	return ""
 }
 
-// apiGet issues a GET to a krea.ai API path carrying the account cookie.
-func (c *Client) apiGet(ctx context.Context, cookie, path string) ([]byte, int, error) {
-	return c.apiGetP(ctx, cookie, path, false)
-}
-
 // apiGetP keeps the route explicit: authentication/quota/bootstrap callers use
 // the proxy, while project setup and polling can remain direct.
 func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool) ([]byte, int, error) {
@@ -477,23 +466,6 @@ func stringValue(v any) string {
 	default:
 		b, _ := json.Marshal(x)
 		return strings.TrimSpace(string(b))
-	}
-}
-
-func intValue(v any) int {
-	switch x := v.(type) {
-	case int:
-		return x
-	case float64:
-		return int(x)
-	case json.Number:
-		n, _ := x.Int64()
-		return int(n)
-	case string:
-		n, _ := strconv.Atoi(strings.TrimSpace(x))
-		return n
-	default:
-		return 0
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"backend/internal/model"
+
 	"gorm.io/gorm"
 )
 
@@ -16,22 +17,6 @@ type ShowcaseRepository struct {
 
 func NewShowcaseRepository(db *gorm.DB) *ShowcaseRepository {
 	return &ShowcaseRepository{db: db}
-}
-
-func (r *ShowcaseRepository) IsPublicFile(ctx context.Context, rel string) (bool, error) {
-	normalized := strings.TrimLeft(strings.TrimSpace(rel), "/")
-	if normalized == "" {
-		return false, nil
-	}
-
-	var count int64
-	if err := r.db.WithContext(ctx).
-		Model(&model.ShowcaseItem{}).
-		Where("image = ? OR image = ?", normalized, "/"+normalized).
-		Count(&count).Error; err != nil {
-		return false, err
-	}
-	return count > 0, nil
 }
 
 // PublicFileSet returns the set of image keys referenced by any showcase item

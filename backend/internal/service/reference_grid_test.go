@@ -70,7 +70,7 @@ func TestVeilFaceCoversFaceRegionWithRedMesh(t *testing.T) {
 		t.Fatal(err)
 	}
 	box := expandFacePanelBox(image.Rect(20, 30, 60, 70), src.Bounds())
-	if box != image.Rect(23, 35, 57, 67) {
+	if box != image.Rect(23, 35, 57, 68) {
 		t.Fatalf("veil box was not trimmed to the face: %v", box)
 	}
 	var red, total int

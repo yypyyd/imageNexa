@@ -64,12 +64,6 @@ func (c *Client) Configured() bool {
 	return c != nil && c.endpoint != "" && c.bucket != "" && c.ak != "" && c.sk != ""
 }
 
-// PublicURL is the direct object URL (used only for reference/debugging — the app
-// serves through the authenticated /images proxy, not this).
-func (c *Client) PublicURL(key string) string {
-	return c.endpoint + "/" + c.bucket + "/" + strings.TrimPrefix(key, "/")
-}
-
 // Put uploads body under key with the given content type.
 func (c *Client) Put(ctx context.Context, key string, body []byte, contentType string) error {
 	resp, err := c.do(ctx, http.MethodPut, c.bucket+"/"+key, nil, body, contentType, nil)

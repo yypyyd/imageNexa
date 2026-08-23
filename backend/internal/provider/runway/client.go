@@ -162,12 +162,6 @@ func NewClient(proxy string) *Client {
 	return &Client{proxy: strings.TrimSpace(proxy)}
 }
 
-func (c *Client) SetProxy(proxy string) {
-	c.proxyMu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
-	c.proxyMu.Unlock()
-}
-
 func (c *Client) proxyValue() string {
 	c.proxyMu.RLock()
 	defer c.proxyMu.RUnlock()
@@ -205,17 +199,6 @@ func TeamIDFromToken(token string) string {
 		return strings.TrimSpace(v)
 	default:
 		return ""
-	}
-}
-
-// ExtractAccountInfo decodes the free (no-network) JWT claims for the accounts
-// view: email, team id and expiry.
-func ExtractAccountInfo(token string) map[string]any {
-	claims := decodeJWTPayload(token)
-	return map[string]any{
-		"email":      emptyStringNil(strings.TrimSpace(stringValue(claims["email"]))),
-		"team_id":    emptyStringNil(TeamIDFromToken(token)),
-		"expires_at": claims["exp"],
 	}
 }
 
@@ -368,14 +351,6 @@ func intValue(v any) int {
 	default:
 		return 0
 	}
-}
-
-func emptyStringNil(v string) any {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return nil
-	}
-	return v
 }
 
 func clip(b []byte, n int) string {

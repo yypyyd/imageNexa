@@ -9,19 +9,11 @@ import (
 )
 
 type orderedMap struct {
-	keys   []string
 	values map[string]any
 }
 
 func newOrderedMap() *orderedMap {
 	return &orderedMap{values: map[string]any{}}
-}
-
-func (m *orderedMap) add(key string, value any) {
-	if _, ok := m.values[key]; !ok {
-		m.keys = append(m.keys, key)
-	}
-	m.values[key] = value
 }
 
 func solveTurnstileToken(dx, p string) string {

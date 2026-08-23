@@ -90,19 +90,17 @@ func veilFaceWithinImage(src image.Image, face detectedFace) (*image.RGBA, error
 	return dst, nil
 }
 
-// drawFaceVeil weaves red strands across the box in both directions. The
-// strands are kept distinct while a moderately tighter gap increases density
-// without turning the whole region into a solid rectangle.
+// drawFaceVeil weaves red strands across the box in both directions. The mesh
+// keeps a moderate density — thin strands with a medium gap — so the face keeps
+// its likeness while the grid stays visible to the upstream model.
 func drawFaceVeil(dst *image.RGBA, box image.Rectangle) {
 	box = box.Intersect(dst.Bounds())
 	if box.Dx() <= 0 || box.Dy() <= 0 {
 		return
 	}
 	red := image.NewUniform(color.RGBA{R: 255, A: 255})
-	// Use a slightly heavier strand so the mesh remains visible after the
-	// reference image is resized by the upstream video model.
-	strand := max(1, min(box.Dx(), box.Dy())/100)
-	gap := max(3, min(box.Dx(), box.Dy())/70)
+	strand := max(1, min(box.Dx(), box.Dy())/120)
+	gap := max(5, min(box.Dx(), box.Dy())/22)
 	for y := box.Min.Y; y < box.Max.Y; y += strand + gap {
 		draw.Draw(dst, image.Rect(box.Min.X, y, box.Max.X, min(box.Max.Y, y+strand)), red, image.Point{}, draw.Src)
 	}

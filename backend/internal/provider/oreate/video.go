@@ -2,7 +2,6 @@ package oreate
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -22,13 +22,32 @@ var videoURLPattern = regexp.MustCompile(`https?://[^\s"'<>\\]+?\.mp4(?:\?[^\s"'
 // be recovered instead of discarding a submit the account already paid for.
 const (
 	videoCDNBase          = "https://cdn.oreateai.com/aivideo/videodownload"
+	messageListPath       = "/oreate/memory/getmessagelist"
+	chatVideoPollInterval = 10 * time.Second
+	chatVideoMaxFailures  = 3
 	videoRecoveryInterval = 15 * time.Second
-	videoRecoveryWindow   = 6 * time.Minute
+	videoRecoveryWindow   = 15 * time.Minute
 )
 
 // errStreamIncomplete marks a stream that neither produced a result nor an
 // upstream verdict — the only case where logId recovery is meaningful.
 var errStreamIncomplete = errors.New("stream ended without a video URL")
+
+var htmlTagPattern = regexp.MustCompile(`<[^>]*>`)
+
+// errChatUnavailable marks a chat that cannot be read at all, as opposed to one
+// that has not reported a result yet.
+var errChatUnavailable = errors.New("chat history unavailable")
+
+// chatVideoVerdict is the chat's terminal state for one generation: Oreate keeps
+// the render result on the assistant message, which is authoritative even when
+// the event stream dropped or only ever carried pings.
+type chatVideoVerdict struct {
+	VideoURL string
+	Failed   bool
+	Pending  bool
+	Message  string
+}
 
 // videoStream is what the SSE consumer learned before the stream ended.
 type videoStream struct {
@@ -182,23 +201,16 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 		return nil, nil, err
 	}
 
-	chatID, err := c.createChat(ctx, account, "aiVideo")
-	if err != nil {
-		return nil, nil, err
-	}
 	if c.signer == nil {
 		return nil, nil, errors.New("oreate: signer not configured")
 	}
-	sig, err := c.signer.Sign(ctx, account)
-	if err != nil {
-		return nil, nil, err
+	// The page mints the token, opens the chat and posts the request itself, so
+	// the identity fields are left empty here and filled in by the page.
+	submitter, ok := c.signer.(videoSubmitter)
+	if !ok {
+		return nil, nil, errors.New("oreate: signer cannot submit generations from a page")
 	}
-	if sig.BID != "" {
-		account.BID = sig.BID
-	}
-	if sig.Cookie != "" {
-		account.Cookie = mergeCookies(account.Cookie, sig.Cookie)
-	}
+	var chatID, egress string
 	config := videoConfig{
 		ModelName: modelName, Ratio: options.Ratio, Resolution: resolution, Duration: options.Duration,
 		IsAudio: options.Audio, AIType: aiType,
@@ -236,7 +248,7 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 		ChatType: "aiVideo", From: "home", ChatTitle: "Unnamed Session", IsFirst: true,
 		Messages:    []videoMessage{{Role: "user", Content: options.Prompt, Attachments: attachments}},
 		VideoConfig: config,
-		JT:          sig.JT, UA: account.UserAgent, JSEnv: "h5",
+		UA:          account.UserAgent, JSEnv: "h5",
 		Extra: requestExtra{
 			DocName: "", ModuleName: "gpt4o", Email: account.Email, VIP: account.VIP,
 			RegTS: account.RegTS, DeviceID: account.OUID, BID: account.BID,
@@ -246,34 +258,56 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 	if err != nil {
 		return nil, nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/oreate/sse/stream"), bytes.NewReader(body))
+	result, err := submitter.SubmitVideo(ctx, account, body)
 	if err != nil {
 		return nil, nil, err
 	}
-	setHeaders(req, account, "text/event-stream")
-	resp, err := c.httpClient(true).Do(req)
+	chatID = result.ChatID
+	// The chat is polled from Go, so it has to leave through the session the
+	// submitting page used: upstream sees one exit IP per generation.
+	egress = result.Proxy
+	submitFailure := strings.TrimSpace(result.Failure)
+	status, err := inPageStreamStatus(result)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: stream request: %v", ErrTemporaryUpstream, err)
+		return nil, nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, nil, ErrAuth
+	// A dropped stream still leaves the events the page already read, which is
+	// what logId recovery below needs.
+	streamBody := io.NopCloser(strings.NewReader(result.Stream))
+	defer streamBody.Close()
+	if status != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(streamBody, 1024))
+		return nil, nil, classifyUpstreamError(status, string(body))
 	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, nil, classifyUpstreamError(resp.StatusCode, string(body))
-	}
-	stream, err := parseVideoSSE(resp.Body)
+	stream, err := parseVideoSSE(streamBody)
 	videoURL := stream.VideoURL
 	if err != nil {
-		if !errors.Is(err, errStreamIncomplete) || !stream.Started || stream.LogID == "" {
+		// A logId means the submit was accepted upstream, so the render can still
+		// land on the CDN even when the stream never reported a start event.
+		if !errors.Is(err, errStreamIncomplete) {
 			return nil, nil, err
 		}
-		recovered := c.awaitVideoByLogID(ctx, stream.LogID)
-		if recovered == "" {
+		// The page hands the render over as soon as upstream accepts it, so the
+		// chat is where the result arrives: it reports the finished clip or the
+		// upstream giving up, and only an unreadable chat falls back to the CDN.
+		verdict := c.awaitChatVideo(ctx, account, chatID, egress)
+		switch {
+		case verdict.VideoURL != "":
+			videoURL = verdict.VideoURL
+		case verdict.Failed:
+			return nil, nil, fmt.Errorf("%w: upstream reported render failure: %s", ErrTemporaryUpstream, upstreamFailureMessage(verdict.Message))
+		case stream.LogID == "":
 			return nil, nil, err
+		default:
+			recovered := c.awaitVideoByLogID(ctx, stream.LogID)
+			if recovered == "" {
+				if submitFailure != "" {
+					return nil, nil, fmt.Errorf("%w (log_id %s, browser: %s)", err, stream.LogID, submitFailure)
+				}
+				return nil, nil, fmt.Errorf("%w (log_id %s)", err, stream.LogID)
+			}
+			videoURL = recovered
 		}
-		videoURL = recovered
 	}
 	meta := map[string]any{"provider": "oreate", "chat_id": chatID, "video_url": videoURL, "log_id": stream.LogID}
 	if !options.DownloadResult {
@@ -286,13 +320,15 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 	return data, meta, nil
 }
 
-func (c *Client) createChat(ctx context.Context, account Account, chatType string) (string, error) {
+// createChat opens a conversation through the given proxy session, which for a
+// video generation is the session that minted the token the submit will carry.
+func (c *Client) createChat(ctx context.Context, account Account, chatType, proxyURL string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/oreate/create/chat"), strings.NewReader(`{"type":"`+chatType+`"}`))
 	if err != nil {
 		return "", err
 	}
 	setHeaders(req, account, "application/json")
-	resp, err := c.httpClient(true).Do(req)
+	resp, err := c.egressClient(proxyURL).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("%w: create chat: %v", ErrTemporaryUpstream, err)
 	}
@@ -322,6 +358,124 @@ func parseCreateChat(body []byte) (string, error) {
 		return "", fmt.Errorf("%w: create-chat response missing chatId", ErrTemporaryUpstream)
 	}
 	return strings.TrimSpace(data.ChatID), nil
+}
+
+// awaitChatVideo reads the conversation back until it reports a terminal state,
+// and returns an empty verdict once the bounded window elapses. Transient read
+// failures are retried because this poll is the only thing still watching the
+// render, but a chat that answers with an error status is not worth the window.
+func (c *Client) awaitChatVideo(ctx context.Context, account Account, chatID, proxyURL string) chatVideoVerdict {
+	if strings.TrimSpace(chatID) == "" {
+		return chatVideoVerdict{}
+	}
+	deadline := time.Now().Add(videoRecoveryWindow)
+	failures := 0
+	for {
+		verdict, err := c.chatVideo(ctx, account, chatID, proxyURL)
+		switch {
+		case errors.Is(err, errChatUnavailable):
+			return chatVideoVerdict{}
+		case err != nil:
+			failures++
+			if failures > chatVideoMaxFailures {
+				return chatVideoVerdict{}
+			}
+		default:
+			failures = 0
+			if !verdict.Pending {
+				return verdict
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return chatVideoVerdict{}
+		}
+		select {
+		case <-ctx.Done():
+			return chatVideoVerdict{}
+		case <-time.After(chatVideoPollInterval):
+		}
+	}
+}
+
+func (c *Client) chatVideo(ctx context.Context, account Account, chatID, proxyURL string) (chatVideoVerdict, error) {
+	query := url.Values{"chatID": {chatID}, "pn": {"1"}, "rn": {"20"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint(messageListPath)+"?"+query.Encode(), nil)
+	if err != nil {
+		return chatVideoVerdict{}, err
+	}
+	setHeaders(req, account, "application/json")
+	resp, err := c.egressClient(proxyURL).Do(req)
+	if err != nil {
+		return chatVideoVerdict{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return chatVideoVerdict{}, fmt.Errorf("%w: http %d", errChatUnavailable, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return chatVideoVerdict{}, err
+	}
+	return parseChatVideo(body)
+}
+
+// parseChatVideo reads the assistant message state: 3 carries the rendered clip,
+// 2 is upstream giving up, anything else means the render is still running.
+func parseChatVideo(body []byte) (chatVideoVerdict, error) {
+	var env statusEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return chatVideoVerdict{}, fmt.Errorf("%w: invalid message-list response", ErrTemporaryUpstream)
+	}
+	if env.Status.Code != 0 {
+		return chatVideoVerdict{}, classifyUpstreamError(env.Status.Code, env.Status.Msg)
+	}
+	var data struct {
+		MessageList []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+			Data    string `json:"data"`
+		} `json:"messageList"`
+	}
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		return chatVideoVerdict{}, fmt.Errorf("%w: invalid message list", ErrTemporaryUpstream)
+	}
+	for _, message := range data.MessageList {
+		if !strings.EqualFold(message.Role, "assistant") {
+			continue
+		}
+		var state struct {
+			Status int `json:"status"`
+		}
+		if message.Data != "" {
+			_ = json.Unmarshal([]byte(message.Data), &state)
+		}
+		switch state.Status {
+		case 3:
+			if found := extractVideoURL(message.Content); found != "" {
+				return chatVideoVerdict{VideoURL: found}, nil
+			}
+		case 2:
+			return chatVideoVerdict{Failed: true, Message: message.Content}, nil
+		default:
+			return chatVideoVerdict{Pending: true}, nil
+		}
+	}
+	// The assistant row shows up moments after the submit, so a chat without one
+	// is still an unfinished render rather than a lost one.
+	return chatVideoVerdict{Pending: true}, nil
+}
+
+// upstreamFailureMessage turns the chat message, which is rendered HTML, into a
+// single readable line for the error the caller reports.
+func upstreamFailureMessage(message string) string {
+	cleaned := strings.Join(strings.Fields(htmlTagPattern.ReplaceAllString(message, " ")), " ")
+	if cleaned == "" {
+		return "upstream gave no reason"
+	}
+	if len(cleaned) > 200 {
+		cleaned = strings.TrimSpace(cleaned[:200])
+	}
+	return cleaned
 }
 
 // awaitVideoByLogID polls the logId path until the rendered file shows up, and

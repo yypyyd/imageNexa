@@ -12,18 +12,19 @@ import (
 	"backend/internal/model"
 	"backend/internal/provider/epay"
 	"backend/internal/repo"
+
 	"gorm.io/gorm"
 )
 
 const orderTTL = 30 * time.Minute
 
 var (
-	ErrPayDisabled    = errors.New("recharge is currently disabled")
-	ErrPayNotConfig   = errors.New("payment is not configured")
-	ErrPayMethod      = errors.New("unsupported payment method")
-	ErrPayAmount      = errors.New("amount below the minimum")
-	ErrOrderNotFound  = errors.New("order not found")
-	ErrOrderPaid      = errors.New("order already paid")
+	ErrPayDisabled   = errors.New("recharge is currently disabled")
+	ErrPayNotConfig  = errors.New("payment is not configured")
+	ErrPayMethod     = errors.New("unsupported payment method")
+	ErrPayAmount     = errors.New("amount below the minimum")
+	ErrOrderNotFound = errors.New("order not found")
+	ErrOrderPaid     = errors.New("order already paid")
 )
 
 // PaymentService drives 易支付 recharge orders: create → pay → async-notify →
@@ -42,8 +43,8 @@ type PaySettings struct {
 	Enabled     bool     `json:"enabled"`
 	PID         string   `json:"pid"`
 	Key         string   `json:"key"`
-	APIBase     string   `json:"api_base"`     // 易支付站点根地址,代码自动拼 /api/pay/create
-	Methods     []string `json:"methods"`      // wxpay, alipay
+	APIBase     string   `json:"api_base"` // 易支付站点根地址,代码自动拼 /api/pay/create
+	Methods     []string `json:"methods"`  // wxpay, alipay
 	MinAmount   float64  `json:"min_amount"`
 	PointsRatio int      `json:"points_ratio"` // 积分 per 元
 }
@@ -319,10 +320,4 @@ func (s *PaymentService) UserNames(ctx context.Context) map[string]string {
 		out[u.ID] = n
 	}
 	return out
-}
-
-// ExpireStale cancels pending orders past their TTL (called by the maintenance
-// sweep). Returns how many were cancelled.
-func (s *PaymentService) ExpireStale(ctx context.Context) (int64, error) {
-	return s.orders.ExpirePending(ctx, time.Now())
 }

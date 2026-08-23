@@ -346,22 +346,6 @@ func blobRefs(ids []string, usage string) []any {
 	return out
 }
 
-func referenceImagesByID(ids []string) []any {
-	out := make([]any, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, map[string]any{"id": id})
-	}
-	return out
-}
-
-func referenceImagesByLocal(ids []string) []any {
-	out := make([]any, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, map[string]any{"localBlobRef": id})
-	}
-	return out
-}
-
 func cloneMap(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	for k, v := range in {

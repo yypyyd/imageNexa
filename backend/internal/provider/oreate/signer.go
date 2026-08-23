@@ -22,8 +22,9 @@ import (
 const maxBantiJTLength = 4096
 
 const (
-	signerTimeout        = 75 * time.Second
-	bantiResponseTimeout = 25 * time.Second
+	signerTimeout          = 75 * time.Second
+	bantiResponseTimeout   = 25 * time.Second
+	signerNavigateAttempts = 3
 )
 
 var signerBlockedURLs = []string{
@@ -41,6 +42,9 @@ var signerBlockedURLs = []string{
 type chromiumSigner struct {
 	proxy func() string
 	sem   chan struct{}
+	// pool keeps the warm signed pages that mint the tokens and post the
+	// generations, which is what bounds how many submits run at once.
+	pool  *signerPool
 	probe func(signerProbeEvent)
 }
 
@@ -78,7 +82,21 @@ type chromiumProxy struct {
 }
 
 func newChromiumSigner(proxy func() string) *chromiumSigner {
-	return &chromiumSigner{proxy: proxy, sem: make(chan struct{}, 2)}
+	return &chromiumSigner{
+		proxy: proxy,
+		sem:   make(chan struct{}, 2),
+		pool:  newSignerPool(proxy),
+	}
+}
+
+// SignHot mints a token on a warm page and reports the proxy session that page
+// uses, which the caller has to reuse for the requests carrying the token.
+func (s *chromiumSigner) SignHot(ctx context.Context, account Account) (hotSignature, error) {
+	account = account.normalized()
+	if account.Cookie == "" {
+		return hotSignature{}, ErrAuth
+	}
+	return s.pool.sign(ctx, account)
 }
 
 func (s *chromiumSigner) Sign(ctx context.Context, account Account) (Signature, error) {
@@ -97,9 +115,18 @@ func (s *chromiumSigner) Sign(ctx context.Context, account Account) (Signature, 
 	if path == "" {
 		return Signature{}, errors.New("oreate signer: no Chrome/Chromium binary (set OREATE_CHROME)")
 	}
+	// Opening the page through a residential proxy times out intermittently
+	// ("page navigation" / "Paris runtime" in production logs) and a second
+	// browser normally gets through, so retry that class of failure once.
 	sig, err := s.signOnce(ctx, path, account)
 	if err != nil {
-		return Signature{}, err
+		if !isTransientSignerFailure(err) || ctx.Err() != nil {
+			return Signature{}, err
+		}
+		sig, err = s.signOnce(ctx, path, account)
+		if err != nil {
+			return Signature{}, err
+		}
 	}
 	// Keep the opaque browser token ephemeral and reject empty or implausibly
 	// large values before they can reach the website API.
@@ -109,27 +136,58 @@ func (s *chromiumSigner) Sign(ctx context.Context, account Account) (Signature, 
 	return sig, nil
 }
 
-func (s *chromiumSigner) signOnce(parent context.Context, path string, account Account) (Signature, error) {
-	ctx, cancel := context.WithTimeout(parent, signerTimeout)
-	defer cancel()
-	var proxy chromiumProxy
-	if s.proxy != nil {
-		var err error
-		proxy, err = parseChromiumProxy(s.proxy())
-		if err != nil {
-			return Signature{}, err
+// isTransientSignerFailure reports whether the browser failed to reach a usable
+// page (navigation / runtime timeouts) rather than the account being rejected.
+func isTransientSignerFailure(err error) bool {
+	if err == nil || errors.Is(err, ErrAuth) || errors.Is(err, ErrRiskControl) {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "page navigation") ||
+		strings.Contains(msg, "Paris runtime") ||
+		strings.Contains(msg, "cookie setup")
+}
+
+// navigateSignerPage opens the chat page, reloading it in the same browser when
+// the document aborts mid-stream (proxy timeouts, ERR_INCOMPLETE_CHUNKED_ENCODING)
+// because that is far cheaper than starting another browser.
+func navigateSignerPage(ctx context.Context) error {
+	var err error
+	for attempt := 0; attempt < signerNavigateAttempts; attempt++ {
+		if err = chromedp.Run(ctx, chromedp.Navigate(defaultRefer)); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
+	return err
+}
+
+// browserOptions builds the Chrome flags for a one-shot signing browser. The
+// caller closes the returned bridge once the browser exits.
+func (s *chromiumSigner) browserOptions(ctx context.Context, path string, account Account) ([]chromedp.ExecAllocatorOption, *proxyBridge, error) {
+	raw := ""
+	if s.proxy != nil {
+		raw = s.proxy()
+	}
+	return browserExecOptions(ctx, path, account, raw)
+}
+
+// browserExecOptions builds the flags for one browser on the given proxy URL.
+func browserExecOptions(ctx context.Context, path string, account Account, proxyURL string) ([]chromedp.ExecAllocatorOption, *proxyBridge, error) {
+	proxy, err := parseChromiumProxy(proxyURL)
+	if err != nil {
+		return nil, nil, err
+	}
 	browserProxy := proxy
-	var proxyBridge *proxyBridge
+	var bridge *proxyBridge
 	if proxy.authenticate {
-		var err error
-		proxyBridge, err = startProxyBridge(ctx, proxy)
+		bridge, err = startProxyBridge(ctx, proxy)
 		if err != nil {
-			return Signature{}, err
+			return nil, nil, err
 		}
-		defer proxyBridge.Close()
-		browserProxy.server = proxyBridge.URL()
+		browserProxy.server = bridge.URL()
 		browserProxy.authenticate = false
 	}
 	opts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
@@ -150,10 +208,37 @@ func (s *chromiumSigner) signOnce(parent context.Context, path string, account A
 	if browserProxy.server != "" {
 		opts = append(opts, chromedp.ProxyServer(browserProxy.server))
 	}
-	if proxyBridge != nil {
+	if bridge != nil {
 		// Chrome otherwise bypasses loopback proxies by default, which would
 		// silently skip the authenticated bridge and use direct egress.
 		opts = append(opts, chromedp.Flag("proxy-bypass-list", "<-loopback>"))
+	}
+	return opts, bridge, nil
+}
+
+// signerCookieActions installs the account cookies on the website origin and
+// keeps third-party trackers from slowing the page down.
+func signerCookieActions(account Account) []chromedp.Action {
+	actions := []chromedp.Action{network.Enable(), chromedp.ActionFunc(setSignerBlockedURLs)}
+	for _, part := range strings.Split(account.Cookie, ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || name == "" {
+			continue
+		}
+		actions = append(actions, network.SetCookie(name, value).WithDomain(".oreateai.com").WithPath("/"))
+	}
+	return actions
+}
+
+func (s *chromiumSigner) signOnce(parent context.Context, path string, account Account) (Signature, error) {
+	ctx, cancel := context.WithTimeout(parent, signerTimeout)
+	defer cancel()
+	opts, bridge, err := s.browserOptions(ctx, path, account)
+	if err != nil {
+		return Signature{}, err
+	}
+	if bridge != nil {
+		defer bridge.Close()
 	}
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
 	defer cancelAlloc()
@@ -165,23 +250,16 @@ func (s *chromiumSigner) signOnce(parent context.Context, path string, account A
 		listenForSignerProbe(browserCtx, s.probe)
 	}
 
-	cookieActions := []chromedp.Action{network.Enable(), chromedp.ActionFunc(setSignerBlockedURLs)}
-	for _, part := range strings.Split(account.Cookie, ";") {
-		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
-		if !ok || name == "" {
-			continue
-		}
-		cookieActions = append(cookieActions, network.SetCookie(name, value).WithDomain(".oreateai.com").WithPath("/"))
-	}
-	if err := chromedp.Run(browserCtx, cookieActions...); err != nil {
+	if err := chromedp.Run(browserCtx, signerCookieActions(account)...); err != nil {
 		return Signature{}, fmt.Errorf("oreate signer: cookie setup: %w", err)
 	}
-	if err := chromedp.Run(browserCtx, chromedp.Navigate(defaultRefer)); err != nil {
-		return Signature{}, fmt.Errorf("oreate signer: page navigation: %w", err)
-	}
+	navErr := navigateSignerPage(browserCtx)
 	pageDiagnostics := browserRuntimeDiagnostics(browserCtx)
 	if err := chromedp.Run(browserCtx, chromedp.Poll(`typeof window.paris_21a851acb0 === "object"`, nil,
 		chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(25*time.Second))); err != nil {
+		if navErr != nil {
+			return Signature{}, fmt.Errorf("oreate signer: page navigation: %w (%s)", navErr, pageDiagnostics)
+		}
 		return Signature{}, fmt.Errorf("oreate signer: Paris runtime: %w (%s)", err, pageDiagnostics)
 	}
 	var jt, browserCookie string

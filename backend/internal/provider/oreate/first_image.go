@@ -62,11 +62,13 @@ func (c *Client) ClaimFirstImageBonus(ctx context.Context, account Account) (str
 	if c.signer == nil {
 		return "", errors.New("oreate: signer not configured")
 	}
-	chatID, err := c.createChat(ctx, account, "aiImage")
+	// The token only works from the exit IP that minted it, so the chat and the
+	// stream both leave through the signing page's proxy session.
+	sig, err := c.signHot(ctx, account)
 	if err != nil {
 		return "", err
 	}
-	sig, err := c.signer.Sign(ctx, account)
+	chatID, err := c.createChat(ctx, account, "aiImage", sig.Proxy)
 	if err != nil {
 		return "", err
 	}
@@ -96,7 +98,7 @@ func (c *Client) ClaimFirstImageBonus(ctx context.Context, account Account) (str
 		return "", err
 	}
 	setHeaders(req, account, "text/event-stream")
-	resp, err := c.httpClient(true).Do(req)
+	resp, err := c.egressClient(sig.Proxy).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("%w: image stream request: %v", ErrTemporaryUpstream, err)
 	}
@@ -109,19 +111,19 @@ func (c *Client) ClaimFirstImageBonus(ctx context.Context, account Account) (str
 		return "", classifyUpstreamError(resp.StatusCode, string(message))
 	}
 	imageURL, streamErr := parseImageSSE(resp.Body)
-	c.requestFirstUseBonus(ctx, account)
+	c.requestFirstUseBonus(ctx, account, sig.Proxy)
 	return imageURL, streamErr
 }
 
 // requestFirstUseBonus triggers the grant the way the site's own frontend does
 // after a generation. A failure only leaves the award unpaid, so it is ignored.
-func (c *Client) requestFirstUseBonus(ctx context.Context, account Account) {
+func (c *Client) requestFirstUseBonus(ctx context.Context, account Account, proxyURL string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("/oreate/account/getfirstusepoint"), nil)
 	if err != nil {
 		return
 	}
 	setHeaders(req, account, "application/json")
-	resp, err := c.httpClient(true).Do(req)
+	resp, err := c.egressClient(proxyURL).Do(req)
 	if err != nil {
 		return
 	}

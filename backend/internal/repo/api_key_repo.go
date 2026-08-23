@@ -2,9 +2,9 @@ package repo
 
 import (
 	"context"
-	"time"
 
 	"backend/internal/model"
+
 	"gorm.io/gorm"
 )
 
@@ -45,9 +45,4 @@ func (r *APIKeyRepository) DeleteByID(ctx context.Context, userID, keyID string)
 
 func (r *APIKeyRepository) Create(ctx context.Context, key *model.APIKey) error {
 	return r.db.WithContext(ctx).Create(key).Error
-}
-
-func (r *APIKeyRepository) TouchUsage(ctx context.Context, keyHash string) error {
-	now := time.Now()
-	return r.db.WithContext(ctx).Model(&model.APIKey{}).Where("key_hash = ?", keyHash).Update("last_used_at", now).Error
 }

@@ -2610,13 +2610,6 @@ func cloneJSONMap(in datatypes.JSONMap) datatypes.JSONMap {
 	return out
 }
 
-func timeOrNil(t *time.Time) any {
-	if t == nil {
-		return nil
-	}
-	return *t
-}
-
 func unixOrNil(t *time.Time) any {
 	if t == nil {
 		return nil

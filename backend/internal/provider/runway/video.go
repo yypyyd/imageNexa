@@ -190,16 +190,6 @@ func (c *Client) createDataset(ctx context.Context, client tlsclient.HttpClient,
 	return id, url, nil
 }
 
-func (c *Client) assetGroupID(ctx context.Context, client tlsclient.HttpClient, token, teamID string) (string, error) {
-	res, err := c.apiJSON(ctx, client, token, teamID, http.MethodGet,
-		"/v1/asset_groups/by_name?name=Generations&asTeamId="+teamID+"&privateInTeam=true", nil)
-	if err != nil {
-		return "", err
-	}
-	ag, _ := res["assetGroup"].(map[string]any)
-	return strings.TrimSpace(stringValue(ag["id"])), nil
-}
-
 func (c *Client) createTask(ctx context.Context, submitClient, controlClient tlsclient.HttpClient, token, teamID, prompt, imageURL, assetID, assetGroupID, sessionID, aspectRatio string, seconds int) (string, error) {
 	w, h := ratioDimensions(aspectRatio)
 	opts := map[string]any{

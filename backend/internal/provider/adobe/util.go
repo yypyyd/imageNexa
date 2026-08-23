@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"math/big"
 	"os"
 	"strconv"
 	"strings"
@@ -107,17 +106,6 @@ func randomHex(n int) string {
 		}
 	}
 	return hex.EncodeToString(buf)
-}
-
-func randomInt(min, max int) int {
-	if max <= min {
-		return min
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
-	if err != nil {
-		return min
-	}
-	return min + int(n.Int64())
 }
 
 func intOrNil(v any) any {

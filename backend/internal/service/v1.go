@@ -35,6 +35,7 @@ import (
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 	"backend/internal/storage"
+
 	"gorm.io/gorm"
 )
 
@@ -1577,10 +1578,6 @@ func (s *V1Service) imageTaskFromEvent(ctx context.Context, principal *APIPrinci
 	return result, nil
 }
 
-func (s *V1Service) PrepareVideoRequest(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
-	return s.prepareVideoExecution(ctx, principal, in, "v1", true)
-}
-
 func (s *V1Service) prepareSessionVideo(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
 	return s.prepareVideoExecution(ctx, principal, in, "user", true)
 }
@@ -1780,13 +1777,6 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 // the background, and returns the OpenAI video object (status "queued").
 func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
 	ctx = context.WithoutCancel(ctx)
-	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
-		gridded, err := applyReferenceFaceSwap(in.ReferenceImages)
-		if err != nil {
-			return nil, err
-		}
-		in.ReferenceImages = gridded
-	}
 	if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
 		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
 		return nil, err
@@ -1815,6 +1805,18 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 	s.inflight.Add(eventID, cancel)
 	defer s.inflight.Done(eventID)
 	startedAt := time.Now()
+
+	// Face-grid preprocessing decodes/re-encodes the reference images and can take
+	// tens of seconds — run it here so POST /v1/videos returns the job id at once.
+	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
+		gridded, gridErr := applyReferenceFaceSwap(in.ReferenceImages)
+		if gridErr != nil {
+			_ = s.refundIfNeeded(ctx, principal, eventID, price)
+			_ = s.events.UpdateStatus(ctx, eventID, "failed", gridErr.Error(), 0)
+			return
+		}
+		in.ReferenceImages = gridded
+	}
 
 	// No-store: capture only the UPSTREAM video URL. /content streams it on demand
 	// (grok URLs are auth-gated → fetched with the generating account's token).
@@ -2431,21 +2433,6 @@ func contentTypeForExt(ext string) string {
 	}
 }
 
-// imageExtFromBytes sniffs a sensible file extension from the magic bytes so the
-// saved reference keeps its real type (the /images handler types by extension).
-func imageExtFromBytes(b []byte) string {
-	switch {
-	case len(b) >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF:
-		return "jpg"
-	case len(b) >= 6 && string(b[0:6]) == "GIF89a", len(b) >= 6 && string(b[0:6]) == "GIF87a":
-		return "gif"
-	case len(b) >= 12 && string(b[0:4]) == "RIFF" && string(b[8:12]) == "WEBP":
-		return "webp"
-	default:
-		return "png"
-	}
-}
-
 // allocateOutput builds the object key (= relative path, user-scoped) and the
 // directly-downloadable URL pointing at this site's /images proxy. Nothing is
 // written here — the bytes are uploaded to RustFS by the caller.
@@ -2493,10 +2480,6 @@ func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem 
 		return "", err
 	}
 	return event.ID, nil
-}
-
-func (s *V1Service) finishUnimplementedEvent(ctx context.Context, eventID string) error {
-	return s.events.UpdateStatus(ctx, eventID, "failed", "generation executor not implemented yet", 0)
 }
 
 // grokConcurrencyPerAccount is how many simultaneous generations one grok account
@@ -2612,6 +2595,11 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 			}
 			lastErr = err
 			lastTempDead = tempDead
+			// Once the job's deadline is spent, another account can only fail on
+			// the expired context and would mask the failure that consumed it.
+			if ctx.Err() != nil {
+				return nil, lastErr
+			}
 			if tempDead {
 				// temp-failover policy: this account hit a temporary upstream error.
 				// Cap how many accounts one burst may burn, then wait and retry
@@ -5070,4 +5058,3 @@ func (s *V1Service) rotateRoundRobin(pool string, items []model.TokenAccount) {
 		i = j
 	}
 }
-

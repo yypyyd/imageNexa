@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"errors"
 	"strings"
 
@@ -37,17 +36,4 @@ func (s *ImageAccessService) Resolve(user, name string) (string, error) {
 		return "", errors.New("invalid image path")
 	}
 	return user + "/" + name, nil
-}
-
-func (s *ImageAccessService) IsPublic(ctx context.Context, rel string) (bool, error) {
-	// Branding assets (the site logo) are public — they render on the homepage /
-	// header for logged-out visitors.
-	if strings.HasPrefix(rel, "branding/") {
-		return true, nil
-	}
-	return s.showcase.IsPublicFile(ctx, rel)
-}
-
-func (s *ImageAccessService) IsAuthorized(ctx context.Context, sessionCookie, owner string) (bool, error) {
-	return s.auth.IsAuthorizedForPrivateImage(ctx, sessionCookie, owner)
 }

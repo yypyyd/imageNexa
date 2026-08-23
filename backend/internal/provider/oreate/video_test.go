@@ -19,6 +19,35 @@ type stubSigner struct {
 
 func (s stubSigner) Sign(context.Context, Account) (Signature, error) { return s.sig, s.err }
 
+// stubSubmitter stands in for the signed page: the real submit only ever happens
+// in a browser, so the stub captures the request Go built and replays a canned
+// event stream.
+type stubSubmitter struct {
+	stubSigner
+	chatID  string
+	stream  string
+	status  int
+	payload []byte
+}
+
+func (s *stubSubmitter) SubmitVideo(_ context.Context, _ Account, payload []byte) (videoSubmitResult, error) {
+	s.payload = payload
+	status := s.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return videoSubmitResult{Status: status, ChatID: s.chatID, Stream: s.stream, Done: true}, nil
+}
+
+func (s *stubSubmitter) request(t *testing.T) videoRequest {
+	t.Helper()
+	var request videoRequest
+	if err := json.Unmarshal(s.payload, &request); err != nil {
+		t.Fatalf("decode submitted request: %v", err)
+	}
+	return request
+}
+
 func TestParseCreateChat(t *testing.T) {
 	id, err := parseCreateChat([]byte(`{"status":{"code":0,"msg":"success"},"data":{"chatId":" chat-1 "}}`))
 	if err != nil || id != "chat-1" {
@@ -102,18 +131,16 @@ func TestGenerateVideoRecoversDroppedStreamByLogID(t *testing.T) {
 		_, _ = w.Write([]byte("recovered-mp4"))
 	}))
 	defer cdn.Close()
+	// An unreadable chat is what leaves logId recovery as the only way to the
+	// rendered file.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/oreate/create/chat" {
-			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-3"}}`)
-			return
-		}
-		_, _ = io.WriteString(w, "data: {\"event\":\"start\",\"logId\":\"777\"}\n")
+		http.NotFound(w, r)
 	}))
 	defer server.Close()
 	client := NewClient("")
 	client.baseURL = server.URL
 	client.cdnBaseURL = cdn.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+	client.SetSigner(&stubSubmitter{chatID: "chat-3", stream: "data: {\"event\":\"start\",\"logId\":\"777\"}\n"})
 	data, meta, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
 		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p",
 		Duration: 5, DownloadResult: true,
@@ -136,11 +163,7 @@ func TestGenerateVideoSkipsRecoveryWithoutRecoverableJob(t *testing.T) {
 	for name, stream := range streams {
 		t.Run(name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/oreate/create/chat" {
-					_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-4"}}`)
-					return
-				}
-				_, _ = io.WriteString(w, stream)
+				http.NotFound(w, r)
 			}))
 			defer server.Close()
 			cdnCalls := 0
@@ -152,7 +175,7 @@ func TestGenerateVideoSkipsRecoveryWithoutRecoverableJob(t *testing.T) {
 			client := NewClient("")
 			client.baseURL = server.URL
 			client.cdnBaseURL = cdn.URL
-			client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+			client.SetSigner(&stubSubmitter{chatID: "chat-4", stream: stream})
 			_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
 				ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
 			})
@@ -166,34 +189,26 @@ func TestGenerateVideoSkipsRecoveryWithoutRecoverableJob(t *testing.T) {
 	}
 }
 
+// The page owns the identity fields, so the request Go hands it carries the
+// model configuration and the content while jt, chatId and focusId stay empty.
 func TestGenerateVideoRequestAndDownload(t *testing.T) {
 	video := []byte("test-mp4")
-	var gotRequest videoRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/oreate/create/chat":
-			assertOreateHeaders(t, r)
-			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-1"}}`)
-		case "/oreate/sse/stream":
-			assertOreateHeaders(t, r)
-			if r.Header.Get("Accept") != "text/event-stream" {
-				t.Errorf("Accept = %q", r.Header.Get("Accept"))
-			}
-			if err := json.NewDecoder(r.Body).Decode(&gotRequest); err != nil {
-				t.Errorf("decode request: %v", err)
-			}
-			_, _ = fmt.Fprintf(w, "data: {\\\"event\\\":\\\"end\\\",\\\"data\\\":{\\\"url\\\":%q}}\\n", serverURL(r)+"/video.mp4")
-		case "/video.mp4":
-			_, _ = w.Write(video)
-		default:
+		if r.URL.Path != "/video.mp4" {
 			http.NotFound(w, r)
+			return
 		}
+		_, _ = w.Write(video)
 	}))
 	defer server.Close()
 
 	client := NewClient("")
 	client.baseURL = server.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed", BID: "browser-bid"}})
+	submitter := &stubSubmitter{
+		chatID: "chat-1",
+		stream: fmt.Sprintf("data: {\"event\":\"end\",\"data\":{\"url\":%q}}\n", server.URL+"/video.mp4"),
+	}
+	client.SetSigner(submitter)
 	account := Account{Cookie: "OUID=device-1; ouss=session", UserAgent: "test-agent", Email: "user@example.com", VIP: "0", RegTS: 123}
 	data, meta, err := client.GenerateVideo(context.Background(), account, VideoOptions{
 		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p",
@@ -205,53 +220,21 @@ func TestGenerateVideoRequestAndDownload(t *testing.T) {
 	if string(data) != string(video) || meta["video_url"] == "" {
 		t.Fatalf("GenerateVideo() data/meta = %q, %#v", data, meta)
 	}
-	if gotRequest.ChatID != "chat-1" || gotRequest.FocusID != "chat-1" || gotRequest.VideoConfig.AIType != 14198 || gotRequest.VideoConfig.Scene != "text_or_image" {
-		t.Fatalf("request identity/config = %#v", gotRequest)
+	gotRequest := submitter.request(t)
+	if gotRequest.JT != "" || gotRequest.ChatID != "" || gotRequest.FocusID != "" {
+		t.Fatalf("request identity = %#v", gotRequest)
 	}
-	if gotRequest.JT != "signed" || gotRequest.Extra.BID != "browser-bid" || gotRequest.Extra.DeviceID != "device-1" || len(gotRequest.Messages) != 1 || gotRequest.Messages[0].Content != "hello" {
-		t.Fatalf("request auth/content = %#v", gotRequest)
+	if gotRequest.ChatType != "aiVideo" || gotRequest.VideoConfig.AIType != 14198 || gotRequest.VideoConfig.Scene != "text_or_image" {
+		t.Fatalf("request config = %#v", gotRequest)
 	}
-}
-
-// The stream request must carry the tracking cookies the signer browser minted
-// alongside the stored auth cookies; stored values win on name conflicts.
-func TestGenerateVideoMergesSignerCookies(t *testing.T) {
-	var streamCookie string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/oreate/create/chat" {
-			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-1"}}`)
-			return
-		}
-		streamCookie = r.Header.Get("Cookie")
-		_, _ = io.WriteString(w, "data: {\"event\":\"end\",\"data\":{\"url\":\"https://example.com/video.mp4\"}}\n")
-	}))
-	defer server.Close()
-	client := NewClient("")
-	client.baseURL = server.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed", Cookie: "_ga=GA1; __bid_n=fresh; OUID=browser-ouid"}})
-	_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "OUID=device-1; ouss=session"}, VideoOptions{
-		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
-	})
-	if err != nil {
-		t.Fatalf("GenerateVideo() error = %v", err)
-	}
-	if streamCookie != "OUID=device-1; ouss=session; _ga=GA1; __bid_n=fresh" {
-		t.Fatalf("stream cookie = %q", streamCookie)
+	if gotRequest.UA != "test-agent" || gotRequest.Extra.DeviceID != "device-1" || len(gotRequest.Messages) != 1 || gotRequest.Messages[0].Content != "hello" {
+		t.Fatalf("request content = %#v", gotRequest)
 	}
 }
 
 func TestGenerateVideoURLOnly(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/oreate/create/chat" {
-			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-2"}}`)
-			return
-		}
-		_, _ = io.WriteString(w, "data: {\"event\":\"end\",\"url\":\"https://cdn.example/url-only.mp4\"}\n")
-	}))
-	defer server.Close()
 	client := NewClient("")
-	client.baseURL = server.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+	client.SetSigner(&stubSubmitter{chatID: "chat-2", stream: "data: {\"event\":\"end\",\"url\":\"https://cdn.example/url-only.mp4\"}\n"})
 	data, meta, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
 		ModelID: "seedance-2.0-fast", Prompt: "hello", Ratio: "1:1", Resolution: "720",
 		Duration: 10, Audio: true, DownloadResult: false,
@@ -342,7 +325,6 @@ func TestGenerateVideoRejectsReferenceVideoForSeedance15(t *testing.T) {
 
 func referenceVideoTestClient(t *testing.T) (*Client, func() videoRequest, func() int, func()) {
 	t.Helper()
-	var got videoRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case uploadTokenPath:
@@ -356,13 +338,6 @@ func referenceVideoTestClient(t *testing.T) (*Client, func() videoRequest, func(
 				keys[filename] = uploadCredential{Bucket: "ot-pt", ObjectPath: "uploaded/" + filename, SessionKey: "test-token"}
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"code": 0}, "data": map[string]any{"KeyList": keys}})
-		case "/oreate/create/chat":
-			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-ref"}}`)
-		case "/oreate/sse/stream":
-			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-				t.Errorf("decode generation request: %v", err)
-			}
-			_, _ = io.WriteString(w, "data: {\"event\":\"end\",\"url\":\"https://cdn.example/reference.mp4\"}\n")
 		default:
 			http.NotFound(w, r)
 		}
@@ -370,7 +345,11 @@ func referenceVideoTestClient(t *testing.T) (*Client, func() videoRequest, func(
 	uploads := 0
 	client := NewClient("")
 	client.baseURL = server.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+	submitter := &stubSubmitter{
+		chatID: "chat-ref",
+		stream: "data: {\"event\":\"end\",\"url\":\"https://cdn.example/reference.mp4\"}\n",
+	}
+	client.SetSigner(submitter)
 	client.directClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.Method {
 		case http.MethodPost:
@@ -382,16 +361,51 @@ func referenceVideoTestClient(t *testing.T) (*Client, func() videoRequest, func(
 			return nil, fmt.Errorf("unexpected direct request %s", req.Method)
 		}
 	})}
-	return client, func() videoRequest { return got }, func() int { return uploads }, server.Close
+	return client, func() videoRequest { return submitter.request(t) }, func() int { return uploads }, server.Close
 }
 
-func assertOreateHeaders(t *testing.T, r *http.Request) {
-	t.Helper()
-	for key, want := range map[string]string{"Cookie": "OUID=device-1; ouss=session", "User-Agent": "test-agent", "Client-Type": "pc", "Locale": "zh-CN"} {
-		if got := r.Header.Get(key); got != want {
-			t.Errorf("%s = %q, want %q", key, got, want)
-		}
+func TestParseChatVideoReadsTerminalState(t *testing.T) {
+	ready := `{"status":{"code":0},"data":{"messageList":[{"role":"user","content":"prompt"},{"role":"assistant","content":"<video src=\"https://cdn.example/ready.mp4\"></video>","data":"{\"status\":3}"}]}}`
+	verdict, err := parseChatVideo([]byte(ready))
+	if err != nil || verdict.VideoURL != "https://cdn.example/ready.mp4" || verdict.Pending {
+		t.Fatalf("ready verdict = %+v, err = %v", verdict, err)
+	}
+	failed := `{"status":{"code":0},"data":{"messageList":[{"role":"assistant","content":"<p>Oreate failed to generate a video, please try again.</p>","data":"{\"status\":2}"}]}}`
+	verdict, err = parseChatVideo([]byte(failed))
+	if err != nil || !verdict.Failed || verdict.Pending {
+		t.Fatalf("failed verdict = %+v, err = %v", verdict, err)
+	}
+	if got := upstreamFailureMessage(verdict.Message); got != "Oreate failed to generate a video, please try again." {
+		t.Fatalf("failure message = %q", got)
+	}
+	generating := `{"status":{"code":0},"data":{"messageList":[{"role":"assistant","content":"generating video","data":"{\"status\":1}"}]}}`
+	verdict, err = parseChatVideo([]byte(generating))
+	if err != nil || !verdict.Pending || verdict.Failed || verdict.VideoURL != "" {
+		t.Fatalf("pending verdict = %+v, err = %v", verdict, err)
+	}
+	empty := `{"status":{"code":0},"data":{"messageList":[{"role":"user","content":"prompt"}]}}`
+	verdict, err = parseChatVideo([]byte(empty))
+	if err != nil || !verdict.Pending || verdict.Failed || verdict.VideoURL != "" {
+		t.Fatalf("empty-chat verdict = %+v, err = %v", verdict, err)
 	}
 }
 
-func serverURL(r *http.Request) string { return "http://" + r.Host }
+func TestGenerateVideoReportsChatFailureVerdict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != messageListPath {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"messageList":[{"role":"assistant","content":"<p>Oreate failed to generate a video, please try again.</p>","data":"{\"status\":2}"}]}}`)
+	}))
+	defer server.Close()
+	client := NewClient("")
+	client.baseURL = server.URL
+	client.SetSigner(&stubSubmitter{chatID: "chat-1", stream: "data: {\"event\":\"start\",\"logId\":\"555\"}\n"})
+	_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
+		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed to generate a video") {
+		t.Fatalf("GenerateVideo error = %v, want the chat verdict", err)
+	}
+}
