@@ -42,7 +42,7 @@ var (
 	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
 	// the account's — every account rejects the same content — so the caller must
 	// surface it as-is without penalizing/killing the account or failing over.
-	ErrContentRejected = errors.New("Adobe 内容安全审核未通过，请修改提示词或参考素材后重试")
+	ErrContentRejected = errors.New("内容安全审核未通过，请修改提示词或参考素材后重试")
 )
 
 // ContentRejectionError preserves Adobe's moderation code so callers can
@@ -67,14 +67,6 @@ func (e *ContentRejectionError) Error() string {
 }
 
 func (e *ContentRejectionError) Unwrap() error { return ErrContentRejected }
-
-// isContentRejection reports whether an Adobe response (status + body) is a
-// content-safety refusal rather than a genuine upstream/account failure. Adobe
-// returns HTTP 451 with an "*_unsafe" code for general moderation, and
-// reference_image_privacy_error when a reference contains a real person's face.
-func isContentRejection(status int, body string) bool {
-	return contentRejectionCode(status, body) != ""
-}
 
 func contentRejectionError(status int, body string) error {
 	code := contentRejectionCode(status, body)

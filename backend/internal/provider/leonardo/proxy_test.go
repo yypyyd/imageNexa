@@ -7,10 +7,7 @@ func TestProxyClientsUseConfiguredProxy(t *testing.T) {
 	if _, err := client.newDirectTLSClient(); err != nil {
 		t.Fatalf("direct non-submit client used configured proxy: %v", err)
 	}
-	if _, err := client.newProxyTLSClient(); err == nil {
+	if _, err := client.newTLSClientP(true); err == nil {
 		t.Fatal("proxy client accepted malformed proxy")
-	}
-	if _, err := client.newSubmitTLSClient(); err == nil {
-		t.Fatal("submit client accepted malformed proxy")
 	}
 }

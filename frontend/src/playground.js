@@ -12,15 +12,3 @@ export const draft = reactive({
   resolution: '',
   duration: '',
 })
-
-// Copy fields from a server-side job entry (the `/jobs/mine` payload) into
-// the draft so a parallel tab can pick up exactly what's being generated.
-export function applyJobToDraft(entry) {
-  if (!entry) return
-  draft.mode = entry.kind === 'video' ? 'video' : 'image'
-  draft.modelId = entry.model || ''
-  draft.prompt = entry.prompt || ''
-  draft.ratio = entry.ratio || ''
-  draft.resolution = entry.resolution || ''
-  draft.duration = entry.duration || ''
-}

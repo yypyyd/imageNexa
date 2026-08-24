@@ -41,12 +41,6 @@ export function jsonBody(method, payload) {
   }
 }
 
-/** Health check hitting the plain /health endpoint. */
-export async function fetchHealth() {
-  const r = await fetch(`${BASE}/health`)
-  return r.json()
-}
-
 /** Absolute URL for a generated artifact (works in dev via proxy too). */
 export function generatedUrl(name) {
   return `${BASE}/images/${name}`

@@ -191,8 +191,6 @@ func (h *ProviderAdminHandler) ImportKreaCookie(c *gin.Context) {
 	var body struct {
 		Cookie string `json:"cookie"`
 		Value  string `json:"value"`
-		Name   string `json:"name"`
-		ID     string `json:"id"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
@@ -202,11 +200,7 @@ func (h *ProviderAdminHandler) ImportKreaCookie(c *gin.Context) {
 	if cookie == "" {
 		cookie = body.Value
 	}
-	name := body.Name
-	if name == "" {
-		name = body.ID
-	}
-	item, err := h.tokens.ImportKreaCookie(c.Request.Context(), cookie, name)
+	item, err := h.tokens.ImportKreaCookie(c.Request.Context(), cookie)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
@@ -218,8 +212,6 @@ func (h *ProviderAdminHandler) ImportImagineToken(c *gin.Context) {
 	var body struct {
 		Cookie string `json:"cookie"`
 		Value  string `json:"value"`
-		Name   string `json:"name"`
-		ID     string `json:"id"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
@@ -229,11 +221,7 @@ func (h *ProviderAdminHandler) ImportImagineToken(c *gin.Context) {
 	if cred == "" {
 		cred = body.Value
 	}
-	name := body.Name
-	if name == "" {
-		name = body.ID
-	}
-	item, err := h.tokens.ImportImagineToken(c.Request.Context(), cred, name)
+	item, err := h.tokens.ImportImagineToken(c.Request.Context(), cred)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return

@@ -52,8 +52,8 @@ type hotSignature struct {
 	Proxy string
 }
 
-// hotSigner is implemented by signers that keep warm pages, so a test signer
-// installed with SetSigner still works through the plain Signer interface.
+// hotSigner is implemented by signers that keep warm pages. Test signers can
+// still implement only the plain Signer interface.
 type hotSigner interface {
 	SignHot(ctx context.Context, account Account) (hotSignature, error)
 }

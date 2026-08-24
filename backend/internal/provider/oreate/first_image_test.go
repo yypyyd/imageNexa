@@ -60,7 +60,7 @@ func TestClaimFirstImageBonus(t *testing.T) {
 	defer server.Close()
 	client := NewClient("")
 	client.baseURL = server.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed", BID: "browser-bid", Cookie: "_ga=GA1; __bid_n=fresh; OUID=browser-ouid"}})
+	client.signer = stubSigner{sig: Signature{JT: "signed", BID: "browser-bid", Cookie: "_ga=GA1; __bid_n=fresh; OUID=browser-ouid"}}
 	url, err := client.ClaimFirstImageBonus(context.Background(), Account{Cookie: "OUID=device-1; ouss=session", Email: "user@example.com"})
 	if err != nil || url != "https://cdn.example/first" {
 		t.Fatalf("ClaimFirstImageBonus() = %q, %v", url, err)
@@ -100,7 +100,7 @@ func TestClaimFirstImageBonusRequestsGrantAfterBrokenStream(t *testing.T) {
 	defer server.Close()
 	client := NewClient("")
 	client.baseURL = server.URL
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+	client.signer = stubSigner{sig: Signature{JT: "signed"}}
 	if _, err := client.ClaimFirstImageBonus(context.Background(), Account{Cookie: "ouss=session"}); !errors.Is(err, errStreamIncomplete) {
 		t.Fatalf("ClaimFirstImageBonus() error = %v", err)
 	}

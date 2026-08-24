@@ -433,8 +433,6 @@ func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool
 // newProxyTLSClient is used for authentication/account maintenance and submit.
 func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
-
 // newDirectTLSClient is used for project setup, media, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 

@@ -440,7 +440,7 @@ func (s *TokenService) checkPendingLeonardo(tokenID, cookie string) {
 
 // ImportKreaCookie imports a Krea account. Like Leonardo the stored credential
 // IS the cookie (Supabase session); quota/generation forward it directly.
-func (s *TokenService) ImportKreaCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, error) {
+func (s *TokenService) ImportKreaCookie(ctx context.Context, cookie string) (*model.TokenAccount, error) {
 	s.applyProxy(ctx)
 	cookie = cleanAdobeCookie(cookie) // same paste-cleanup (JSON / "Cookie:" prefix)
 	if cookie == "" {
@@ -454,6 +454,7 @@ func (s *TokenService) ImportKreaCookie(ctx context.Context, cookie, tokenID str
 	// new account. Reuse the existing row for this email; else mint a fresh unique
 	// id (never trust the caller's id for a new row).
 	email := krea.EmailFromCookie(cookie)
+	var tokenID string
 	if existing, _ := s.tokens.GetByPoolEmail(ctx, "krea", email); existing != nil {
 		tokenID = existing.ID
 	} else {
@@ -537,7 +538,7 @@ func (s *TokenService) checkPendingKrea(tokenID, cookie string) {
 // ImportImagineToken imports an Imagine.art account. The stored credential IS the
 // JSON {"token","refreshToken"}; quota/generation forward it (refreshing the
 // access token from the refreshToken when expired).
-func (s *TokenService) ImportImagineToken(ctx context.Context, cred, tokenID string) (*model.TokenAccount, error) {
+func (s *TokenService) ImportImagineToken(ctx context.Context, cred string) (*model.TokenAccount, error) {
 	s.applyProxy(ctx)
 	cred = strings.TrimSpace(cred)
 	if cred == "" {
@@ -549,6 +550,7 @@ func (s *TokenService) ImportImagineToken(ctx context.Context, cred, tokenID str
 	// Identity is (pool, email=userId), NOT the caller-supplied id — reuse the
 	// existing row for this account; else mint a fresh unique id.
 	email := imagine.EmailFromCred(cred)
+	var tokenID string
 	if existing, _ := s.tokens.GetByPoolEmail(ctx, "imagine", email); existing != nil {
 		tokenID = existing.ID
 	} else {
@@ -1935,9 +1937,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		if item.Status == "quota" && hasRem && rem > 0 {
 			patch["status"] = "active"
 		}
-		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-			item = updated
-		}
+		_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
 		return map[string]any{
 			"supported":       true,
 			"remaining":       data["remaining"],
@@ -1984,9 +1984,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		if item.Status == "quota" && hasRem && rem > 0 {
 			patch["status"] = "active"
 		}
-		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-			item = updated
-		}
+		_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
 		return map[string]any{
 			"supported":       true,
 			"remaining":       data["remaining"],
@@ -2032,9 +2030,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		// explicit renewal time. Drives RecoverQuota.
 		resetAfter := leonardoResetAfter(stringValue(data["available_until"]))
 		patch["cached_quota_reset_after"] = resetAfter
-		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-			item = updated
-		}
+		_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
 		return map[string]any{
 			"supported":       true,
 			"remaining":       data["remaining"],

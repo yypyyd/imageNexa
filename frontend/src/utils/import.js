@@ -6,7 +6,7 @@ const MAX_IMPORT_FILE_BYTES = 20 * 1024 * 1024
 const MAX_ZIP_ENTRY_BYTES = 2 * 1024 * 1024
 const MAX_ZIP_JSON_FILES = 1000
 
-export function looksLikeJwt(s) {
+function looksLikeJwt(s) {
   s = (s || '').replace(/^Bearer\s+/i, '').trim()
   const parts = s.split('.')
   if (parts.length !== 3) return false
@@ -26,7 +26,7 @@ function decodeJwtPayload(s) {
 // Runway JWTs carry a top-level numeric `id` plus an `sso` claim and, crucially,
 // no OpenAI (https://api.openai.com/*) claims — that's what distinguishes them
 // from a ChatGPT JWT, which is otherwise also an opaque three-part token.
-export function looksLikeRunwayJwt(s) {
+function looksLikeRunwayJwt(s) {
   const claims = decodeJwtPayload(s)
   if (!claims || typeof claims !== 'object') return false
   if (Object.keys(claims).some((k) => k.startsWith('https://api.openai.com/'))) return false
@@ -35,7 +35,7 @@ export function looksLikeRunwayJwt(s) {
 
 // Grok website "sso" JWTs carry ONLY a session_id claim (no openai claims, no
 // runway id/sso) — that's what tells them apart from a ChatGPT/Runway JWT.
-export function looksLikeGrokJwt(s) {
+function looksLikeGrokJwt(s) {
   const claims = decodeJwtPayload(s)
   if (!claims || typeof claims !== 'object') return false
   if (Object.keys(claims).some((k) => k.startsWith('https://api.openai.com/'))) return false
@@ -45,16 +45,16 @@ export function looksLikeGrokJwt(s) {
 
 // Leonardo cookies carry the better-auth session cookie — that's what tells them
 // apart from an Adobe cookie (both are otherwise opaque cookie strings).
-export function looksLikeLeonardoCookie(s) {
+function looksLikeLeonardoCookie(s) {
   return /better-auth\.session_token/.test(s || '') || /better-auth\.session_data/.test(s || '')
 }
 
 // Krea cookies carry the Supabase auth cookie.
-export function looksLikeKreaCookie(s) {
+function looksLikeKreaCookie(s) {
   return /sb-superb-auth-token/.test(s || '')
 }
 
-export function looksLikeOreateCookie(s) {
+function looksLikeOreateCookie(s) {
   return /(?:^|;\s*)OUID=[^;]+/.test(s || '') && /(?:^|;\s*)ouss=[^;]+/.test(s || '')
 }
 
@@ -66,7 +66,7 @@ function isImagineObj(o) {
 }
 
 // String form (a pasted JSON object on a line).
-export function looksLikeImagineToken(s) {
+function looksLikeImagineToken(s) {
   try { return isImagineObj(JSON.parse(s)) } catch (_) { return false }
 }
 

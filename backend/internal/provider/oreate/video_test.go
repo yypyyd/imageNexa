@@ -140,7 +140,7 @@ func TestGenerateVideoRecoversDroppedStreamByLogID(t *testing.T) {
 	client := NewClient("")
 	client.baseURL = server.URL
 	client.cdnBaseURL = cdn.URL
-	client.SetSigner(&stubSubmitter{chatID: "chat-3", stream: "data: {\"event\":\"start\",\"logId\":\"777\"}\n"})
+	client.signer = &stubSubmitter{chatID: "chat-3", stream: "data: {\"event\":\"start\",\"logId\":\"777\"}\n"}
 	data, meta, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
 		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p",
 		Duration: 5, DownloadResult: true,
@@ -175,7 +175,7 @@ func TestGenerateVideoSkipsRecoveryWithoutRecoverableJob(t *testing.T) {
 			client := NewClient("")
 			client.baseURL = server.URL
 			client.cdnBaseURL = cdn.URL
-			client.SetSigner(&stubSubmitter{chatID: "chat-4", stream: stream})
+			client.signer = &stubSubmitter{chatID: "chat-4", stream: stream}
 			_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
 				ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
 			})
@@ -208,7 +208,7 @@ func TestGenerateVideoRequestAndDownload(t *testing.T) {
 		chatID: "chat-1",
 		stream: fmt.Sprintf("data: {\"event\":\"end\",\"data\":{\"url\":%q}}\n", server.URL+"/video.mp4"),
 	}
-	client.SetSigner(submitter)
+	client.signer = submitter
 	account := Account{Cookie: "OUID=device-1; ouss=session", UserAgent: "test-agent", Email: "user@example.com", VIP: "0", RegTS: 123}
 	data, meta, err := client.GenerateVideo(context.Background(), account, VideoOptions{
 		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p",
@@ -234,7 +234,7 @@ func TestGenerateVideoRequestAndDownload(t *testing.T) {
 
 func TestGenerateVideoURLOnly(t *testing.T) {
 	client := NewClient("")
-	client.SetSigner(&stubSubmitter{chatID: "chat-2", stream: "data: {\"event\":\"end\",\"url\":\"https://cdn.example/url-only.mp4\"}\n"})
+	client.signer = &stubSubmitter{chatID: "chat-2", stream: "data: {\"event\":\"end\",\"url\":\"https://cdn.example/url-only.mp4\"}\n"}
 	data, meta, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
 		ModelID: "seedance-2.0-fast", Prompt: "hello", Ratio: "1:1", Resolution: "720",
 		Duration: 10, Audio: true, DownloadResult: false,
@@ -313,7 +313,7 @@ func TestGenerateVideoReferenceScenes(t *testing.T) {
 
 func TestGenerateVideoRejectsReferenceVideoForSeedance15(t *testing.T) {
 	client := NewClient("")
-	client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+	client.signer = stubSigner{sig: Signature{JT: "signed"}}
 	_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=session"}, VideoOptions{
 		ModelID: "seedance-1.5-pro", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
 		ReferenceVideos: []MediaReference{{Data: []byte("video"), ContentType: "video/mp4", DurationSec: 5}},
@@ -349,7 +349,7 @@ func referenceVideoTestClient(t *testing.T) (*Client, func() videoRequest, func(
 		chatID: "chat-ref",
 		stream: "data: {\"event\":\"end\",\"url\":\"https://cdn.example/reference.mp4\"}\n",
 	}
-	client.SetSigner(submitter)
+	client.signer = submitter
 	client.directClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.Method {
 		case http.MethodPost:
@@ -401,7 +401,7 @@ func TestGenerateVideoReportsChatFailureVerdict(t *testing.T) {
 	defer server.Close()
 	client := NewClient("")
 	client.baseURL = server.URL
-	client.SetSigner(&stubSubmitter{chatID: "chat-1", stream: "data: {\"event\":\"start\",\"logId\":\"555\"}\n"})
+	client.signer = &stubSubmitter{chatID: "chat-1", stream: "data: {\"event\":\"start\",\"logId\":\"555\"}\n"}
 	_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
 		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
 	})

@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"image"
 	"image/color"
@@ -15,12 +16,12 @@ func TestFacePanelTransformAppliesToAdobeAndOreateSeedance(t *testing.T) {
 		"oreate-seedance-1.5-pro", "oreate-seedance-2.0-mini", "oreate-seedance-2.0-fast", "oreate-seedance-2.0", "oreate-seedance-2.5",
 		" OREATE-SEEDANCE-2.0-MINI ",
 	} {
-		if !(&V1Service{}).shouldApplyReferenceGrid(nil, model, false) {
+		if !(&V1Service{}).shouldApplyReferenceGrid(context.Background(), model, false) {
 			t.Fatalf("model %q should enable face-panel transform", model)
 		}
 	}
 	for _, model := range []string{"firefly-kling-o3", "firefly-ray", "gpt-image-2", "runway-gen4", ""} {
-		if (&V1Service{}).shouldApplyReferenceGrid(nil, model, true) {
+		if (&V1Service{}).shouldApplyReferenceGrid(context.Background(), model, true) {
 			t.Fatalf("model %q should not enable face-panel transform", model)
 		}
 	}

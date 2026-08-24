@@ -19,8 +19,6 @@ export const auth = reactive({
 
 export function isAuthed() { return !!auth.token && !!auth.user }
 export function isAdmin() { return isAuthed() && auth.user.role === 'admin' }
-export function isAgent() { return isAuthed() && auth.user.role === 'agent' }
-export function getToken() { return auth.token }
 
 /** Open the login modal, remembering where the user wanted to go. */
 export function openLogin(intent = '') { auth.loginIntent = intent || ''; auth.startMode = 'login'; auth.loginOpen = true }

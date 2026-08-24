@@ -4,9 +4,7 @@ package grok
 // OWN obfuscated signer (a Turbopack chunk) inside an embedded JS engine (goja),
 // under a synthesized DOM + Web-Animations getComputedStyle shim (statsig_shim.js).
 // grok's code does all the per-build byte-indexing / curve-selection; we only supply
-// the stable browser primitives. This replaces the brittle hand-ported byte-offset
-// algorithm in computeStatsigTail (kept as a last-resort fallback). See the package
-// doc and the grok-statsig-signer memory for the reverse-engineering details.
+// the stable browser primitives. Static defaults remain the last-resort fallback.
 
 import (
 	"context"

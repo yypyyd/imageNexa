@@ -10,12 +10,12 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
-The dev server proxies `/admin`, `/health`, `/generated`, `/v1` to the backend.
+The dev server proxies `/admin/api`, `/health`, `/images`, and `/v1` to the backend.
 Start the backend separately:
 
 ```bash
-# from repo root
-python app.py      # http://0.0.0.0:6060
+cd ../backend
+go run ./cmd/api   # http://127.0.0.1:6666
 ```
 
 The account importer recognizes OreateAI account-export JSON. It forwards only
@@ -29,7 +29,7 @@ downstream importers. OreateAI currently advertises no reference-audio slots.
 If the backend runs elsewhere, set `VITE_BACKEND` before `npm run dev`:
 
 ```bash
-VITE_BACKEND=http://192.168.1.10:6060 npm run dev
+VITE_BACKEND=http://192.168.1.10:6666 npm run dev
 ```
 
 ## Build
@@ -40,5 +40,5 @@ npm run preview    # serve the production build locally
 ```
 
 When hosting `dist/` on a different origin than the API, set `VITE_API_BASE`
-(e.g. `VITE_API_BASE=http://api-host:6060`) at build time, and add that frontend
+(e.g. `VITE_API_BASE=http://api-host:6666`) at build time, and add that frontend
 origin to the backend's `CORS_ORIGINS` env var.

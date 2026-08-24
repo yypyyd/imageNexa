@@ -127,10 +127,10 @@ func TestGlobalChatGPTProxyReplacesAndClearsPreviousValue(t *testing.T) {
 	}
 }
 
-func TestAssistantTextFromEvent(t *testing.T) {
+func TestApplyAssistantEvent(t *testing.T) {
 	raw := []byte(`{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["hello","world"]}}}`)
-	if got := assistantTextFromEvent(raw); got != "hello\nworld" {
-		t.Fatalf("assistantTextFromEvent() = %q", got)
+	if got, _, _ := applyAssistantEvent(raw, "", false); got != "hello\nworld" {
+		t.Fatalf("applyAssistantEvent() = %q", got)
 	}
 	if got := textModelSlug("chatgpt-auto"); got != "auto" {
 		t.Fatalf("textModelSlug(chatgpt-auto) = %q", got)

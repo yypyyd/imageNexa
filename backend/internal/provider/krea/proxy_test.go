@@ -10,7 +10,4 @@ func TestProxyClientsUseConfiguredProxy(t *testing.T) {
 	if _, err := client.newProxyTLSClient(); err == nil {
 		t.Fatal("proxy client accepted malformed proxy")
 	}
-	if _, err := client.newSubmitTLSClient(); err == nil {
-		t.Fatal("submit client accepted malformed proxy")
-	}
 }

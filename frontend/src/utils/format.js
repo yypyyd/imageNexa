@@ -27,23 +27,6 @@ export function fmtIso(iso) {
   } catch { return iso }
 }
 
-/** Human-friendly "5m 后 / 3h 前" relative time from unix seconds.
- *  Floors to integer seconds so floating-point ts (e.g. `time.time()` on the
- *  server) never leaks "15.88s 前" into the UI. */
-export function fmtRelative(ts) {
-  ts = Number(ts)
-  if (!ts || Number.isNaN(ts)) return '—'
-  const diff = Math.round(ts - Date.now() / 1000)
-  const abs = Math.abs(diff)
-  const u = (n, s) => `${n}${s}`
-  let txt
-  if (abs < 60) txt = u(abs, 's')
-  else if (abs < 3600) txt = u(Math.floor(abs / 60), 'm')
-  else if (abs < 86400) txt = u(Math.floor(abs / 3600), 'h')
-  else txt = u(Math.floor(abs / 86400), 'd')
-  return diff >= 0 ? `${txt} 后` : `${txt} 前`
-}
-
 // Accepts either unix-seconds (number or numeric string) or an ISO-8601 string,
 // returning a Date in either case (null when unparseable). Lets the stacked
 // date/time cells below work for both the unix timestamps (created_at, etc.)
@@ -100,10 +83,6 @@ export function friendlyGenerationError(value) {
     return 'Adobe 内容安全审核未通过，请修改提示词或参考素材后重试。'
   }
   return message
-}
-
-export function nowTime() {
-  return new Date().toLocaleTimeString(CN_LOCALE, CN_TZ_OPTS)
 }
 
 /** Human-readable byte size — "86 MB", "5.3 MB", "512 KB". Rounds to a whole

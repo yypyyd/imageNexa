@@ -234,9 +234,8 @@ func (c *Client) FetchSession(ctx context.Context, token string) (email, userID 
 // hand-ported algorithm goes stale within a day (403 anti-bot). The durable path
 // therefore runs grok's OWN signer in goja (statsig_engine.go): we fetch the seed
 // + curves from the homepage and let grok's code do all the (rotating) indexing.
-// statsigID prefers that engine; the hand-ported computeStatsigTail below and the
-// static env-overridable defaults are only a last-resort fallback. See the package
-// doc and statsig_engine.go for the full picture.
+// statsigID prefers that engine; the static env-overridable defaults are only a
+// last-resort fallback. See statsig_engine.go for the full picture.
 // statsigEpoch is the challenge epoch (2023-05-01 00:00 UTC).
 const (
 	statsigEpoch          = 1682924400
@@ -244,7 +243,6 @@ const (
 	defaultStatsigSuffix  = "obfiowerehiringd244100f5c28f5c28f5c047ae147ae147b047ae147ae147b0f5c28f5c28f5c00"
 	defaultStatsigTrailer = 3
 	statsigSaltPrefix     = "obfiowerehiring"
-	statsigAnimDuration   = 4096
 	statsigTTL            = 5 * time.Minute
 	statsigRefreshTimeout = 45 * time.Second
 )
@@ -446,14 +444,14 @@ func fetchStatsigChallenge(ctx context.Context, client tlsclient.HttpClient) (st
 		seedB64:    mm[1],
 		curvesJSON: string(curvesJSON),
 	}
-	// NOTE: the old hand-ported per-session derivation (0x00+seed header +
-	// computeStatsigTail salt) is intentionally NOT applied here. Verified
-	// 2026-07-13 against /rest/app-chat/conversations/new: that dynamic token is
+	// NOTE: the old hand-ported per-session derivation is intentionally NOT
+	// applied here. Verified 2026-07-13 against
+	// /rest/app-chat/conversations/new: that dynamic token is
 	// rejected ("Request rejected by anti-bot rules.", 403), while the static
 	// (header, salt) defaults are accepted (200) — so we keep the static values
 	// as the fallback. When the goja signer (ensureEngine above) locates and
 	// verifies grok's own chunk it still takes over via seedB64/curvesJSON in
-	// statsigID; computeStatsigTail is retained only for reference/tests.
+	// statsigID.
 	return ch, nil
 }
 
@@ -524,119 +522,6 @@ func parseStatsigCurves(html string) ([][]statsigCurve, error) {
 		return nil, fmt.Errorf("statsig: curves json: %w", err)
 	}
 	return out, nil
-}
-
-// computeStatsigTail reproduces the browser's 3-byte color + 6-number transform
-// matrix "F" tail: it selects a curve by the seed, samples the curve's keyframe
-// animation (color lerp + rotate) at a seed-derived paused currentTime, and
-// serializes getComputedStyle(color)+getComputedStyle(transform) exactly as the
-// signer does (each number -> Number(v.toFixed(2)).toString(16), '.'/'-' stripped).
-func computeStatsigTail(seed []byte, curves [][]statsigCurve) (string, error) {
-	if len(seed) < 46 {
-		return "", errors.New("statsig: short seed")
-	}
-	if len(curves) == 0 {
-		return "", errors.New("statsig: no curves")
-	}
-	group := int(seed[5]) % len(curves)
-	if len(curves[group]) == 0 {
-		return "", errors.New("statsig: empty curve group")
-	}
-	idx := int(seed[45]) % len(curves[group])
-	cv := curves[group][idx]
-	if len(cv.Color) < 6 || len(cv.Bezier) < 4 {
-		return "", errors.New("statsig: malformed curve")
-	}
-
-	n := (int(seed[1]) % 16) * (int(seed[6]) % 16) * (int(seed[13]) % 16)
-	currentTime := jsRound(float64(n)/10) * 10
-	progress := float64(currentTime) / statsigAnimDuration
-
-	x1 := toFixed2(float64(cv.Bezier[0]) / 255)
-	y1 := toFixed2(float64(cv.Bezier[1])*2/255 - 1)
-	x2 := toFixed2(float64(cv.Bezier[2]) / 255)
-	y2 := toFixed2(float64(cv.Bezier[3])*2/255 - 1)
-	eased := cubicBezierEase(x1, y1, x2, y2, progress)
-
-	nums := make([]float64, 0, 9)
-	for k := 0; k < 3; k++ {
-		v := jsRound(float64(cv.Color[k]) + (float64(cv.Color[k+3])-float64(cv.Color[k]))*eased)
-		if v < 0 {
-			v = 0
-		}
-		if v > 255 {
-			v = 255
-		}
-		nums = append(nums, float64(v))
-	}
-	theta := int(math.Floor(float64(cv.Deg)*300/255 + 60))
-	rad := float64(theta) * eased * math.Pi / 180
-	cos, sin := math.Cos(rad), math.Sin(rad)
-	nums = append(nums, cos, sin, -sin, cos, 0, 0)
-
-	var b strings.Builder
-	for _, v := range nums {
-		b.WriteString(jsHex(v))
-	}
-	out := strings.NewReplacer(".", "", "-", "").Replace(b.String())
-	return out, nil
-}
-
-// jsRound matches JavaScript Math.round (round half up toward +Inf).
-func jsRound(x float64) int {
-	return int(math.Floor(x + 0.5))
-}
-
-// toFixed2 matches JavaScript Number(v.toFixed(2)).
-func toFixed2(v float64) float64 {
-	f, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'f', 2, 64), 64)
-	return f
-}
-
-// jsHex matches JavaScript Number(v.toFixed(2)).toString(16).
-func jsHex(v float64) string {
-	v = toFixed2(v)
-	neg := ""
-	if v < 0 {
-		neg = "-"
-		v = -v
-	}
-	ip := int64(math.Floor(v))
-	frac := v - float64(ip)
-	s := neg + strconv.FormatInt(ip, 16)
-	if frac == 0 {
-		return s
-	}
-	const digits = "0123456789abcdef"
-	var b strings.Builder
-	b.WriteString(s)
-	b.WriteByte('.')
-	for i := 0; i < 20 && frac != 0; i++ {
-		frac *= 16
-		d := int(frac)
-		b.WriteByte(digits[d])
-		frac -= float64(d)
-	}
-	return b.String()
-}
-
-// cubicBezierEase evaluates a CSS cubic-bezier(x1,y1,x2,y2) easing at input
-// fraction p: solve X(t)=p for t (bisection), then return Y(t).
-func cubicBezierEase(x1, y1, x2, y2, p float64) float64 {
-	bez := func(t, a, b float64) float64 {
-		mt := 1 - t
-		return 3*a*mt*mt*t + 3*b*mt*t*t + t*t*t
-	}
-	lo, hi := 0.0, 1.0
-	for i := 0; i < 100; i++ {
-		mid := (lo + hi) / 2
-		if bez(mid, x1, x2) < p {
-			lo = mid
-		} else {
-			hi = mid
-		}
-	}
-	return bez((lo+hi)/2, y1, y2)
 }
 
 // statsigID reproduces grok.com's x-statsig-id anti-bot token for a request. The

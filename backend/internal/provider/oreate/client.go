@@ -93,14 +93,6 @@ func (c *Client) endpoint(path string) string {
 	return base + path
 }
 
-// SetSigner is primarily useful for deterministic tests. Production clients use
-// the Chromium signer created by NewClient.
-func (c *Client) SetSigner(signer Signer) {
-	if signer != nil {
-		c.signer = signer
-	}
-}
-
 func (c *Client) SetProxy(proxy string) {
 	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)

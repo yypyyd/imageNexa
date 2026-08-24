@@ -325,11 +325,6 @@ func numericValue(value any) float64 {
 	}
 }
 
-func assistantTextFromEvent(raw []byte) string {
-	text, _, _ := applyAssistantEvent(raw, "", false)
-	return text
-}
-
 // applyAssistantEvent understands ChatGPT's v1 SSE encoding: the assistant
 // message is added with an empty parts[0], then later patch events append text
 // at /message/content/parts/0.

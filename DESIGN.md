@@ -1,5 +1,23 @@
 # Design Notes
 
+### 2026-08-24 - Reduce frontend startup cost and make direct custom egress explicit
+
+**Change**: Vue route components now load on demand, while route metadata drives
+user and administrator authorization in the global navigation guard. The Custom
+provider owns one reusable HTTP client whose transport explicitly ignores proxy
+environment variables. CI now runs Go tests and Staticcheck plus frontend tests,
+unused-code analysis, and a production build.
+
+**Reason**: Eagerly importing every view put the entire console into the initial
+JavaScript bundle, and a hard-coded protected-path list could drift whenever a
+new account page was added. The Custom provider's unused proxy scaffolding also
+created per-request clients and obscured the intended direct-egress policy.
+
+**Impact**: Initial page loading downloads only the active route, authorization
+requirements live beside route declarations, and Custom requests share a direct
+connection pool. Public API contracts, account storage, and provider scheduling
+behavior are unchanged.
+
 ### 2026-08-18 - Isolate explicit Oreate spam-user accounts and pin proxy sessions
 
 **Change**: Oreate's explicit `212361`/`spam user` response now marks the

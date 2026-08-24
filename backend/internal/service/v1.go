@@ -2586,7 +2586,7 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 				continue
 			}
 			// release via defer so a panic in tryAccount can't leak the job slot.
-			data, err, failover, tempDead := func() ([]byte, error, bool, bool) {
+			data, failover, tempDead, err := func() ([]byte, bool, bool, error) {
 				defer s.acctRelease(ctx, token.ID, eventID)
 				return s.tryAccount(ctx, eventID, pool, token, kind, attempt, classify, refreshOnAuth, tempFailover)
 			}()
@@ -2651,15 +2651,15 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 
 // tryAccount runs one account's attempt with the pool's retry policy:
 // 额度耗尽/认证失效 → mark + failover; 上游临时 → record failure + failover (capped
-// via the tempDead return); 参数错 → fail fast. Returns (data, err, failover,
-// tempDead) — failover=true means move on to the next account. The per-account
+// via the tempDead return); 参数错 → fail fast. Returns (data, failover,
+// tempDead, err) — failover=true means move on to the next account. The per-account
 // concurrency gate is held by the caller.
 func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token model.TokenAccount, kind string,
 	attempt func(token model.TokenAccount) ([]byte, error),
 	classify func(error) (isAuth, isQuota, isTemporary, isDead bool),
 	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
 	tempFailover bool,
-) ([]byte, error, bool, bool) {
+) ([]byte, bool, bool, error) {
 	_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
 	_ = s.tokens.TouchLastUsed(ctx, token.ID)
 	authRefreshed := false
@@ -2671,14 +2671,14 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				"success_total": gorm.Expr("success_total + 1"),
 				"fails":         0,
 			})
-			return data, nil, false, false
+			return data, false, false, nil
 		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
 		if isQuota {
 			if shouldMarkAccountQuota(err) {
 				s.markTokenFailure(ctx, pool, token, kind, false, true)
 			}
-			return nil, err, true, false
+			return nil, true, false, err
 		}
 		if isAuth {
 			// Refresh from cookie and retry ONCE; otherwise the credential is dead.
@@ -2691,7 +2691,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			}
 			s.markTokenFailure(ctx, pool, token, kind, true, false)
 			s.coolDownAccount(pool, token.ID)
-			return nil, err, true, false
+			return nil, true, false, err
 		}
 		// Fatal / temporary-under-failover-policy upstream error.
 		if isDead || (isTemp && tempFailover) {
@@ -2705,11 +2705,11 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				// blip can't fan a single request across the whole pool.
 				s.markTokenUpstreamFailure(ctx, pool, token)
 				s.coolDownAccount(pool, token.ID)
-				return nil, err, true, true
+				return nil, true, true, err
 			}
 			s.markTokenDead(ctx, pool, token, kind)
 			// Permanent account death must not consume the temporary-failure cap.
-			return nil, err, true, false
+			return nil, true, false, err
 		}
 		if isTemp {
 			// Temporary upstream error → record it against the upstream (not the
@@ -2717,9 +2717,9 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			// return so a pool-wide blip can't fan one request across the whole pool.
 			s.markTokenUpstreamFailure(ctx, pool, token)
 			s.coolDownAccount(pool, token.ID)
-			return nil, err, true, true
+			return nil, true, true, err
 		}
-		return nil, err, false, false // 参数错 / request-level
+		return nil, false, false, err // 参数错 / request-level
 	}
 }
 

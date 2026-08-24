@@ -9,28 +9,29 @@ import PublicLayout from './layouts/PublicLayout.vue'
 import AdminLayout from './layouts/AdminLayout.vue'
 
 import HomeView from './views/HomeView.vue'
-import PlaygroundView from './views/PlaygroundView.vue'
-import UserLogsView from './views/UserLogsView.vue'
-import UserLogsTableView from './views/UserLogsTableView.vue'
-import SettingsView from './views/SettingsView.vue'
-import OrdersView from './views/OrdersView.vue'
-import AdminOrdersView from './views/AdminOrdersView.vue'
-import InviteView from './views/InviteView.vue'
-import DocsView from './views/DocsView.vue'
-import AboutView from './views/AboutView.vue'
-import OverviewView from './views/OverviewView.vue'
-import ModelsView from './views/ModelsView.vue'
-import AccountsView from './views/AccountsView.vue'
-import UsersView from './views/UsersView.vue'
-import ConcurrencyView from './views/ConcurrencyView.vue'
-import BannedWordsView from './views/BannedWordsView.vue'
-import BannedWordHitsView from './views/BannedWordHitsView.vue'
-import CdksView from './views/CdksView.vue'
-import InvitesAdminView from './views/InvitesAdminView.vue'
-import ImagesView from './views/ImagesView.vue'
-import LogsView from './views/LogsView.vue'
-import ConfigView from './views/ConfigView.vue'
-import ShowcaseView from './views/ShowcaseView.vue'
+
+const PlaygroundView = () => import('./views/PlaygroundView.vue')
+const UserLogsView = () => import('./views/UserLogsView.vue')
+const UserLogsTableView = () => import('./views/UserLogsTableView.vue')
+const SettingsView = () => import('./views/SettingsView.vue')
+const OrdersView = () => import('./views/OrdersView.vue')
+const AdminOrdersView = () => import('./views/AdminOrdersView.vue')
+const InviteView = () => import('./views/InviteView.vue')
+const DocsView = () => import('./views/DocsView.vue')
+const AboutView = () => import('./views/AboutView.vue')
+const OverviewView = () => import('./views/OverviewView.vue')
+const ModelsView = () => import('./views/ModelsView.vue')
+const AccountsView = () => import('./views/AccountsView.vue')
+const UsersView = () => import('./views/UsersView.vue')
+const ConcurrencyView = () => import('./views/ConcurrencyView.vue')
+const BannedWordsView = () => import('./views/BannedWordsView.vue')
+const BannedWordHitsView = () => import('./views/BannedWordHitsView.vue')
+const CdksView = () => import('./views/CdksView.vue')
+const InvitesAdminView = () => import('./views/InvitesAdminView.vue')
+const ImagesView = () => import('./views/ImagesView.vue')
+const LogsView = () => import('./views/LogsView.vue')
+const ConfigView = () => import('./views/ConfigView.vue')
+const ShowcaseView = () => import('./views/ShowcaseView.vue')
 
 const routes = [
   {
@@ -38,19 +39,20 @@ const routes = [
     component: PublicLayout,
     children: [
       { path: '', component: HomeView, meta: { label: '首页' } },
-      { path: 'user', component: PlaygroundView, meta: { label: '画图' } },
-      { path: 'logs', component: UserLogsView, meta: { label: '图片' } },
-      { path: 'mylogs', component: UserLogsTableView, meta: { label: '日志' } },
-      { path: 'invite', component: InviteView, meta: { label: '邀请' } },
+      { path: 'user', component: PlaygroundView, meta: { label: '画图', requiresAuth: true } },
+      { path: 'logs', component: UserLogsView, meta: { label: '图片', requiresAuth: true } },
+      { path: 'mylogs', component: UserLogsTableView, meta: { label: '日志', requiresAuth: true } },
+      { path: 'invite', component: InviteView, meta: { label: '邀请', requiresAuth: true } },
       { path: 'docs', component: DocsView, meta: { label: '文档' } },
       { path: 'about', component: AboutView, meta: { label: '关于' } },
-      { path: 'orders', component: OrdersView, meta: { label: '订单' } },
-      { path: 'settings', component: SettingsView, meta: { label: '设置' } },
+      { path: 'orders', component: OrdersView, meta: { label: '订单', requiresAuth: true } },
+      { path: 'settings', component: SettingsView, meta: { label: '设置', requiresAuth: true } },
     ],
   },
   {
     path: '/admin',
     component: AdminLayout,
+    meta: { requiresAuth: true, requiresAdmin: true },
     children: [
       { path: '', redirect: '/admin/overview' },
       { path: 'overview', component: OverviewView, meta: { label: '概览' } },
@@ -89,24 +91,17 @@ const router = createRouter({
   routes,
 })
 
-// Pages that require a login. The home page (/) stays public; everything a
-// signed-in user touches (画图/记录/设置) and the whole admin area is gated.
-const PROTECTED = ['/user', '/logs', '/invite', '/settings', '/orders']
-function isProtected(path) {
-  return path.startsWith('/admin') || PROTECTED.includes(path)
-}
-
 // Guard: validate the stored token against /me once (auth.ready), then trust
 // state. Unauthed visits to a protected page stay on home and pop the login
 // modal (no separate login page); the modal navigates to `intent` on success.
 router.beforeEach(async (to) => {
-  if (!isProtected(to.path)) return true
+  if (!to.meta.requiresAuth) return true
   if (!auth.ready) await refreshMe()
   if (!auth.token || !auth.user) {
     openLogin(to.fullPath)
     return to.path === '/' ? false : '/'
   }
-  if (to.path.startsWith('/admin') && auth.user.role !== 'admin') {
+  if (to.meta.requiresAdmin && auth.user.role !== 'admin') {
     return '/user'   // logged in but not an admin -> user side
   }
   return true

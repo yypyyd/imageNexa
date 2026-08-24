@@ -352,11 +352,6 @@ func unknownBalance(reason string) map[string]any {
 	}
 }
 
-// newProxyTLSClient is used for authentication/account maintenance and submit.
-func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
-
-func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
-
 // newDirectTLSClient is used for project/media setup, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 

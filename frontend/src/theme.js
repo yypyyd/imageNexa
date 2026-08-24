@@ -15,7 +15,7 @@ function systemTheme() {
 const saved = localStorage.getItem(KEY)
 const initial = saved === 'dark' || saved === 'light' ? saved : systemTheme()
 
-export const theme = ref(initial)
+const theme = ref(initial)
 export const isDark = ref(initial === 'dark')
 
 function apply(t) {

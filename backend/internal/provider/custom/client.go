@@ -1,9 +1,8 @@
 // Package custom implements a generic OpenAI-compatible upstream client. A
 // "custom" model forwards generation to any OpenAI-compatible API: the upstream
 // base_url + api_key live on a custom account (pool="custom"), the upstream model
-// name on the model config (UpstreamModel). Generation submits use the site-wide
-// proxy; polling and artifact fetches use direct local egress. Custom has no
-// separate login or quota endpoint to route.
+// name on the model config (UpstreamModel). Custom upstream traffic always uses
+// direct local egress and never inherits process-level proxy environment variables.
 package custom
 
 import (
@@ -18,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -30,16 +28,15 @@ var (
 )
 
 type Client struct {
-	mu    sync.RWMutex
-	proxy string
+	http *http.Client
 }
 
-func NewClient() *Client { return &Client{} }
-
-func (c *Client) SetProxy(proxy string) {
-	c.mu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
-	c.mu.Unlock()
+func NewClient() *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Custom upstreams are administrator-configured direct routes. Explicitly
+	// ignore HTTP_PROXY/HTTPS_PROXY instead of inheriting process environment.
+	transport.Proxy = nil
+	return &Client{http: &http.Client{Transport: transport, Timeout: 10 * time.Minute}}
 }
 
 // sanitizeErr strips the upstream URL/host from a network error so a user's
@@ -68,44 +65,8 @@ func sanitizeErr(err error) string {
 	return "upstream request failed"
 }
 
-func (c *Client) submitHTTPClient() (*http.Client, error) {
-	return c.httpClientP(true)
-}
-
-func (c *Client) httpClientP(useProxy bool) (*http.Client, error) {
-	c.mu.RLock()
-	proxyRaw := c.proxy
-	c.mu.RUnlock()
-
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Do not inherit HTTP_PROXY/HTTPS_PROXY from the process: an empty admin
-	// setting means explicit local egress for every account type.
-	transport.Proxy = nil
-	if useProxy && proxyRaw != "" {
-		proxyURL, err := url.Parse(proxyRaw)
-		if err != nil || proxyURL.Host == "" {
-			return nil, errors.New("invalid global proxy configuration")
-		}
-		switch strings.ToLower(proxyURL.Scheme) {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			return nil, errors.New("unsupported global proxy scheme")
-		}
-		transport.Proxy = http.ProxyURL(proxyURL)
-	}
-	return &http.Client{Transport: transport, Timeout: 10 * time.Minute}, nil
-}
-
-func (c *Client) doSubmit(req *http.Request) (*http.Response, error) {
-	return c.doP(req, true)
-}
-
-func (c *Client) doP(req *http.Request, useProxy bool) (*http.Response, error) {
-	client, err := c.httpClientP(useProxy)
-	if err != nil {
-		return nil, err
-	}
-	return client.Do(req)
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	return c.http.Do(req)
 }
 
 // ChatResponse is a successful OpenAI-compatible chat-completions response.
@@ -147,7 +108,7 @@ func (c *Client) ChatCompletions(ctx context.Context, baseURL, apiKey, upstreamM
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	resp, err := c.doSubmit(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -293,7 +254,7 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := c.doSubmit(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -360,7 +321,7 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
-		job, err := c.doJSONP(ctx, http.MethodGet, baseURL+"/v1/videos/"+jobID, apiKey, nil, false)
+		job, err := c.doJSON(ctx, http.MethodGet, baseURL+"/v1/videos/"+jobID, apiKey, nil)
 		if err != nil {
 			if errors.Is(err, ErrTemporaryUpstream) {
 				if sleepCtx(ctx, 5*time.Second) != nil {
@@ -395,10 +356,10 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 }
 
 func (c *Client) submitJSON(ctx context.Context, method, url, apiKey string, body []byte) (map[string]any, error) {
-	return c.doJSONP(ctx, method, url, apiKey, body, true)
+	return c.doJSON(ctx, method, url, apiKey, body)
 }
 
-func (c *Client) doJSONP(ctx context.Context, method, url, apiKey string, body []byte, useProxy bool) (map[string]any, error) {
+func (c *Client) doJSON(ctx context.Context, method, url, apiKey string, body []byte) (map[string]any, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -412,7 +373,7 @@ func (c *Client) doJSONP(ctx context.Context, method, url, apiKey string, body [
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.doP(req, useProxy)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -432,10 +393,6 @@ func (c *Client) doJSONP(ctx context.Context, method, url, apiKey string, body [
 }
 
 func (c *Client) submitMultipart(ctx context.Context, url, apiKey string, body io.Reader, contentType string) (map[string]any, error) {
-	return c.doMultipartP(ctx, url, apiKey, body, contentType, true)
-}
-
-func (c *Client) doMultipartP(ctx context.Context, url, apiKey string, body io.Reader, contentType string, useProxy bool) (map[string]any, error) {
 	req, err := http.NewRequest(http.MethodPost, url, body)
 	if err != nil {
 		return nil, err
@@ -443,7 +400,7 @@ func (c *Client) doMultipartP(ctx context.Context, url, apiKey string, body io.R
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", contentType)
-	resp, err := c.doP(req, useProxy)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -466,7 +423,7 @@ func (c *Client) download(ctx context.Context, url, apiKey string) ([]byte, erro
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := c.doP(req, false)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -507,7 +464,7 @@ func (c *Client) imageFromResponse(ctx context.Context, body []byte, downloadRes
 		return nil, url, nil
 	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	resp, err := c.doP(req, false)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
