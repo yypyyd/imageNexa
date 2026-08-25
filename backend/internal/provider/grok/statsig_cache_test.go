@@ -74,8 +74,72 @@ func TestBotChallengeInvalidatesFreshStatsigSnapshot(t *testing.T) {
 	if !errors.Is(err, ErrTemporaryUpstream) {
 		t.Fatalf("anti-bot response = %v, want temporary upstream", err)
 	}
+	if !errors.Is(err, ErrChallenge) {
+		t.Fatalf("anti-bot response = %v, want challenge", err)
+	}
 	if _, ok := loadStatsigChallenge(); ok {
 		t.Fatal("anti-bot response kept the rejected Statsig snapshot")
+	}
+}
+
+func TestStalePageChallengeInvalidatesFreshStatsigSnapshot(t *testing.T) {
+	resetStatsigCacheForTest()
+	t.Cleanup(resetStatsigCacheForTest)
+	storeStatsigChallenge(statsigChallenge{
+		header: make([]byte, 49), suffix: "rejected", trailer: 3, fetchedAt: time.Now(),
+	})
+
+	err := mapStatus("/rest/app-chat/conversations/new", 403, []byte(
+		`{"error":{"code":7,"message":"This page is out of date. Reload to continue.","details":[]}}`,
+	))
+	if !errors.Is(err, ErrChallenge) || !errors.Is(err, ErrTemporaryUpstream) {
+		t.Fatalf("stale-page response = %v, want temporary challenge", err)
+	}
+	if errors.Is(err, ErrAuth) {
+		t.Fatalf("stale-page response = %v, must not be auth", err)
+	}
+	if _, ok := loadStatsigChallenge(); ok {
+		t.Fatal("stale-page response kept the rejected Statsig snapshot")
+	}
+}
+
+func TestUnknownProtectedSubmitForbiddenIsChallenge(t *testing.T) {
+	err := mapStatus("/rest/media/post/create", 403, []byte(`{"error":"new wording"}`))
+	if !errors.Is(err, ErrChallenge) {
+		t.Fatalf("protected submit 403 = %v, want challenge", err)
+	}
+}
+
+func TestChallengeRetryRefreshesAndReplaysExactlyOnce(t *testing.T) {
+	attempts, refreshes := 0, 0
+	_, err := retryChallengeOnce(context.Background(), func() ([]byte, error) {
+		attempts++
+		return nil, ErrChallenge
+	}, func(context.Context) error {
+		refreshes++
+		return nil
+	})
+	if !errors.Is(err, ErrChallenge) {
+		t.Fatalf("second rejection = %v, want challenge", err)
+	}
+	if attempts != 2 || refreshes != 1 {
+		t.Fatalf("attempts=%d refreshes=%d, want 2/1", attempts, refreshes)
+	}
+}
+
+func TestChallengeRetryStopsWhenRefreshFails(t *testing.T) {
+	attempts := 0
+	_, err := retryChallengeOnce(context.Background(), func() ([]byte, error) {
+		attempts++
+		return nil, ErrChallenge
+	}, func(context.Context) error {
+		return errors.New("discovery failed")
+	})
+	if !errors.Is(err, ErrChallenge) {
+		t.Fatalf("refresh failure = %v, want challenge", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d, want 1", attempts)
 	}
 }
 

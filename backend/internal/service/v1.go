@@ -881,6 +881,11 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 			s.acctRelease(bookCtx, token.ID, eventID)
 			lastErr = callErr
 			switch {
+			case errors.Is(callErr, grok.ErrChallenge):
+				// Statsig is process-wide and account-independent. The provider
+				// already refreshed and retried once; rotating the pool would
+				// repeat the same rejected signature against every account.
+				return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, callErr)
 			case errors.Is(callErr, custom.ErrAuth), errors.Is(callErr, chatgpt.ErrAuth), errors.Is(callErr, grok.ErrAuth):
 				s.markTokenFailure(bookCtx, pool, token, "text", true, false)
 				continue
@@ -3577,6 +3582,8 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 			}
 			lastErr = genErr
 			switch {
+			case errors.Is(genErr, grok.ErrChallenge):
+				return false, false
 			case errors.Is(genErr, grok.ErrAuth), errors.Is(genErr, grok.ErrQuotaExhausted):
 				// 失效 / 额度没了 → 当 401 判死(不续期),换号。
 				s.markTokenFailure(ctx, "grok", token, "video", true, false)
@@ -3667,6 +3674,8 @@ func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, model
 			}
 			lastErr = genErr
 			switch {
+			case errors.Is(genErr, grok.ErrChallenge):
+				return false, false
 			case errors.Is(genErr, grok.ErrAuth), errors.Is(genErr, grok.ErrQuotaExhausted):
 				s.markTokenFailure(ctx, "grok", token, "image", true, false)
 				return false, true

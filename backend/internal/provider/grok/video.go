@@ -342,12 +342,9 @@ func (c *Client) waitForAsset(ctx context.Context, client tlsclient.HttpClient, 
 
 // postJSON does an authed JSON POST and parses a single JSON object response.
 func (c *Client) postJSON(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) (map[string]any, error) {
-	raw, status, err := c.doPost(ctx, client, token, path, body)
+	raw, err := c.postWithChallengeRetry(ctx, client, token, path, body)
 	if err != nil {
 		return nil, err
-	}
-	if e := mapStatus(path, status, raw); e != nil {
-		return nil, e
 	}
 	var out map[string]any
 	if len(raw) == 0 {
@@ -361,14 +358,35 @@ func (c *Client) postJSON(ctx context.Context, client tlsclient.HttpClient, toke
 
 // postStream does an authed JSON POST and returns the full (streamed) text body.
 func (c *Client) postStream(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) (string, error) {
-	raw, status, err := c.doPost(ctx, client, token, path, body)
-	if err != nil {
-		return string(raw), err
+	raw, err := c.postWithChallengeRetry(ctx, client, token, path, body)
+	return string(raw), err
+}
+
+// postWithChallengeRetry refreshes and replays exactly once when a protected
+// submit is rejected before acceptance. A second rejection preserves
+// ErrChallenge so the service can fail fast instead of rotating every account.
+func (c *Client) postWithChallengeRetry(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) ([]byte, error) {
+	attempt := func() ([]byte, error) {
+		raw, status, err := c.doPost(ctx, client, token, path, body)
+		if err != nil {
+			return raw, err
+		}
+		return raw, mapStatus(path, status, raw)
 	}
-	if e := mapStatus(path, status, raw); e != nil {
-		return string(raw), e
+	return retryChallengeOnce(ctx, attempt, func(ctx context.Context) error {
+		return c.refreshChallenge(ctx, client)
+	})
+}
+
+func retryChallengeOnce(ctx context.Context, attempt func() ([]byte, error), refresh func(context.Context) error) ([]byte, error) {
+	raw, err := attempt()
+	if !errors.Is(err, ErrChallenge) {
+		return raw, err
 	}
-	return string(raw), nil
+	if refreshErr := refresh(ctx); refreshErr != nil {
+		return raw, fmt.Errorf("%w: refresh failed: %v", ErrChallenge, refreshErr)
+	}
+	return attempt()
 }
 
 func (c *Client) doPost(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) ([]byte, int, error) {
@@ -494,14 +512,14 @@ func mapStatus(path string, status int, raw []byte) error {
 	switch {
 	case status == 200:
 		return nil
-	case status == 403 && isBotChallenge(string(raw)):
+	case status == 403 && (isStatsigProtectedPath(path) || isBotChallenge(string(raw))):
 		// grok bot-detection or a Cloudflare challenge page ("Just a moment…"),
 		// NOT a dead token — transient, so a good account isn't killed by an
 		// IP/anti-bot hiccup. Invalidate even a TTL-fresh snapshot so the next
 		// request refreshes the homepage challenge and signer chunk through the
 		// normal HTTP/Goja path.
 		invalidateStatsigChallenge()
-		return fmt.Errorf("%w: %s 403 %s", ErrTemporaryUpstream, path, clip(raw, 160))
+		return fmt.Errorf("%w: %s 403 %s", ErrChallenge, path, clip(raw, 160))
 	case status == 401 || status == 403:
 		return fmt.Errorf("%w: %s %d %s", ErrAuth, path, status, clip(raw, 160))
 	case status == 429:
@@ -522,12 +540,23 @@ func mapStatus(path string, status int, raw []byte) error {
 	}
 }
 
+func isStatsigProtectedPath(path string) bool {
+	switch path {
+	case "/rest/app-chat/conversations/new", "/rest/media/post/create":
+		return true
+	default:
+		return false
+	}
+}
+
 // isBotChallenge reports whether a 403 body is an anti-bot interstitial rather
 // than a real auth rejection: grok's own "anti-bot" marker or a Cloudflare
 // challenge page ("Just a moment…" / cf-chl / challenge-platform).
 func isBotChallenge(s string) bool {
 	s = strings.ToLower(s)
 	return strings.Contains(s, "anti-bot") ||
+		strings.Contains(s, "page is out of date") ||
+		strings.Contains(s, "reload to continue") ||
 		strings.Contains(s, "just a moment") ||
 		strings.Contains(s, "cf-chl") ||
 		strings.Contains(s, "challenge-platform") ||

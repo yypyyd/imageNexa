@@ -1,5 +1,34 @@
 # Design Notes
 
+### 2026-08-25 - Fail-safe Grok Statsig recovery without account-pool sweeps
+
+**Change**: Statsig-protected Grok submit endpoints now classify every HTTP 403
+as an account-independent challenge, synchronously refresh the process-wide
+signer snapshot, and replay the definitely rejected POST once on the same
+account. A second rejection fails the request immediately as a temporary
+provider error without rotating or penalizing the account pool. Signer discovery
+crawls up to four lazy chunk-reference layers with a 512-chunk bound and accepts
+equivalent minified byte-modulo forms. A challenge snapshot is published only
+after the current signer chunk has been located, behaviorally verified, and
+loaded; a static fallback is no longer logged as a successful self-heal.
+
+**Reason**: Grok changed its rejection to HTTP 403/code 7 with “This page is out
+of date”. The literal-marker classifier treated it as expired SSO while the new
+signer had moved outside the one-layer discovery graph, causing one request to
+walk every healthy Grok account for more than ten minutes.
+
+**Impact**: Future 403 wording changes on the protected submit paths cannot
+poison account health or amplify one provider-wide signature failure across the
+pool. Confirmed 401/session authentication failures retain their existing auth
+classification. Refresh remains singleflight and bounded; the POST replay is
+safe because it occurs only after a non-accepting 403 response and at most once.
+
+**Security decision**: Account credentials are destructive state. Only the
+authenticated session/liveness boundary or an explicit 401 may establish that
+an SSO credential is invalid; an account-independent anti-bot submit must never
+make that decision. Discovery fetches only same-origin, regex-normalized Next.js
+chunk paths and retains fixed depth, count, concurrency, and context bounds.
+
 ### 2026-08-24 - Reduce frontend startup cost and make direct custom egress explicit
 
 **Change**: Vue route components now load on demand, while route metadata drives

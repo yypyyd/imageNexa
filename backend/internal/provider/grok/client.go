@@ -48,6 +48,9 @@ var (
 	ErrAuth              = errors.New("grok auth failed")
 	ErrQuotaExhausted    = errors.New("grok quota exhausted")
 	ErrTemporaryUpstream = errors.New("grok upstream temporary error")
+	// ErrChallenge is account-independent and also unwraps to the temporary
+	// sentinel for callers that do not need the finer distinction.
+	ErrChallenge = fmt.Errorf("%w: statsig challenge rejected", ErrTemporaryUpstream)
 )
 
 type Client struct {
@@ -376,6 +379,21 @@ func (c *Client) ensureChallenge(ctx context.Context, client tlsclient.HttpClien
 	}
 }
 
+// refreshChallenge invalidates a rejected snapshot and waits for the shared
+// refresh. It is used only after an explicit non-accepting challenge response.
+func (c *Client) refreshChallenge(ctx context.Context, client tlsclient.HttpClient) error {
+	invalidateStatsigChallenge()
+	result := beginStatsigChallengeRefresh(func(refreshCtx context.Context) (statsigChallenge, error) {
+		return fetchStatsigChallenge(refreshCtx, client)
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-result:
+		return res.Err
+	}
+}
+
 func fetchStatsigHomepage(ctx context.Context, client tlsclient.HttpClient) (string, error) {
 	req, err := http.NewRequest(http.MethodGet, apiBase+"/", nil)
 	if err != nil {
@@ -434,7 +452,9 @@ func fetchStatsigChallenge(ctx context.Context, client tlsclient.HttpClient) (st
 
 	// Primary path is the goja signer (statsig_js.go); set it up / refresh it for
 	// this build. Static (header, salt) below is only a last-resort fallback.
-	ensureEngine(ctx, client, html)
+	if err := ensureEngine(ctx, client, html); err != nil {
+		return statsigChallenge{}, err
+	}
 
 	ch := statsigChallenge{
 		header:     statsigHeader,
