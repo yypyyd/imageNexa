@@ -22,10 +22,11 @@ func TestV1ModelEntryStrictByDefault(t *testing.T) {
 
 	got := v1ModelEntry(item, 123, false)
 	want := map[string]any{
-		"id":       "public-name",
-		"object":   "model",
-		"created":  int64(123),
-		"owned_by": "grok",
+		"id":            "public-name",
+		"object":        "model",
+		"created":       int64(123),
+		"owned_by":      "2api",
+		"shutdown_date": nil,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("strict model entry mismatch\n got: %#v\nwant: %#v", got, want)
@@ -159,8 +160,11 @@ func TestV1ModelEntryOreateSeedance25Capabilities(t *testing.T) {
 	if got["maxReferenceImages"] != 9 || got["maxReferenceVideos"] != 3 || got["maxReferenceMedia"] != 12 || got["maxReferenceAudios"] != 0 {
 		t.Fatalf("camelCase Oreate capabilities = %#v", got)
 	}
-	if got["supportsAudioOutput"] != true || got["referenceMode"] != "asset" || got["upstreamModel"] != "seedance-2.5" {
+	if got["supportsAudioOutput"] != true || got["referenceMode"] != "asset" {
 		t.Fatalf("Oreate output/reference mapping = %#v", got)
+	}
+	if _, leaked := got["upstreamModel"]; leaked {
+		t.Fatalf("public model response leaked upstream model: %#v", got)
 	}
 }
 

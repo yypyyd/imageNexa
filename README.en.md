@@ -1,315 +1,267 @@
 <div align="center">
 
-<img src="frontend/public/favicon.svg" width="84" alt="Vivid AI" />
+<img src="frontend/public/favicon.svg" width="80" alt="2API" />
 
-<h1>image2api</h1>
+# 2API
 
-**Multi-provider AI image / video generation gateway — one OpenAI-compatible API, nine platforms aggregated, a ready-to-run operations system**
+**An OpenAI-compatible API gateway for text, image, and video generation**
 
-<sub>Live instance (brand): [Vivid AI · vividai.run](https://vividai.run)</sub>
-
-[简体中文](README.md) | **English**
-
-[![Online Demo](https://img.shields.io/badge/Live%20Demo-vividai.run-7c3aed?style=for-the-badge)](https://vividai.run)
-
-[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
-[![Vue 3](https://img.shields.io/badge/Vue-3-42b883?logo=vuedotjs&logoColor=white)](https://vuejs.org)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](#-deployment)
-[![OpenAI Compatible](https://img.shields.io/badge/OpenAI-compatible-412991?logo=openai&logoColor=white)](#-openai-compatible-api)
-[![HTTPS](https://img.shields.io/badge/HTTPS-your--proxy-lightgrey)](#-deployment)
-[![Providers](https://img.shields.io/badge/providers-9-orange)](#-supported-models--providers)
-[![Self-hosted](https://img.shields.io/badge/self--hosted-yes-success)](#-deployment)
-[![License](https://img.shields.io/badge/license-MIT-blue)](#-license)
-
-[Live Demo](https://vividai.run) · [Features](#-features) · [Deploy](#-deployment) · [API](#-openai-compatible-api) · [Community](#-community--contact)
-
-<br/>
-
-<img src="docs/screenshots/playground.png" alt="image2api — playground" width="860" />
+[简体中文](README.md) | English | [Design](DESIGN.md)
 
 </div>
 
----
+## Scope
 
-## 📖 Table of Contents
+2API is a self-hosted API service with a singleton super-administrator console. Downstream clients use one OpenAI-style `Bearer sk-*` API key and canonical model IDs; the gateway handles provider routing, account selection, concurrency, quota reservation, failover, and quota reconciliation internally.
 
-- [Overview](#-overview)
-- [Screenshots](#-screenshots)
-- [Features](#-features)
-- [Supported Models / Providers](#-supported-models--providers)
-- [OpenAI-Compatible API](#-openai-compatible-api)
-- [Deployment](#-deployment)
-- [Tech Stack](#-tech-stack)
-- [Repository Layout](#-repository-layout)
-- [Roadmap](#-roadmap)
-- [Community / Contact](#-community--contact)
-- [License](#-license)
+The product boundary is intentionally small:
 
-## ✨ Overview
+- Public `/v1` endpoints cover text, images, image edits, asynchronous image tasks, and videos.
+- There is exactly one super administrator and no public registration or end-user web application.
+- The console manages model routes, upstream accounts, API keys, logs, artifacts, banned words, and system settings.
+- The model catalog is closed. Clients neither use provider prefixes nor create model IDs.
+- Multiple providers or accounts may serve one canonical model without leaking provider details into the public API.
 
-**image2api** wraps the image / video capabilities of Adobe Firefly, BytePlus Lumina, OpenAI, Runway, Grok, Leonardo, Krea, Imagine and OreateAI into **a single OpenAI-compatible API**. Behind it, multi-account pools are scheduled automatically — out of quota → switch account, auth expired → refresh or kill, transient errors → retry, tokens proactively renewed before they expire — to deliver a stable service.
+## Authentication
 
-It's more than an API proxy: it ships with **credit billing, CDK top-ups, referral rewards, a user system, an admin console, and a modern generation frontend**, so a single command turns it into a fully operational AI generation site — the author's live instance **[Vivid AI · vividai.run](https://vividai.run)** (brand) is built on this project.
+Every `/v1` request uses the standard OpenAI Bearer header:
 
-> 💡 Both frontend and backend are **fully open-source** (MIT) — Go + Vue 3, free to fork and self-host.
+```http
+Authorization: Bearer sk-your-api-key
+```
 
-**At a glance** 🔌 OpenAI-compatible · 🤖 9 platforms, 10+ models · 🔁 auto failover / token keep-alive · 💳 credits + agent pricing · 🎨 generation frontend + admin console · 🐳 one-command deploy (bring your own TLS proxy)
+`x-api-key`, query parameters, cookies, and custom authentication headers are not accepted. The super administrator creates and rotates API keys in the console. Plaintext is shown once; the server persists only a hash and preview. Each key may have its own concurrency limit.
 
-## 🖼️ Screenshots
+The administrator console uses an HttpOnly, SameSite=Strict session cookie. Mutations also require the session-bound `X-CSRF-Token`. Administrator credentials and session secrets are never stored in browser localStorage.
 
-<div align="center">
-<sub>🎨 Modern generation frontend · light / dark admin console · data-driven ops dashboard</sub>
-</div>
+Creating the administrator for the first time also requires the deployment's `ADMIN_BOOTSTRAP_TOKEN`. The initialization request sends it only in the fixed `X-Admin-Bootstrap-Token` header. Once the administrator exists, the database singleton permanently closes initialization.
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard.png" alt="Dashboard" /></td>
-    <td width="50%"><img src="docs/screenshots/models.png" alt="Models" /></td>
-  </tr>
-  <tr>
-    <td align="center"><b>📊 Dashboard</b><br/><sub>Users / volume / provider health / 24h trend</sub></td>
-    <td align="center"><b>🧩 Model management</b><br/><sub>Per-model capabilities, pricing & weight</sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/screenshots/accounts.png" alt="Accounts" /></td>
-    <td width="50%"><img src="docs/screenshots/logs.png" alt="Logs" /></td>
-  </tr>
-  <tr>
-    <td align="center"><b>🔑 Account pools</b><br/><sub>Multi-account pools · weight / concurrency · CRUD</sub></td>
-    <td align="center"><b>📜 Call logs</b><br/><sub>Success / failure / in-progress · prompts & latency</sub></td>
-  </tr>
-</table>
+## Public API
 
-## 🚀 Features
+Except for health probes, every endpoint below requires `Authorization: Bearer sk-*`.
 
-#### 🎨 Generation
-- Images + videos in one place, with **image-to-image / reference frames** (first frame, last frame, style reference)
-- Multiple resolutions (images 1K / 2K / 4K · videos 720p / 1080p), aspect ratios and video durations — configured and priced per model
-- 9 providers, 10+ models, **enable / disable / re-price from the admin console**, no code changes
-- **Model aliases**: one model can expose multiple public ids — API calls with any alias resolve to it
-- **De-AI fingerprint** (optional): one-click toggle on the playground — generated images get anti-AI-detection post-processing (subtle detail jitter + metadata stripping), charged as a per-tier surcharge (defaults 1K+1 / 2K+2 / 4K+3 credits, admin-configurable, can be disabled globally); processed works carry a "de-AI" badge across the playground, gallery, logs and admin image manager
-
-#### 🔌 OpenAI Compatible
-- Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`, with model-gated video/audio references and generated audio) · `/v1/models` (extended ratios, resolutions, durations, reference limits, and audio-output capabilities by default; `?extended=false` returns strict four-field OpenAI objects, with ratios normalized as `W:H`)
-- **Strict OpenAI params**: image `size` sets the aspect ratio and native-provider tier (long edge → 1K/2K/4K); only the GPT Image 2 family (`gpt-image-2` / `firefly-gpt-image-2` / `lumina-gpt-image-2`) adapts an explicit `quality=low/medium/high` to 1K/2K/4K, while other models ignore its resolution effect; video `size` maps by short edge to 720p/1080p — just swap `base_url` + `api_key` into an existing OpenAI SDK
-- Image results default to **URLs**. Ordinary API requests do not download, base64-encode, or store the upstream asset; explicitly request `response_format=b64_json` for inline bytes. The in-app **/docs** ships a size ↔ tier reference table
-
-#### 🔁 Account Pools + Smart Failover
-- Round-robin scheduling across the pool; one bad account doesn't break the whole
-- **Out of quota → switch** · **auth expired → refresh & retry / kill** · **transient → retry same account ×3** · **bad params → fail fast**
-- **Pre-deducted credits**: atomic debit before generation, auto-refunded on failure, no over-spend under concurrency
-
-#### 🌐 Unified Upstream Egress
-- The admin **Global Proxy** (`proxy.url`) is injected only into ChatGPT, Grok Web/Build, and OreateAI protected control-plane traffic: account checks, required bootstrap/challenge or browser-signing work, and generation submits. Their provider clients keep confirmed bulk-media and artifact transfers on direct local egress where supported.
-- Adobe, Runway, Leonardo, Krea, Imagine, and custom OpenAI-compatible upstreams use direct server egress and do not consume the residential proxy. Leave `proxy.url` empty to make the protected ChatGPT/Grok/Oreate stages direct as well.
-
-#### 🔐 Automatic Token Keep-alive
-- Single-use rotating tokens (Krea / Imagine) are **renewed proactively 10 minutes before expiry**; new tokens persisted automatically
-- Adobe cookies exchanged for fresh tokens on a schedule; bare JWTs killed on expiry
-- Daily quota recovered at each provider's reset time, then re-probed for the real balance; OreateAI accounts below 60 points are retained in quota state, periodically refreshed, and automatically re-enabled after replenishment
-
-#### 💳 Billing & Operations
-- Credit-based (**pre-deduct + refund on failure**), priced per model / resolution / duration; de-AI fingerprint adds a per-tier surcharge
-- **Agent pricing**: a user can be set as an "agent" role and models can carry agent prices; agent users (including their API key calls) are billed at the agent price, falling back to the normal price when unset
-- **Online top-up (易支付 / epay)**: WeChat / Alipay QR, preset + custom amounts, unpaid orders auto-cancel after 30 min, MD5-verified idempotent callback auto-credits; cumulative top-up tracked
-- **CDK redeem codes** · **referral rewards** · email sign-up / verification code / password reset
-- **Concurrency groups**: cap a user's simultaneous generations (playground + API key combined, `0` = unlimited), self-healing Redis counters, new users auto-join the default group
-- Three roles: regular user / agent / admin (single)
-
-#### 🖥️ User Frontend (Vue 3)
-- Playground · creations gallery · generation logs (with failure reasons / source tags)
-- Gallery **multi-select batch ops**: select page / bulk delete (videos take their frame stills along) / bulk download (multiple files auto-packed into a zip, fetched concurrently)
-- Lightbox preview with built-in **copy original / download / close** buttons; one-click copy of the original image from cards
-- **Top-up · Orders** (recharge history / resume unpaid) · API docs · API key management · referral · about, light / dark theme
-- **In-app announcements**: a Markdown notice pops up after login and re-shows whenever its content changes
-
-#### 🛠️ Admin Console
-- Overview dashboard (trends / DAU / top failures / top spenders)
-- Model management (normal + agent price + aliases) · account management (bulk import / dedup / per-account quota refresh, including complete BytePlus Lumina Cookies, CPA JSON/ZIP and Sub2API bundle JSON) · **concurrency groups** · **order management** (filter / search / paginate) · site-wide logs · user management (set as agent / assign concurrency group / view cumulative top-up / banned-word hits) · CDK · image management (multi-select bulk delete / zip download) · showcase · **announcements** · site config (incl. epay, de-AI fingerprint toggle & surcharge pricing)
-- **Banned words**: add / remove words in the console (paginated + multi-select bulk delete); prompts containing a banned word are rejected outright (playground + API, case-insensitive), with per-word / per-user hit counters
-
-**🧰 Engineering highlights**: tls-client (Chrome JA3/JA4 fingerprint) reliably passes Cloudflare · media stored in S3/RustFS, served through an authenticated proxy with retention cleanup · self-healing maintenance loop (quota recovery / credential refresh / orphan-job cleanup with refunds) · one-command Docker deploy (TLS via your own reverse proxy).
-
-## 🤖 Supported Models / Providers
-
-| Provider | Models (examples) | Type |
+| Method | Path | Purpose |
 |---|---|---|
-| **Adobe Firefly** | firefly-image-5 · firefly-gpt-image-2 · flux-kontext-max · firefly-video · firefly-ray · gemini-veo31 | Image / Video |
-| **BytePlus Lumina** | lumina-seedream-5.0-pro · lumina-gpt-image-2 · lumina-seedream-5.0-lite · lumina-nano-banana-2 · lumina-nano-banana-pro | Image (text-to-image / image-to-image) |
-| **OpenAI** | gpt-image-2 | Image |
-| **Runway** | runway-gen4-turbo · nano-banana-2 (Nano Banana 2) | Video / Image |
-| **Grok (grok.com)** | grok-video (imagine text/image-to-video) · grok-imagine-image (Lite, works on free accounts) · grok-chat (text, works on free accounts) | Text / Image / Video |
-| **Leonardo.ai** | seedream-4.5 | Image |
-| **Krea.ai** | flux-klein-2 | Image |
-| **Imagine.art** | imagine-1.5 · imagine-1.5pro | Image |
-| **OreateAI** | oreate-seedance-2.0-mini · oreate-seedance-2.0-fast · oreate-seedance-1.5-pro · oreate-seedance-2.0 · oreate-seedance-2.5 | Video (text, image, and video references) |
+| `GET` | `/v1/models` | List canonical models; the default is a strict five-field OpenAI object (`shutdown_date` is `null`), and `?extended=true` opts into capability metadata |
+| `POST` | `/v1/chat/completions` | Chat Completions with ordinary JSON or `stream: true` SSE |
+| `POST` | `/v1/images/generations` | Text-to-image; synchronous by default, opt into async with `Prefer: respond-async` |
+| `POST` | `/v1/images/edits` | `multipart/form-data` image editing with one or more reference images |
+| `GET` | `/v1/images/tasks?request_id=...` | Poll an asynchronous image task or recover a result by idempotency ID |
+| `GET` | `/v1/images/:id/content` | Read image content |
+| `POST` | `/v1/videos` | Create an asynchronous video task |
+| `GET` | `/v1/videos/:id` | Read video task status |
+| `GET` | `/v1/videos/:id/content` | Download the completed video |
 
-> Models are enabled and priced dynamically from the admin console — add or remove anytime. The built-in BytePlus Lumina integration exposes only the five listed `lumina-*` ids, avoiding collisions with same-named OpenAI / Runway models. Import an account by pasting the complete website Cookie containing `csrfToken` in the admin console. Treat the Cookie as a high-value secret: never log it or commit it to the repository.
+Unauthenticated probes:
 
-## 🔌 OpenAI-Compatible API
+- `GET /health/live`: process liveness.
+- `GET /health/ready`: PostgreSQL, Redis, the latest database migration, and the private RustFS bucket are ready.
+
+Errors use the OpenAI shape:
+
+```json
+{"error":{"message":"...","type":"invalid_request_error","param":"model","code":"model_not_found"}}
+```
+
+## Closed Canonical Model Catalog
+
+`GET /v1/models` returns only these 24 public IDs. Provider model names and route IDs are internal adapter details and are invalid as API `model` values.
+
+### Text (4)
+
+- `gpt-5-5-mini`
+- `gpt-5-5-thinking`
+- `grok-4.5`
+- `grok-chat-fast`
+
+### Image (6)
+
+- `gpt-image-2`
+- `seedream-5.0-pro`
+- `seedream-5.0-lite`
+- `nano-banana-2`
+- `nano-banana-pro`
+- `grok-imagine-image`
+
+### Video (14)
+
+- `veo-3.1`
+- `veo-3.1-lite`
+- `kling-3`
+- `kling-o3`
+- `runway-gen-4.5`
+- `runway-gen-4-turbo`
+- `seedance-2.0`
+- `seedance-2.0-fast`
+- `seedance-2.0-mini`
+- `seedance-1.5-pro`
+- `seedance-2.5`
+- `grok-imagine-video`
+- `luma-ray`
+- `firefly-video`
+
+## Unified Routing and Account Scheduling
+
+Clients submit only a canonical model ID. 2API then:
+
+1. Filters routes by operation, aspect ratio, resolution, duration, and reference-media capabilities.
+2. Removes route-bound accounts that are disabled, cooling down, authentication-invalid, at their concurrency limit, or known to lack enough quota.
+3. Selects by route priority, account weight, available concurrency, and the quota bucket used by that model. Among equivalent candidates, best-fit balance ordering avoids spending large-balance accounts on cheap work.
+4. Atomically reserves account concurrency and quota before upstream submission; a definitely unaccepted request releases its reservation.
+5. Re-reads or reconciles the selected account's upstream quota after every generation, updating both the console and the next scheduling decision.
+
+Authentication failures, exhausted quota, and safely retryable pre-acceptance errors may move to another account or route. Once an upstream accepts a task, or submission outcome is uncertain, 2API does not switch accounts and resubmit. This prevents duplicate generations and duplicate upstream charges. Send a stable, unique `Idempotency-Key` on image and video creation requests. If an image request omits it, the server creates one for that request and returns it in the `Idempotency-Key` and `Location` headers so accepted work can be recovered. That generated key is not automatically present on a later client retry and does not replace client-side reuse.
+
+## Importing BytePlus Accounts
+
+BytePlus uses only a complete Lumina website Cookie as its credential. You may paste a Cookie Header or browser-export JSON containing `cookie_string` / `cookies[]`; the backend extracts, normalizes, and stores only the Cookie. Exported email, avatar, tenant, and quota fields are never trusted.
+
+The Cookie must contain valid session data and a non-empty `csrfToken`. A standalone CSRF value, Bearer token, password, or incomplete Cookie cannot be imported. The server derives `X-Csrf-Token` from the Cookie, immediately verifies identity and real upstream quota, and creates candidate bindings for the canonical BytePlus routes. If a later request returns affirmative evidence that the account lacks one model entitlement, only that account-route binding is disabled; the account's other models remain eligible.
+
+Treat the Cookie as a high-value secret. Never place it in logs, screenshots, documentation, `.env`, or Git.
+
+## Quick Deployment
+
+Requirements: Docker Engine and Docker Compose v2. The stack starts PostgreSQL, Redis, RustFS, the Go API, and the administrator SPA. Host port `2000` serves HTTP.
+
+1. Create the deployment environment file:
 
 ```bash
-# Text-to-image — size sets native-provider ratio/resolution; only GPT Image 2 adapts quality
-curl https://your-domain/v1/images/generations \
-  -H "Authorization: Bearer sk-xxxx" \
+cp .env.example .env
+```
+
+PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+2. Edit `.env` and replace every `replace-with-*` value:
+
+| Variable | Purpose |
+|---|---|
+| `APP_ENV` | Must be `production` online; use `development` explicitly only for local plain-HTTP testing |
+| `APP_TITLE` | Console title |
+| `PUBLIC_BASE_URL` | Canonical external API URL, for example `https://api.example.com` |
+| `CORS_ORIGINS` | Origins allowed to access the administrator API; comma-separated |
+| `COOKIE_SECURE` | `true` behind HTTPS; `false` only for local plain-HTTP development |
+| `SESSION_COOKIE_NAME` | Administrator session cookie name |
+| `ADMIN_BOOTSTRAP_TOKEN` | High-entropy secret required to create the singleton administrator; at least 32 bytes and never the template value |
+| `TRUSTED_PROXY_CIDRS` | Exact reverse-proxy CIDRs allowed while walking `X-Forwarded-For` from right to left |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | PostgreSQL configuration; production passwords must be at least 16 bytes and non-default |
+| `RUSTFS_BUCKET` / `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | Private object storage; production access keys must be at least 16 bytes and secret keys at least 32 bytes |
+
+Generate the initialization token with:
+
+```bash
+openssl rand -hex 32
+```
+
+PowerShell:
+
+```powershell
+[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
+```
+
+3. Validate and start the stack:
+
+```bash
+docker compose config
+docker compose up -d --build
+docker compose ps
+```
+
+4. Check health:
+
+```bash
+curl http://localhost:2000/health/live
+curl http://localhost:2000/health/ready
+```
+
+On first access, enter the initialization token from `.env` and create the singleton super administrator. The token is not stored in the browser or database. Then create a downstream key on the API Key page and import upstream credentials on the Accounts page.
+
+For production, place your own HTTPS reverse proxy in front of port `2000`, preserve `Host`, and append `X-Forwarded-For`. Public links use only `PUBLIC_BASE_URL=https://...`; client-supplied forwarded schemes are not trusted. Production also requires HTTPS `CORS_ORIGINS`, `COOKIE_SECURE=true`, a non-default database password, and non-template RustFS keys, otherwise the backend refuses to start. Add only the exact network of any additional proxy to `TRUSTED_PROXY_CIDRS` when the backend must resolve the original client IP. This project does not issue TLS certificates.
+
+Common operations:
+
+```bash
+docker compose logs -f backend web
+docker compose pull
+docker compose up -d --build
+```
+
+## API Examples
+
+Create an API key in the administrator console first.
+
+```bash
+# Models
+curl https://api.example.com/v1/models \
+  -H "Authorization: Bearer sk-your-api-key"
+
+# Text
+curl https://api.example.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-image-2",
-    "prompt": "a cute cat on a desk, studio lighting",
-    "size": "2048x2048"
-  }'
+  -d '{"model":"gpt-5-5-mini","messages":[{"role":"user","content":"Hello"}]}'
 
-# Image-to-image — multipart reference upload (multiple via image[])
-curl https://your-domain/v1/images/edits \
-  -H "Authorization: Bearer sk-xxxx" \
-  -F model="seedream-4.5" -F prompt="make it cyberpunk" -F image=@input.png
+# Image
+curl https://api.example.com/v1/images/generations \
+  -H "Authorization: Bearer sk-your-api-key" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: image-order-001" \
+  -d '{"model":"gpt-image-2","prompt":"Minimal product photography","size":"1024x1024"}'
+
+# Image edit
+curl https://api.example.com/v1/images/edits \
+  -H "Authorization: Bearer sk-your-api-key" \
+  -H "Idempotency-Key: edit-order-001" \
+  -F "model=nano-banana-pro" \
+  -F "prompt=Replace the background with a studio backdrop" \
+  -F "image=@reference.png"
+
+# Create a video task
+curl https://api.example.com/v1/videos \
+  -H "Authorization: Bearer sk-your-api-key" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: video-order-001" \
+  -d '{"model":"veo-3.1","prompt":"Slow dolly through a neon alley","seconds":8,"size":"1280x720"}'
 ```
 
-Images default to the OpenAI-style `{ "created": ..., "data": [{ "url": "..." }] }` response. Ordinary requests return the upstream URL without downloading, base64-encoding, or storing the asset; authenticated ChatGPT/Grok assets use this gateway's streaming `/content` URL. Explicitly pass `"response_format":"b64_json"` for inline image data. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. OreateAI 1.5/2.0 variants expose 5/10 seconds; Seedance 2.5 additionally exposes 20/30 seconds. The live account configuration allows two ordered frames for 1.5 Pro, or up to nine images and three videos (2–15 seconds total, rounded up) for 2.0/2.5. Full parameters are documented on the in-app **/docs** page.
+For images, `Prefer: respond-async` returns `202`; poll `/v1/images/tasks` with the returned `request_id`. Even without that preference, an upstream-accepted image that is still processing returns `202` immediately so a reverse-proxy timeout cannot hide its recovery handle. Image edits accept PNG, JPEG, GIF, or WebP references; `mask`, `background`, and `output_format` are explicitly rejected instead of silently ignored. Videos are always task-based: poll `/v1/videos/:id` until `completed`, then request `/content`.
 
-## 🚀 Deployment
+Image/video tasks, status, and `/content` are isolated to the API key that created them. Content downloads therefore require the same Bearer key.
 
-> Domain + HTTPS are handled by your own reverse proxy (this project issues no certificates).
+## Local Development and Verification
 
-**Docker (recommended)**: `docker compose up -d --build` brings up PostgreSQL + Redis + RustFS + backend + frontend (nginx serving **HTTP on container port 2000**); point your reverse proxy at `http://<host>:2000` (port via `WEB_PORT`; edit the values (passwords / keys / `CORS_ORIGINS`, and `COOKIE_SECURE=true` when your proxy serves HTTPS) directly in `docker-compose.yml`).
-
-Configure the admin **Global Proxy** (`proxy.url`), for example `http://user:password@proxy:port`, when ChatGPT, Grok, or OreateAI protected traffic requires residential egress. Only those providers receive the setting; Adobe, Runway, Leonardo, Krea, Imagine, and custom upstreams remain direct. ChatGPT/Grok/Oreate clients also keep confirmed bulk-media and artifact transfers direct where supported. Clear the setting to make their protected stages direct too. The URL can contain credentials: do not expose it in logs or documentation, and restrict the proxy to the application server.
-
-Or **build from source** — bring your own **PostgreSQL · Redis · RustFS (or any S3) · reverse proxy**:
+Backend:
 
 ```bash
-# 1. Create an empty database (the backend auto-migrates on start)
-createdb vivid_ai
-
-# 2. Configure and build the backend from source
-cat > backend/.env <<'EOF'
-APP_ENV=production
-HTTP_ADDR=127.0.0.1:6666
-POSTGRES_DSN=host=127.0.0.1 user=postgres password=YOUR_PASSWORD dbname=vivid_ai port=5432 sslmode=disable TimeZone=Asia/Shanghai
-REDIS_ADDR=127.0.0.1:6379
-RUSTFS_ENDPOINT=http://127.0.0.1:9000
-RUSTFS_BUCKET=vivid-ai
-RUSTFS_ACCESS_KEY=YOUR_AK
-RUSTFS_SECRET_KEY=YOUR_SK
-CORS_ORIGINS=https://your-domain
-COOKIE_SECURE=true
-EOF
-cd backend && go build -o bin/api ./cmd/api && ./bin/api   # listens on 127.0.0.1:6666
-
-# 3. Build the frontend (output in frontend/dist)
-cd frontend && npm install && npm run build
+cd backend
+go test ./...
+go build ./cmd/api
 ```
 
-Nginx reverse proxy (issue the certificate yourself with certbot / acme.sh):
+Frontend:
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name your-domain;
-    ssl_certificate     /path/fullchain.pem;
-    ssl_certificate_key /path/privkey.pem;
-    root /path/to/frontend/dist;
-    index index.html;
-    client_max_body_size 320m;
-    proxy_read_timeout 600s;            # video generation can take a while
-
-    location /assets/ { expires 1y; add_header Cache-Control "public, max-age=31536000, immutable"; }
-    location / { try_files $uri $uri/ /index.html; add_header Cache-Control "no-cache"; }
-    location ^~ /admin/api/ { proxy_pass http://127.0.0.1:6666; }
-    location ^~ /images/    { proxy_pass http://127.0.0.1:6666; }
-    location = /health      { proxy_pass http://127.0.0.1:6666; }
-    location ^~ /v1/        { proxy_pass http://127.0.0.1:6666; add_header Cache-Control "no-store" always; }
-}
+```bash
+cd frontend
+npm ci
+npm test
+npm run lint:unused
+npm run build
 ```
 
-> See `backend/.env.example` for the full set of environment variables.
+## Repository Layout
 
-</details>
-
-## 🧱 Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Backend | Go · gin · gorm (PostgreSQL) · go-redis · tls-client (Chrome fingerprint) |
-| Frontend | Vue 3 · Vue Router · Vite · Tailwind CSS v4 |
-| Infrastructure | PostgreSQL · Redis · RustFS (S3-compatible) · Nginx |
-
-## 📦 Repository Layout
-
-```
-backend/                       Backend source (Go)
-├── cmd/
-│   ├── api/                   Service entry point (main)
-│   └── marklabel/             Ops helper (mark accounts on demand)
-├── internal/
-│   ├── bootstrap/             App wiring, scheduled maintenance startup
-│   ├── config/                Env-var configuration loading
-│   ├── http/
-│   │   ├── handler/           HTTP handlers (v1-compatible API, admin, auth…)
-│   │   ├── middleware/        Auth / request-id middleware
-│   │   └── router/            Route registration
-│   ├── model/                 GORM data models
-│   ├── provider/              Upstream provider clients
-│   │   ├── adobe/             Adobe Firefly (tls-client fingerprint)
-│   │   ├── byteplus/          Five-model BytePlus Lumina web integration (Cookie + ImageX)
-│   │   ├── chatgpt/           OpenAI (incl. PoW / turnstile)
-│   │   ├── runway/            Runway video + Nano Banana image
-│   │   ├── grok/              Grok (grok.com, spoofed statsig, text / image / video)
-│   │   ├── leonardo/          Leonardo
-│   │   ├── krea/              Krea
-│   │   ├── imagine/           Imagine.art
-│   │   ├── oreate/            OreateAI Seedance (website Banti signer)
-│   │   ├── custom/            Custom upstream (OpenAI-compatible v1, routed by id)
-│   │   └── epay/              易支付 / epay (mapi order + MD5-verified callback, top-ups)
-│   ├── repo/                  Data-access layer (users / models / accounts / logs / CDK / orders / concurrency groups…)
-│   ├── service/               Business logic (scheduling, billing, account pools, keep-alive, maintenance)
-│   └── storage/               RustFS / S3 media storage
-├── Dockerfile                 Multi-stage build (compile source → slim runtime image)
-└── .env.example               Backend env-var template
-
-frontend/                      Frontend source (Vue 3 + Vite)
-├── src/
-│   ├── views/                 Pages (playground / accounts / models / users / concurrency / orders / logs / overview / top-up / settings…)
-│   ├── components/            Reusable components (modals / selectors / lightbox…)
-│   ├── layouts/               Public / admin layouts
-│   ├── utils/                 Utility functions
-│   └── api.js · auth.js …     API client, auth, theme, credits, etc.
-├── Dockerfile                 Nginx static hosting (HTTP :2000) + API proxy
-└── default.conf.template      Nginx site template (reverse proxy + caching)
-
-docker-compose.yml             Docker orchestration (Postgres / Redis / RustFS / backend / frontend)
+```text
+backend/                 Go API, provider adapters, routing, and scheduling
+frontend/                Vue 3 singleton administrator console
+docker-compose.yml       Complete container stack
+.env.example             Deployment variable template
+DESIGN.md                Architecture, data model, security, and scheduling semantics
 ```
 
-## 🗺️ Roadmap
+## License
 
-- [ ] More upstream providers
-- [ ] Usage analytics / export
-- [ ] Multi-language UI (i18n)
-- [ ] Webhook / async callbacks
-
-## 💬 Community / Contact
-
-| | |
-|---|---|
-| 🌐 Website | **[vividai.run](https://vividai.run)** |
-| 👥 QQ Group | **1106849765** · [Join](https://qm.qq.com/q/976LeMFoHu) |
-| 🐧 QQ | **1114639355** · [Add](https://qm.qq.com/q/ItgCcNA7ac) |
-| 🛒 Shop | **[pay.ldxp.cn/shop/chiyi](https://pay.ldxp.cn/shop/chiyi)** |
-| ✉️ Email | vividairun@gmail.com |
-
-## ⭐ Star History
-
-<!-- After creating the GitHub repo, uncomment the line below and replace OWNER with your username to show the chart: -->
-<!-- [![Star History Chart](https://api.star-history.com/svg?repos=OWNER/image2api&type=Date)](https://star-history.com/#OWNER/image2api&Date) -->
-
-If you find this useful, give it a ⭐ — uncomment the line above after creating the repo to show the Star History chart.
-
-## 📄 License
-
-This project (frontend + backend) is open-source under the [MIT](LICENSE) license — free to use, modify, commercialize and redistribute.
-
-<div align="center">
-
-If this project helps you, a ⭐ Star is much appreciated!
-
-</div>
+This project is released under the [MIT License](LICENSE).

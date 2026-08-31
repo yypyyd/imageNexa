@@ -92,14 +92,6 @@ var nanoBananaTierSize = map[string]map[string][2]int{
 	},
 }
 
-var fluxSize = map[string][2]int{
-	"1:1":  {1024, 1024},
-	"16:9": {1408, 768},
-	"9:16": {768, 1408},
-	"4:3":  {1280, 896},
-	"3:4":  {896, 1280},
-}
-
 var defaultSize = map[string]map[string][2]int{
 	"1K": {"1:1": {1024, 1024}, "1:8": {384, 3072}, "1:4": {512, 2048}, "16:9": {1360, 768}, "9:16": {768, 1360}, "4:1": {2048, 512}, "4:3": {1152, 864}, "3:4": {864, 1152}, "8:1": {3072, 384}},
 	"2K": {"1:1": {2048, 2048}, "1:8": {768, 6144}, "1:4": {1024, 4096}, "16:9": {2752, 1536}, "9:16": {1536, 2752}, "4:1": {4096, 1024}, "4:3": {2048, 1536}, "3:4": {1536, 2048}, "8:1": {6144, 768}},
@@ -118,8 +110,6 @@ func ResolveModelSpec(modelID string) modelSpec {
 		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-2"}
 	case "firefly-nano-banana-2":
 		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-3"}
-	case "flux-kontext-max":
-		return modelSpec{UpstreamModelID: "flux", UpstreamModelVersion: "fluxKontextMax"}
 	default:
 		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-3"}
 	}
@@ -176,8 +166,6 @@ func BuildImagePayloadCandidates(modelID, prompt, aspectRatio, outputResolution 
 		return buildGPTImagePayloads(spec, prompt, ratio, resolution, blobIDs)
 	case "gemini-flash":
 		return buildGeminiPayloads(spec, prompt, ratio, resolution, blobIDs)
-	case "flux":
-		return buildFluxPayloads(spec, prompt, ratio, blobIDs)
 	default:
 		return buildDefaultPayloads(spec, prompt, ratio, resolution, blobIDs)
 	}
@@ -300,36 +288,6 @@ func gptImage2DetailLevel(resolution string) int {
 	}
 }
 
-func buildFluxPayloads(spec modelSpec, prompt, ratio string, blobIDs []string) []map[string]any {
-	size := fluxSize[ratio]
-	if size == [2]int{} {
-		size = fluxSize["1:1"]
-	}
-	base := map[string]any{
-		"modelId":        spec.UpstreamModelID,
-		"modelVersion":   spec.UpstreamModelVersion,
-		"n":              1,
-		"prompt":         prompt,
-		"size":           map[string]any{"width": size[0], "height": size[1]},
-		"seeds":          []int{nextImageSeed()},
-		"output":         map[string]any{"storeInputs": true},
-		"referenceBlobs": []any{},
-		"modelSpecificPayload": map[string]any{
-			"prompt_upsampling": true,
-			"safety_tolerance":  2,
-			"aspect_ratio":      ratio,
-		},
-		"generationMetadata": map[string]any{"module": "text2image", "submodule": "ff-image-generate"},
-	}
-	if len(blobIDs) == 0 {
-		return []map[string]any{base}
-	}
-	edited := cloneMap(base)
-	edited["generationMetadata"] = map[string]any{"module": "image2image", "submodule": "ff-image-generate"}
-	edited["referenceBlobs"] = blobRefs(blobIDs, "general")
-	return []map[string]any{edited}
-}
-
 func buildDefaultPayloads(spec modelSpec, prompt, ratio, resolution string, blobIDs []string) []map[string]any {
 	size := getSize(defaultSize, resolution, ratio, "16:9")
 	// Shape mirrors a captured working firefly.adobe.com request exactly: top-level
@@ -373,10 +331,6 @@ func getSize(table map[string]map[string][2]int, resolution, ratio, fallbackRati
 		size = levelTable[fallbackRatio]
 	}
 	return size
-}
-
-func sizeString(size [2]int) string {
-	return itoa(size[0]) + "x" + itoa(size[1])
 }
 
 func blobRefs(ids []string, usage string) []any {

@@ -84,16 +84,12 @@ func (r *BannedWordRepository) Delete(ctx context.Context, id string) (int64, er
 	return res.RowsAffected, res.Error
 }
 
-// RecordHit bumps the word's block counter, the user's 违禁词触发次数 (when userID
-// is set), and appends a BannedWordHit row for the admin 违禁词触发列表.
-// Best-effort bookkeeping.
+// RecordHit bumps the word's block counter and appends a BannedWordHit row for
+// the admin trigger list. userID/userName are request-identity snapshots only;
+// there is no mutable legacy User record in the 2API product.
 func (r *BannedWordRepository) RecordHit(ctx context.Context, wordID, word, userID, userName, prompt string) {
 	_ = r.db.WithContext(ctx).Model(&model.BannedWord{}).Where("id = ?", wordID).
 		UpdateColumn("hits", gorm.Expr("hits + 1")).Error
-	if userID != "" {
-		_ = r.db.WithContext(ctx).Model(&model.User{}).Where("id = ?", userID).
-			UpdateColumn("banned_word_hits", gorm.Expr("banned_word_hits + 1")).Error
-	}
 	_ = r.db.WithContext(ctx).Create(&model.BannedWordHit{
 		ID:        strings.ReplaceAll(uuid.NewString(), "-", "")[:32],
 		WordID:    wordID,

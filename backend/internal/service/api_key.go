@@ -2,86 +2,234 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"strings"
 	"time"
 
 	"backend/internal/model"
 	"backend/internal/repo"
+	"gorm.io/gorm"
 )
 
-type APIKeyService struct {
-	keys *repo.APIKeyRepository
+var (
+	ErrInvalidAPICredential         = errors.New("invalid api key")
+	ErrCredentialServiceUnavailable = errors.New("api credential service is not configured")
+)
+
+type APICredentialService struct {
+	credentials *repo.APICredentialRepository
+	concurrency *ConcurrencyService
 }
 
-func NewAPIKeyService(keys *repo.APIKeyRepository) *APIKeyService {
-	return &APIKeyService{keys: keys}
+func NewAPICredentialService(credentials *repo.APICredentialRepository) *APICredentialService {
+	return &APICredentialService{credentials: credentials}
 }
 
-func (s *APIKeyService) Current(ctx context.Context, userID string) (map[string]any, error) {
-	keys, err := s.keys.ListByUserID(ctx, userID)
-	if err != nil {
-		return nil, err
+func (s *APICredentialService) SetConcurrency(concurrency *ConcurrencyService) {
+	if s != nil {
+		s.concurrency = concurrency
 	}
-	if len(keys) == 0 {
-		return map[string]any{"key": nil}, nil
-	}
-	key := keys[0]
-	return map[string]any{
-		"key": map[string]any{
-			"id":           key.ID,
-			"name":         key.Name,
-			"key_preview":  key.KeyPreview,
-			"created_at":   key.CreatedAt,
-			"last_used_at": key.LastUsedAt,
-		},
-	}, nil
 }
 
-func (s *APIKeyService) Mint(ctx context.Context, userID string) (map[string]any, error) {
+func (s *APICredentialService) ActiveRequests(ctx context.Context, credentialID string) int64 {
+	if s == nil || s.concurrency == nil {
+		return 0
+	}
+	return s.concurrency.ActiveCount(ctx, "conc:k:"+credentialID)
+}
+
+type CreateAPICredentialInput struct {
+	Name             string `json:"name"`
+	ConcurrencyLimit int    `json:"concurrency_limit"`
+}
+
+type UpdateAPICredentialInput struct {
+	Name             *string `json:"name"`
+	Status           *string `json:"status"`
+	ConcurrencyLimit *int    `json:"concurrency_limit"`
+}
+
+type CreatedAPICredential struct {
+	Credential model.APICredential `json:"credential"`
+	Key        string              `json:"key"`
+}
+
+func (s *APICredentialService) List(ctx context.Context, includeRevoked bool) ([]model.APICredential, error) {
+	if s == nil || s.credentials == nil {
+		return nil, ErrCredentialServiceUnavailable
+	}
+	return s.credentials.List(ctx, includeRevoked)
+}
+
+func (s *APICredentialService) Create(ctx context.Context, input CreateAPICredentialInput) (*CreatedAPICredential, error) {
+	if s == nil || s.credentials == nil {
+		return nil, ErrCredentialServiceUnavailable
+	}
+	name := strings.TrimSpace(input.Name)
+	if name == "" {
+		return nil, errors.New("API Key 名称不能为空")
+	}
+	if len(name) > 100 {
+		return nil, errors.New("API Key 名称不能超过 100 个字符")
+	}
+	if input.ConcurrencyLimit < 0 {
+		return nil, errors.New("并发上限不能小于 0")
+	}
 	plain, err := generatePlainAPIKey()
 	if err != nil {
 		return nil, err
 	}
-	key := &model.APIKey{
-		ID:         "k-" + time.Now().Format("150405") + randomSuffix(2),
-		UserID:     userID,
-		Name:       "default",
-		KeyPreview: previewAPIKey(plain),
-		KeyHash:    hashAPIKey(plain),
-		CreatedAt:  time.Now(),
-	}
-	if err := s.keys.ReplaceForUser(ctx, userID, key); err != nil {
+	now := time.Now()
+	credentialID, err := randomSecret(9)
+	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
-		"ok":      true,
-		"key":     plain,
-		"preview": key.KeyPreview,
-	}, nil
+	credential := model.APICredential{
+		ID:               "cred-" + credentialID,
+		Name:             name,
+		KeyPreview:       previewAPIKey(plain),
+		KeyHash:          HashAPIKey(plain),
+		Status:           model.APICredentialStatusActive,
+		ConcurrencyLimit: input.ConcurrencyLimit,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := s.credentials.Create(ctx, &credential); err != nil {
+		return nil, err
+	}
+	return &CreatedAPICredential{Credential: credential, Key: plain}, nil
 }
 
-func (s *APIKeyService) Revoke(ctx context.Context, userID string) error {
-	return s.keys.DeleteByUserID(ctx, userID)
+func (s *APICredentialService) Update(
+	ctx context.Context,
+	credentialID string,
+	input UpdateAPICredentialInput,
+) (*model.APICredential, error) {
+	if s == nil || s.credentials == nil {
+		return nil, ErrCredentialServiceUnavailable
+	}
+	existing, err := s.credentials.GetByID(ctx, credentialID)
+	if err != nil {
+		return nil, err
+	}
+	if existing.RevokedAt != nil || existing.Status == model.APICredentialStatusRevoked {
+		return nil, errors.New("已吊销的 API Key 不能修改")
+	}
+	patch := make(map[string]any)
+	if input.Name != nil {
+		name := strings.TrimSpace(*input.Name)
+		if name == "" || len(name) > 100 {
+			return nil, errors.New("API Key 名称需为 1 到 100 个字符")
+		}
+		patch["name"] = name
+	}
+	if input.ConcurrencyLimit != nil {
+		if *input.ConcurrencyLimit < 0 {
+			return nil, errors.New("并发上限不能小于 0")
+		}
+		patch["concurrency_limit"] = *input.ConcurrencyLimit
+	}
+	if input.Status != nil {
+		status := strings.ToLower(strings.TrimSpace(*input.Status))
+		switch status {
+		case model.APICredentialStatusActive, model.APICredentialStatusDisabled:
+			patch["status"] = status
+		case model.APICredentialStatusRevoked:
+			return nil, errors.New("请使用吊销接口永久吊销 API Key")
+		default:
+			return nil, errors.New("API Key 状态不正确")
+		}
+	}
+	if len(patch) == 0 {
+		return existing, nil
+	}
+	patch["updated_at"] = time.Now()
+	credential, err := s.credentials.Update(ctx, credentialID, patch)
+	if err != nil {
+		return nil, err
+	}
+	return credential, nil
+}
+
+func (s *APICredentialService) Revoke(ctx context.Context, credentialID string) error {
+	if s == nil || s.credentials == nil {
+		return ErrCredentialServiceUnavailable
+	}
+	return s.credentials.Revoke(ctx, credentialID)
+}
+
+func (s *APICredentialService) Rotate(ctx context.Context, credentialID string) (*CreatedAPICredential, error) {
+	if s == nil || s.credentials == nil {
+		return nil, ErrCredentialServiceUnavailable
+	}
+	existing, err := s.credentials.GetByID(ctx, credentialID)
+	if err != nil {
+		return nil, err
+	}
+	plain, err := generatePlainAPIKey()
+	if err != nil {
+		return nil, err
+	}
+	id, err := randomSecret(9)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	replacement := model.APICredential{
+		ID: "cred-" + id, Name: existing.Name, KeyPreview: previewAPIKey(plain), KeyHash: HashAPIKey(plain),
+		Status: existing.Status, ConcurrencyLimit: existing.ConcurrencyLimit,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.credentials.Rotate(ctx, credentialID, &replacement); err != nil {
+		return nil, err
+	}
+	return &CreatedAPICredential{Credential: replacement, Key: plain}, nil
+}
+
+// AuthenticateBearer accepts only OpenAI's Authorization: Bearer sk-* shape.
+// It deliberately ignores x-api-key, cookies and query parameters.
+func (s *APICredentialService) AuthenticateBearer(ctx context.Context, authorization string) (*model.APICredential, error) {
+	plain := ParseBearer(authorization)
+	if !validPlainAPIKey(plain) {
+		return nil, ErrInvalidAPICredential
+	}
+	if s == nil || s.credentials == nil {
+		return nil, ErrCredentialServiceUnavailable
+	}
+	credential, err := s.credentials.GetActiveByHash(ctx, HashAPIKey(plain))
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrInvalidAPICredential
+		}
+		return nil, err
+	}
+	_ = s.credentials.TouchLastUsed(ctx, credential.ID, time.Now())
+	return credential, nil
 }
 
 func generatePlainAPIKey() (string, error) {
-	return "sk-" + randomUpper(38), nil
+	secret, err := randomSecret(36)
+	if err != nil {
+		return "", err
+	}
+	return "sk-" + secret, nil
+}
+
+func validPlainAPIKey(plain string) bool {
+	if len(plain) < 16 || len(plain) > 128 || !strings.HasPrefix(plain, "sk-") {
+		return false
+	}
+	for _, char := range plain[3:] {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' && char != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func previewAPIKey(plain string) string {
-	if len(plain) <= 4 {
-		return strings.Repeat("•", len(plain))
+	if len(plain) <= 8 {
+		return "sk-••••"
 	}
-	return "…" + plain[len(plain)-4:]
-}
-
-func hashAPIKey(plain string) string {
-	sum := sha256.Sum256([]byte(plain))
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-func randomSuffix(n int) string {
-	return randomUpper(n)
+	return plain[:7] + "…" + plain[len(plain)-4:]
 }

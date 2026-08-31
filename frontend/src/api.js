@@ -1,38 +1,44 @@
-// Thin fetch wrapper mirroring the old admin.html `API()` helper.
-// In dev, requests use relative paths and are proxied by Vite to the backend.
-// For a separately-hosted frontend, set VITE_API_BASE (e.g. http://host:6060).
-import { auth, clearSession } from './auth'
+import { auth, clearSession, getCSRF } from './auth'
 
 const BASE = import.meta.env.VITE_API_BASE || ''
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
-/** Call an /admin/api endpoint. Returns { ok, status, data }. Automatically
- *  attaches the bearer token and clears the session on a 401 so admin pages
- *  fall back to the login screen via the router guard. */
-export async function api(path, opts = {}) {
-  const headers = { ...(opts.headers || {}) }
-  if (auth.token) headers.Authorization = `Bearer ${auth.token}`
-  const r = await fetch(`${BASE}/admin/api${path}`, { ...opts, headers })
-  let data = null
-  try {
-    data = await r.json()
-  } catch {
-    data = null
-  }
-  // A 401 only means "log out" when it's the *caller's* session that's invalid.
-  // Business/upstream failures (a dead provider account, etc.) must NOT clear
-  // the session — they used to surface as 401 and kick the user out mid-action.
-  // The backend now flags genuine session expiry with detail "未登录或会话已过期";
-  // treat only those (or a token-less 401) as a real logout signal.
-  if (r.status === 401) {
-    const detail = data?.detail || ''
-    if (!auth.token || detail.includes('未登录') || detail.includes('会话')) {
-      clearSession()
-    }
-  }
-  return { ok: r.ok, status: r.status, data }
+function messageOf(data, fallback = '请求失败') {
+  return data?.error?.message || data?.detail || data?.message || fallback
 }
 
-/** Shorthand for a JSON POST/PATCH body. */
+async function parseBody(response) {
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType.includes('application/json')) {
+    try { return await response.json() } catch { return null }
+  }
+  try {
+    const text = await response.text()
+    return text ? { message: text } : null
+  } catch { return null }
+}
+
+export async function api(path, opts = {}) {
+  const method = String(opts.method || 'GET').toUpperCase()
+  const headers = { Accept: 'application/json', ...(opts.headers || {}) }
+  if (WRITE_METHODS.has(method)) headers['X-CSRF-Token'] = await getCSRF()
+
+  const response = await fetch(`${BASE}/admin/api${path}`, {
+    ...opts,
+    method,
+    headers,
+    credentials: 'include',
+  })
+  const data = await parseBody(response)
+
+  if (response.status === 401) clearSession()
+  if (response.status === 403 && (data?.code === 'csrf_invalid' || /csrf/i.test(messageOf(data, '')))) {
+    auth.csrfToken = ''
+  }
+
+  return { ok: response.ok, status: response.status, data, error: response.ok ? '' : messageOf(data) }
+}
+
 export function jsonBody(method, payload) {
   return {
     method,
@@ -41,13 +47,14 @@ export function jsonBody(method, payload) {
   }
 }
 
-/** Absolute URL for a generated artifact (works in dev via proxy too). */
-export function generatedUrl(name) {
-  return `${BASE}/images/${name}`
+export function listOf(data) {
+  if (Array.isArray(data)) return data
+  for (const key of ['data', 'items', 'results', 'models', 'accounts', 'credentials', 'logs', 'artifacts']) {
+    if (Array.isArray(data?.[key])) return data[key]
+  }
+  return []
 }
 
-/** Small thumbnail URL for list views. The server falls back to the original
- * when no thumbnail object exists (old images), so this is always safe. */
-export function thumbUrl(name) {
-  return `${BASE}/images/${name}.thumb.jpg`
+export function apiURL(path) {
+  return `${BASE}${path}`
 }

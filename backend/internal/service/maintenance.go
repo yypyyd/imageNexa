@@ -22,34 +22,34 @@ type MaintenanceService struct {
 	tokens          *repo.TokenRepository
 	tokenSvc        *TokenService
 	events          *repo.EventRepository
-	users           *repo.UserRepository
 	refresh         *RefreshProfileService
 	settings        *repo.SiteSettingRepository
+	models          *repo.ModelRepository
 	store           *storage.Client
 	inflight        *InflightRegistry
-	showcase        *repo.ShowcaseRepository
-	orders          *repo.OrderRepository
+	recovery        *V1Service
 	interval        time.Duration
 	stalePending    time.Duration
 	mediaPruneEvery time.Duration
 	lastMediaPrune  time.Time
+	quotaRecoverAge time.Duration
 }
 
-func NewMaintenanceService(tokens *repo.TokenRepository, tokenSvc *TokenService, events *repo.EventRepository, users *repo.UserRepository, refresh *RefreshProfileService, settings *repo.SiteSettingRepository, store *storage.Client, inflight *InflightRegistry, showcase *repo.ShowcaseRepository, orders *repo.OrderRepository) *MaintenanceService {
+func NewMaintenanceService(tokens *repo.TokenRepository, tokenSvc *TokenService, events *repo.EventRepository, refresh *RefreshProfileService, settings *repo.SiteSettingRepository, models *repo.ModelRepository, store *storage.Client, recovery *V1Service) *MaintenanceService {
 	return &MaintenanceService{
 		tokens:          tokens,
 		tokenSvc:        tokenSvc,
 		events:          events,
-		users:           users,
 		refresh:         refresh,
 		settings:        settings,
+		models:          models,
 		store:           store,
-		inflight:        inflight,
-		showcase:        showcase,
-		orders:          orders,
+		inflight:        recovery.Inflight(),
+		recovery:        recovery,
 		interval:        60 * time.Second,
 		stalePending:    600 * time.Second,
 		mediaPruneEvery: 60 * time.Second,
+		quotaRecoverAge: 2 * time.Minute,
 	}
 }
 
@@ -70,17 +70,15 @@ func (m *MaintenanceService) Run(ctx context.Context) {
 	}
 }
 
-// syncRecoveredQuota re-probes each just-recovered account so its displayed
-// balance reflects the post-reset value (these providers only sync quota when
-// accessed). krea additionally needs /app (Activate) to actually grant the daily
-// free balance before billing-data reports it. Bounded concurrency avoids a
+// syncRecoveredQuota re-probes recovered ChatGPT accounts so their displayed
+// image balance reflects the post-reset value. Bounded concurrency avoids a
 // thundering herd at the daily reset.
 func (m *MaintenanceService) syncRecoveredQuota(accs []model.TokenAccount) {
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for _, acc := range accs {
 		switch acc.Pool {
-		case "chatgpt", "leonardo", "krea", "imagine":
+		case "chatgpt":
 		default:
 			continue
 		}
@@ -91,9 +89,6 @@ func (m *MaintenanceService) syncRecoveredQuota(accs []model.TokenAccount) {
 			defer func() { <-sem }()
 			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
-			if a.Pool == "krea" && m.tokenSvc.krea != nil {
-				m.tokenSvc.krea.Activate(ctx, a.Value)
-			}
 			_, _ = m.tokenSvc.Quota(ctx, a.Pool, a.ID)
 		}(acc)
 	}
@@ -101,21 +96,12 @@ func (m *MaintenanceService) syncRecoveredQuota(accs []model.TokenAccount) {
 }
 
 func (m *MaintenanceService) tick(ctx context.Context) {
-	// 0. Auto-cancel unpaid recharge orders past their 30-min TTL.
-	if m.orders != nil {
-		if n, err := m.orders.ExpirePending(ctx, time.Now()); err != nil {
-			log.Printf("maintenance: expire orders: %v", err)
-		} else if n > 0 {
-			log.Printf("maintenance: cancelled %d expired order(s)", n)
-		}
-	}
-
+	m.resumeAcceptedImages(ctx)
+	m.reconcileOpenQuotaReservations(ctx)
 	// 1. Re-activate quota-exhausted tokens whose reset time has passed, then
-	//    auto-sync their real balance — these providers only refresh quota when
-	//    accessed, so recovery alone would leave a stale 0/—. For krea the sync
-	//    must first load /app (Activate) to grant the daily free balance.
+	//    auto-sync their real balance where the provider exposes a cheap probe.
 	if recovered, err := m.tokens.RecoverQuota(ctx); err != nil {
-		log.Printf("maintenance: recover_quota: %v", err)
+		log.Printf("maintenance: recover_quota failed")
 	} else if len(recovered) > 0 {
 		log.Printf("maintenance: recovered %d quota token(s)", len(recovered))
 		if m.tokenSvc != nil {
@@ -123,12 +109,10 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 		}
 	}
 
-	// 1a. Roll the 恢复时间 marker of ACTIVE daily-reset accounts forward to the next
-	//     future reset (same time-of-day, +1 day) so the column never shows a stale
-	//     past time. Limited accounts are intentionally skipped (RecoverQuota owns
-	//     their marker). adobe/leonardo/krea/imagine all renew daily.
-	if _, err := m.tokens.RollResetMarkers(ctx, []string{"adobe", "leonardo", "krea", "imagine"}); err != nil {
-		log.Printf("maintenance: roll_reset: %v", err)
+	// 1a. Roll Adobe's active reset marker forward so the admin view never shows
+	//     a stale past time. Limited accounts remain owned by RecoverQuota.
+	if _, err := m.tokens.RollResetMarkers(ctx, []string{"adobe"}); err != nil {
+		log.Printf("maintenance: roll_reset failed")
 	}
 
 	// 1b. Runway tokens have no refresh — once the JWT expiry marker passes the
@@ -140,36 +124,26 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	//     import-time FetchSession check and by marking dead on a 401 at use.
 	for _, pool := range []string{"runway"} {
 		if n, err := m.tokens.ExpireByReset(ctx, pool); err != nil {
-			log.Printf("maintenance: expire_%s: %v", pool, err)
+			log.Printf("maintenance: expire_%s failed", pool)
 		} else if n > 0 {
 			log.Printf("maintenance: expired %d %s token(s)", n, pool)
 		}
 	}
 
-	// 1c. Proactively renew krea/imagine sessions ~10min before expiry so a
-	//     dormant account's rotating refresh_token never lapses (a dead token
-	//     can't be recovered and, for krea, blocks the daily free-credit meter
-	//     from being re-created). Only near-expiry accounts hit the network.
 	if m.tokenSvc != nil {
-		m.tokenSvc.RefreshExpiringTokens(ctx)
-		// 1d. Once-per-day krea /app activation for accounts not yet synced since the
-		//     daily reset — krea only grants the free balance after /app loads, so an
-		//     always-active account (never went 限额) would otherwise read 0 / 402
-		//     after each reset. Self-guarded + background; no-op once all are done.
-		m.tokenSvc.ActivateKreaDue(ctx)
-		// 1e. Re-sync Grok accounts through the authenticated credits endpoint.
+		// 1c. Re-sync Grok accounts through the authenticated credits endpoint.
 		//     It also provides liveness; subscription tier is not a video
 		//     entitlement signal and is intentionally not probed here.
 		m.tokenSvc.RefreshGrokLiveness(ctx)
-		// 1f. Refresh Oreate quota rows and legacy active rows cached below the
+		// 1d. Refresh Oreate quota rows and active rows cached below the
 		//     operating floor. Replenished accounts return to active automatically.
 		m.tokenSvc.RefreshLowCreditOreateAccounts(ctx)
-		// 1g. Re-probe ChatGPT accounts stuck in pending past stalePending — an
+		// 1e. Re-probe ChatGPT accounts stuck in pending past stalePending — an
 		//     import probe interrupted by a restart (or that never finished) would
 		//     otherwise strand a good freshly-registered account forever, since
 		//     RecoverQuota only revives 限额, never pending.
 		m.tokenSvc.ReprobeStalePendingChatGPT(ctx, m.stalePending)
-		// 1h. Same stale-pending safety net for Adobe: a cookie→token exchange
+		// 1f. Same stale-pending safety net for Adobe: a cookie→token exchange
 		//     interrupted mid-flight (process restart / redis blip during import)
 		//     would otherwise strand the row as an empty-email pending zombie.
 		m.tokenSvc.ReprobeStalePendingAdobe(ctx, m.stalePending)
@@ -178,15 +152,14 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	// 2. Auto-renew Adobe cookies whose refresh interval has elapsed.
 	if m.refresh != nil {
 		if n, err := m.refresh.RefreshDue(ctx); err != nil {
-			log.Printf("maintenance: refresh_due: %v", err)
+			log.Printf("maintenance: refresh_due failed")
 		} else if n > 0 {
 			log.Printf("maintenance: refreshed %d cookie profile(s)", n)
 		}
 	}
 
-	// 3. Fail long-pending events so they stop blocking the per-user gate, and
-	//    refund the credits debited up-front for each abandoned generation (the
-	//    normal failure-refund path never ran for a process-restart orphan).
+	// 3. Fail long-pending events so credential tasks do not remain stuck after a
+	//    process restart. 2API has no downstream credit debit/refund path.
 	//    An event whose generation goroutine is still registered in-flight is
 	//    NOT an orphan — a slow video render can legitimately outlive the
 	//    window — so it is skipped and left to its own work-context backstop.
@@ -196,9 +169,8 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 		return m.inflight != nil && m.inflight.Active(e.ID) && time.Since(e.TS) < 3*m.stalePending
 	}
 	if purged, err := m.events.PurgeStale(ctx, m.stalePending, skipLive); err != nil {
-		log.Printf("maintenance: purge_stale: %v", err)
+		log.Printf("maintenance: purge_stale failed")
 	} else if len(purged) > 0 {
-		refunded := 0
 		cancelled := 0
 		for _, e := range purged {
 			// Stop the generation goroutine if it's still running, so it doesn't
@@ -211,29 +183,11 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 			// (the normal markTokenFailure path never ran for an orphaned job).
 			if e.AccountID != "" {
 				if err := m.tokens.IncrementFail(ctx, e.AccountID); err != nil {
-					log.Printf("maintenance: fail-count abandoned event %s (account %s): %v", e.ID, e.AccountID, err)
+					log.Printf("maintenance: fail-count abandoned event %s (account %s) failed", e.ID, e.AccountID)
 				}
 			}
-			if e.UserID == "" || e.Cost <= 0 {
-				continue
-			}
-			// Exactly-once: only refund if we win the claim (the in-flight request
-			// may have already refunded itself on its own failure path).
-			claimed, err := m.events.MarkRefunded(ctx, e.ID)
-			if err != nil {
-				log.Printf("maintenance: claim refund %s: %v", e.ID, err)
-				continue
-			}
-			if !claimed {
-				continue
-			}
-			if _, err := m.users.AdjustCredits(ctx, e.UserID, e.Cost); err != nil {
-				log.Printf("maintenance: refund abandoned event %s (user %s, %.0f): %v", e.ID, e.UserID, e.Cost, err)
-			} else {
-				refunded++
-			}
 		}
-		log.Printf("maintenance: marked %d stale pending event(s) failed, refunded %d, cancelled %d in-flight", len(purged), refunded, cancelled)
+		log.Printf("maintenance: marked %d stale pending event(s) failed, cancelled %d in-flight", len(purged), cancelled)
 	}
 
 	// 4. Enforce the admin-configured log retention window.
@@ -247,13 +201,122 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	}
 }
 
+// resumeAcceptedImages proactively restarts only the polling/download half of
+// durable BytePlus tasks. It runs immediately after process start and every
+// maintenance tick, so recovery does not depend on a downstream client polling.
+// Ambiguous submissions have no upstream task id and are intentionally skipped.
+func (m *MaintenanceService) resumeAcceptedImages(ctx context.Context) {
+	if m.recovery == nil || m.models == nil || m.events == nil {
+		return
+	}
+	attempts, err := m.models.Dispatch().ListAccepted(ctx, 100)
+	if err != nil {
+		log.Printf("maintenance: list accepted image tasks failed")
+		return
+	}
+	for _, attempt := range attempts {
+		event, eventErr := m.events.GetByID(ctx, attempt.EventID)
+		if eventErr != nil {
+			log.Printf("maintenance: load accepted image event failed")
+			continue
+		}
+		m.recovery.startAcceptedImageRecovery(ctx, event)
+	}
+}
+
+func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context) {
+	if m.models == nil || m.tokenSvc == nil {
+		return
+	}
+	items, err := m.models.Quotas().ListOpen(ctx, time.Now().Add(-m.quotaRecoverAge), 200)
+	if err != nil {
+		log.Printf("maintenance: list open quota reservations failed")
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	accounts, err := m.tokens.List(ctx)
+	if err != nil {
+		log.Printf("maintenance: list accounts for quota reconciliation failed")
+		return
+	}
+	byID := make(map[string]model.TokenAccount, len(accounts))
+	for _, account := range accounts {
+		byID[account.ID] = account
+	}
+	for _, item := range items {
+		state, failureClass := "unknown", ""
+		if item.Attempt != nil {
+			state, failureClass = item.Attempt.State, item.Attempt.FailureClass
+		}
+		reservationID := item.Reservation.ID
+		switch state {
+		case "failed":
+			if failureClass == "quota" {
+				zero := 0.0
+				if err := m.models.Quotas().Settle(ctx, reservationID, &zero); err != nil {
+					log.Printf("maintenance: settle exhausted reservation %s failed", reservationID)
+				}
+			} else if err := m.models.Quotas().Release(ctx, reservationID); err != nil {
+				log.Printf("maintenance: release reservation %s failed", reservationID)
+			}
+			continue
+		case "unknown", "submitting", "created":
+			if err := m.models.Quotas().MarkUncertain(ctx, reservationID); err != nil {
+				log.Printf("maintenance: mark reservation %s uncertain failed", reservationID)
+				continue
+			}
+		}
+		account, ok := byID[item.Bucket.AccountID]
+		if !ok {
+			// Missing credentials make the upstream outcome unknowable. Keep the
+			// reservation conservative instead of inventing spendable quota.
+			continue
+		}
+		remaining := m.refreshRecoveredQuota(ctx, account, item.Bucket.BucketKey)
+		if remaining == nil && (state == "unknown" || state == "submitting" || state == "created") {
+			continue
+		}
+		if err := m.models.Quotas().Settle(ctx, reservationID, remaining); err != nil {
+			log.Printf("maintenance: settle reservation %s failed", reservationID)
+		}
+	}
+}
+
+func (m *MaintenanceService) refreshRecoveredQuota(ctx context.Context, account model.TokenAccount, bucketKey string) *float64 {
+	authoritativeBucket, unit, scoped := providerSnapshotScope(account.Pool)
+	if !scoped || strings.TrimSpace(bucketKey) != authoritativeBucket {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	snapshot, err := m.tokenSvc.Quota(probeCtx, account.Pool, account.ID)
+	if err != nil || boolValueWithDefault(snapshot["unknown"], false) {
+		return nil
+	}
+	remaining, ok := anyFloat(snapshot["remaining"])
+	if !ok {
+		return nil
+	}
+	var total *float64
+	if value, exists := anyFloat(snapshot["total"]); exists {
+		total = &value
+	}
+	if _, err := m.models.Quotas().UpsertSnapshot(ctx, account.ID, bucketKey, unit, total, &remaining, parseResetTime(snapshot["reset_after"])); err != nil {
+		log.Printf("maintenance: refresh recovered quota snapshot failed")
+		return nil
+	}
+	return &remaining
+}
+
 func (m *MaintenanceService) pruneLogs(ctx context.Context) {
 	days := m.retentionDays(ctx, "logs.retention_days")
 	if days <= 0 {
 		return
 	}
 	if _, err := m.events.PurgeOlderThan(ctx, time.Duration(days)*24*time.Hour); err != nil {
-		log.Printf("maintenance: purge_older_than: %v", err)
+		log.Printf("maintenance: purge_older_than failed")
 	}
 }
 
@@ -261,45 +324,24 @@ func (m *MaintenanceService) pruneMedia(ctx context.Context) {
 	if m.store == nil || !m.store.Configured() {
 		return
 	}
-	days := m.retentionDays(ctx, "media.retention_days")
+	days := m.retentionDays(ctx, "artifacts.retention_days")
 	if days <= 0 {
 		return
 	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	objs, err := m.store.List(ctx, "")
 	if err != nil {
-		log.Printf("maintenance: list media: %v", err)
+		log.Printf("maintenance: list media failed")
 		return
 	}
-	// Files referenced by the homepage showcase are kept forever, no matter how
-	// old — deleting them would break the public landing page.
-	var pinned map[string]struct{}
-	if m.showcase != nil {
-		if pinned, err = m.showcase.PublicFileSet(ctx); err != nil {
-			log.Printf("maintenance: showcase file set: %v", err)
-			pinned = nil
-		}
-	}
-	// The site logo is permanent too — pin it like a showcase image so the
-	// retention sweep never deletes it. site.logo is "/images/<key>".
-	if logo, _ := m.settings.GetValue(ctx, "site.logo"); strings.TrimSpace(logo) != "" {
-		if pinned == nil {
-			pinned = map[string]struct{}{}
-		}
-		pinned[strings.TrimPrefix(strings.TrimLeft(logo, "/"), "images/")] = struct{}{}
-	}
-	removed, skipped := 0, 0
+	removed := 0
 	var clearedKeys []string
 	for _, o := range objs {
 		if !o.LastModified.Before(cutoff) {
 			continue
 		}
-		if _, ok := pinned[strings.TrimLeft(o.Key, "/")]; ok {
-			skipped++
-			continue
-		}
 		if err := m.store.Delete(ctx, o.Key); err != nil {
-			log.Printf("maintenance: delete %s: %v", o.Key, err)
+			log.Printf("maintenance: delete %s failed", o.Key)
 			continue
 		}
 		removed++
@@ -307,12 +349,12 @@ func (m *MaintenanceService) pruneMedia(ctx context.Context) {
 		// don't dangle a 404 preview.
 		clearedKeys = append(clearedKeys, o.Key)
 	}
-	if removed > 0 || skipped > 0 {
-		log.Printf("maintenance: pruned %d expired media object(s), kept %d showcase-pinned", removed, skipped)
+	if removed > 0 {
+		log.Printf("maintenance: pruned %d expired artifact object(s)", removed)
 	}
 	if len(clearedKeys) > 0 {
 		if n, err := m.events.ClearFiles(ctx, clearedKeys); err != nil {
-			log.Printf("maintenance: clear_files: %v", err)
+			log.Printf("maintenance: clear_files failed")
 		} else if n > 0 {
 			log.Printf("maintenance: cleared file ref on %d log row(s)", n)
 		}
@@ -330,4 +372,3 @@ func (m *MaintenanceService) retentionDays(ctx context.Context, key string) int 
 	}
 	return days
 }
-

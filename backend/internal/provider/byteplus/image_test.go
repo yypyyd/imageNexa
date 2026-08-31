@@ -168,6 +168,110 @@ func TestGenerateImageFiveModelPayloads(t *testing.T) {
 	}
 }
 
+func TestGenerateImageFiveModelsPreserveNonPNGMagic(t *testing.T) {
+	jpeg := append([]byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10}, []byte("JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00")...)
+	webp := append([]byte("RIFF\x10\x00\x00\x00WEBPVP8 "), make([]byte, 32)...)
+	avif := append([]byte{0, 0, 0, 24}, []byte("ftypavif")...)
+	avif = append(avif, make([]byte, 32)...)
+	tests := []struct {
+		model       string
+		fixture     []byte
+		contentType string
+	}{
+		{model: "lumina-seedream-5.0-pro", fixture: jpeg, contentType: "image/jpeg"},
+		{model: "lumina-gpt-image-2", fixture: webp, contentType: "image/webp"},
+		{model: "lumina-seedream-5.0-lite", fixture: avif, contentType: "image/avif"},
+		{model: "lumina-nano-banana-2", fixture: jpeg, contentType: "image/jpeg"},
+		{model: "lumina-nano-banana-pro", fixture: webp, contentType: "image/webp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/user/current":
+					writeEnvelope(t, w, map[string]any{"user_id": "user-1", "role": "member"})
+				case "/api/inference/v2/create_task":
+					writeEnvelope(t, w, map[string]any{"parent_task_id": "task-format"})
+				case "/api/inference/task/query_task_list":
+					writeEnvelope(t, w, map[string]any{"tasks": []any{map[string]any{
+						"status": "complete",
+						"children": []any{map[string]any{"status": "complete", "multi_outputs": []any{
+							map[string]any{"value": server.URL + "/api/resource-utils/output.png", "format": "image/png"},
+						}}},
+					}}})
+				case "/api/resource-utils/output.png":
+					// Deliberately stale: payload magic, not this header or suffix,
+					// must drive the returned and persisted media type.
+					w.Header().Set("Content-Type", "image/png")
+					_, _ = w.Write(tt.fixture)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			withAPIBase(t, server.URL+"/api")
+
+			asset, meta, err := NewClient("").GenerateImage(context.Background(), "csrfToken=csrf; sessionid=session", ImageRequest{
+				Model: tt.model, Prompt: "draw a lighthouse", Resolution: "1K", AspectRatio: "1:1", DownloadResult: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(asset, tt.fixture) {
+				t.Fatalf("asset bytes changed: got %d bytes, want %d", len(asset), len(tt.fixture))
+			}
+			if got := stringValue(meta["content_type"]); got != tt.contentType {
+				t.Fatalf("content_type = %q, want magic-detected %q; meta=%#v", got, tt.contentType, meta)
+			}
+		})
+	}
+}
+
+func TestResumeImageTaskNeverCreatesAnotherTask(t *testing.T) {
+	var createCalls atomic.Int32
+	var queryCalls atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/inference/v2/create_task":
+			createCalls.Add(1)
+			http.Error(w, "must not submit", http.StatusInternalServerError)
+		case "/api/inference/task/query_task_list":
+			queryCalls.Add(1)
+			query := decodeJSONMap(t, r.Body)
+			ids, _ := query["ids"].([]any)
+			if len(ids) != 1 || fmt.Sprint(ids[0]) != "accepted-parent-1" {
+				t.Fatalf("resume ids = %#v", query["ids"])
+			}
+			writeEnvelope(t, w, map[string]any{"tasks": []any{map[string]any{
+				"status": "complete",
+				"children": []any{map[string]any{"status": "complete", "multi_outputs": []any{
+					map[string]any{"value": server.URL + "/api/resource-utils/result.png", "format": "image/png"},
+				}}},
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	withAPIBase(t, server.URL+"/api")
+
+	_, meta, err := NewClient("").ResumeImageTask(context.Background(), "csrfToken=csrf; sessionid=session", "accepted-parent-1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta["task_id"] != "accepted-parent-1" || meta["status"] != "complete" {
+		t.Fatalf("resume metadata = %#v", meta)
+	}
+	if got := createCalls.Load(); got != 0 {
+		t.Fatalf("create_task calls = %d, want 0", got)
+	}
+	if got := queryCalls.Load(); got != 1 {
+		t.Fatalf("query_task_list calls = %d, want 1", got)
+	}
+}
+
 func TestRequiredCreditsMatchesLuminaBillingRules(t *testing.T) {
 	tests := []struct {
 		name    string

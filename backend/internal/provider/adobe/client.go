@@ -35,6 +35,7 @@ const (
 
 var (
 	ErrAuth              = errors.New("adobe auth failed")
+	ErrEntitlement       = errors.New("adobe model entitlement missing")
 	ErrQuotaExhausted    = errors.New("adobe quota exhausted")
 	ErrTemporaryUpstream = errors.New("adobe upstream temporary error")
 	ErrDeadUpstream      = errors.New("adobe upstream fatal error")
@@ -44,6 +45,14 @@ var (
 	// surface it as-is without penalizing/killing the account or failing over.
 	ErrContentRejected = errors.New("内容安全审核未通过，请修改提示词或参考素材后重试")
 )
+
+func accessError(status int, accessHeader string, body []byte) error {
+	detail := strings.ToLower(strings.TrimSpace(accessHeader + " " + string(body)))
+	if status == 403 && (strings.Contains(detail, "user_not_entitled") || strings.Contains(detail, "not entitled")) {
+		return fmt.Errorf("%w (%d %s: %s)", ErrEntitlement, status, accessHeader, clip(body, 300))
+	}
+	return fmt.Errorf("%w (%d %s: %s)", ErrAuth, status, accessHeader, clip(body, 300))
+}
 
 // ContentRejectionError preserves Adobe's moderation code so callers can
 // distinguish a blocked prompt/reference from a randomly unsafe generated
@@ -272,7 +281,7 @@ func (c *Client) uploadMediaOnce(ctx context.Context, token string, content []by
 		return nil, err, true
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("%w (upload %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300)), false
+		return nil, accessError(resp.StatusCode, resp.Header.Get("x-access-error"), body), false
 	}
 	if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		return nil, fmt.Errorf("adobe upload failed: %d %s", resp.StatusCode, clip(body, 300)), true
@@ -630,7 +639,7 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		if strings.EqualFold(resp.Header.Get("x-access-error"), "taste_exhausted") {
 			return respBody, "", ErrQuotaExhausted
 		}
-		return respBody, "", fmt.Errorf("%w (submit %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
+		return respBody, "", accessError(resp.StatusCode, resp.Header.Get("x-access-error"), respBody)
 	}
 	// Adobe may report overload in a nominal response. It remains a regular
 	// temporary upstream error: there is no client-side breaker or submit pacing.
@@ -704,6 +713,9 @@ func (c *Client) pollImage(ctx context.Context, sess, downloadSess *tlsSession, 
 		}
 		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 			return nil, nil, ErrTemporaryUpstream
+		}
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return nil, nil, accessError(resp.StatusCode, resp.Header.Get("x-access-error"), body)
 		}
 		if rejectErr := contentRejectionError(resp.StatusCode, string(body)); rejectErr != nil {
 			return nil, nil, rejectErr
@@ -814,7 +826,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		}
 		// Surface Adobe's response body — "adobe auth failed" alone hides whether
 		// it's a bad token, a missing scope, or a WAF/fingerprint block.
-		return respBody, "", fmt.Errorf("%w (%d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
+		return respBody, "", accessError(resp.StatusCode, resp.Header.Get("x-access-error"), respBody)
 	}
 	if rejectErr := contentRejectionError(resp.StatusCode, string(respBody)); rejectErr != nil {
 		return respBody, "", rejectErr
@@ -891,7 +903,7 @@ func (c *Client) pollVideo(ctx context.Context, sess, downloadSess *tlsSession, 
 			return nil, nil, readErr
 		}
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			return nil, nil, fmt.Errorf("%w (%d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300))
+			return nil, nil, accessError(resp.StatusCode, resp.Header.Get("x-access-error"), body)
 		}
 		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 			return nil, nil, ErrTemporaryUpstream

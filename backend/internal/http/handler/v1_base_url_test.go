@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func TestRequestBaseURLPreservesForwardedHTTPSPort(t *testing.T) {
+func TestRequestBaseURLIgnoresUntrustedForwardedHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest("GET", "http://internal/v1/images/generations", nil)
@@ -15,12 +15,12 @@ func TestRequestBaseURLPreservesForwardedHTTPSPort(t *testing.T) {
 	c.Request.Header.Set("X-Forwarded-Proto", "https")
 	c.Request.Header.Set("X-Forwarded-Port", "9445")
 
-	if got := requestBaseURL(c); got != "https://media.example.test:9445" {
+	if got := requestBaseURL(c); got != "http://media.example.test" {
 		t.Fatalf("requestBaseURL() = %q", got)
 	}
 }
 
-func TestRequestBaseURLDoesNotDuplicatePort(t *testing.T) {
+func TestRequestBaseURLUsesValidatedDirectHost(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest("GET", "http://internal/v1/images/generations", nil)
@@ -28,8 +28,20 @@ func TestRequestBaseURLDoesNotDuplicatePort(t *testing.T) {
 	c.Request.Header.Set("X-Forwarded-Proto", "https")
 	c.Request.Header.Set("X-Forwarded-Port", "9445")
 
-	if got := requestBaseURL(c); got != "https://example.test:8443" {
+	if got := requestBaseURL(c); got != "http://example.test:8443" {
 		t.Fatalf("requestBaseURL() = %q", got)
+	}
+}
+
+func TestRequestBaseURLRejectsMalformedHostAndPort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, host := range []string{"example.test@evil.test", "example.test/path", "example.test:99999"} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("GET", "http://internal/v1/models", nil)
+		c.Request.Host = host
+		if got := requestBaseURL(c); got != "" {
+			t.Fatalf("requestBaseURL() for %q = %q, want empty", host, got)
+		}
 	}
 }
 

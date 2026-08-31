@@ -2,10 +2,15 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+var ErrConcurrencyBackendUnavailable = errors.New("concurrency backend unavailable")
 
 // ConcurrencyService is a Redis-backed, self-healing concurrency limiter shared
 // by the per-user gate (画图台 + API key) and the per-account upstream gate.
@@ -42,16 +47,21 @@ return 1
 `)
 
 // Acquire takes one slot under `key` (capped at max; 0 = unlimited), tagged with
-// `token`. Returns true if admitted. Fail-open when Redis is down/unset.
-func (c *ConcurrencyService) Acquire(ctx context.Context, key string, max int, token string) bool {
+// `token`. An unlimited gate does not need Redis. A bounded generation gate is
+// fail-closed when Redis is unavailable: silently bypassing it can submit the
+// same upstream account concurrently and multiply provider spend.
+func (c *ConcurrencyService) Acquire(ctx context.Context, key string, max int, token string) (bool, error) {
+	if max <= 0 {
+		return true, nil
+	}
 	if c == nil || c.redis == nil {
-		return true
+		return false, ErrConcurrencyBackendUnavailable
 	}
 	res, err := acquireScript.Run(ctx, c.redis, []string{key}, max, c.ttl, token).Int()
 	if err != nil {
-		return true // fail open — never block a generation on Redis trouble
+		return false, fmt.Errorf("%w: %v", ErrConcurrencyBackendUnavailable, err)
 	}
-	return res == 1
+	return res == 1, nil
 }
 
 // Release frees the slot held by `token` under `key`. Safe to call even if the
@@ -61,6 +71,55 @@ func (c *ConcurrencyService) Release(ctx context.Context, key, token string) {
 		return
 	}
 	_ = c.redis.ZRem(ctx, key, token).Err()
+}
+
+// ActiveCount reports live slots after pruning crash-expired members. It is
+// observational only; Redis failure returns zero and never affects dispatch.
+func (c *ConcurrencyService) ActiveCount(ctx context.Context, key string) int64 {
+	counts, ok := c.ActiveCounts(ctx, []string{key})
+	if !ok {
+		return 0
+	}
+	return counts[key]
+}
+
+// ActiveCounts observes several gates in one Redis pipeline. ok=false means
+// the observation is unavailable; callers must treat that as unknown and rely
+// on Acquire's atomic decision rather than incorrectly declaring accounts full.
+func (c *ConcurrencyService) ActiveCounts(ctx context.Context, keys []string) (map[string]int64, bool) {
+	if c == nil || c.redis == nil {
+		return nil, false
+	}
+	unique := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, key)
+	}
+	if len(unique) == 0 {
+		return map[string]int64{}, true
+	}
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+	pipe := c.redis.TxPipeline()
+	commands := make(map[string]*redis.IntCmd, len(unique))
+	for _, key := range unique {
+		pipe.ZRemRangeByScore(ctx, key, "-inf", now)
+		commands[key] = pipe.ZCard(ctx, key)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, false
+	}
+	counts := make(map[string]int64, len(commands))
+	for key, command := range commands {
+		counts[key] = command.Val()
+	}
+	return counts, true
 }
 
 // NextCursor returns the next value of a shared round-robin counter (starting at

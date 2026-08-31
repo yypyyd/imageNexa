@@ -1,77 +1,45 @@
-# Vivid AI Backend
+# 2API Backend
 
-Go backend for `vivid-ai`, using:
+Go data plane and singleton-administrator control plane for 2API. The public API exposes only the canonical text, image, image-edit, and video endpoints documented in the repository [README](../README.md). Provider names, upstream model IDs, account credentials, and account selection stay internal.
 
-- Gin
-- GORM
-- PostgreSQL
-- Redis
+## Security contract
 
-## Current scope
+- Every `/v1` request requires `Authorization: Bearer sk-*`; alternate headers, cookies, and query credentials are rejected.
+- Image and video task/content reads are scoped to the API credential that created the event.
+- The control plane has exactly one administrator and uses an HttpOnly, SameSite=Strict session cookie plus CSRF protection.
+- First initialization also requires `X-Admin-Bootstrap-Token`, matching the deployment-only `ADMIN_BOOTSTRAP_TOKEN`.
+- PostgreSQL stores downstream API-key hashes and durable routing/quota state. Redis stores short-lived concurrency/session state. RustFS stores private generated artifacts.
+- The production backend container runs as an unprivileged user. Docker's default seccomp profile prevents Chromium user namespaces, so the Oreate signer uses `--no-sandbox`; its empty environment, ephemeral profile, parent-death/process-group teardown, and restricted provider-only use are mandatory compensating controls.
 
-This is an in-progress rewrite. The current skeleton already includes:
+## Local dependencies
 
-- app bootstrap
-- PostgreSQL and Redis initialization
-- GORM auto-migrations
-- session storage in Redis
-- opaque, cross-origin API media via `/v1/images/:event/content`
-- legacy gallery media and existing-link compatibility via `/images/:user/:name`
-- public site endpoint: `/admin/api/site`
-- public showcase endpoint: `/admin/api/showcase`
-- session-based auth endpoint: `/admin/api/auth/me`
-- typed image/video/audio reference uploads for Adobe video generation, with
-  model capability checks and bounded multipart requests
-- OreateAI Seedance text/image/reference-video generation through an isolated
-  Chromium Banti signer, including Seedance 2.5 and discoverable model limits,
-  with Cookie-only account imports and no persisted account passwords
-
-## Environment
-
-Set these before running:
+The supported full-stack deployment is `docker compose` from the repository root. To run only the backend during development, start PostgreSQL, Redis, and RustFS, then copy and edit the local template:
 
 ```powershell
-$env:POSTGRES_DSN="host=127.0.0.1 user=postgres password=postgres dbname=vivid_ai port=5432 sslmode=disable TimeZone=Asia/Shanghai"
-$env:REDIS_ADDR="127.0.0.1:6379"
-$env:HTTP_ADDR=":6061"
-$env:PUBLIC_BASE_URL="https://api.example.com"
-```
-
-Optional:
-
-```powershell
-$env:APP_ENV="development"
-$env:APP_TITLE="Vivid AI"
-$env:SESSION_COOKIE_NAME="vivid_session"
-$env:CORS_ORIGINS="http://localhost:5173,http://127.0.0.1:5173"
-```
-
-## Run
-
-```powershell
+Copy-Item .env.example .env
 go run ./cmd/api
 ```
 
-## Notes
+Important variables are:
 
-- Generated media defaults to `../../ai-gateway/data/generated` relative to the backend working directory.
-- Image API results use public, CORS-enabled opaque event URLs so downstream
-  clients can fetch them without a browser session and without seeing internal
-  owner/object keys. RustFS remains private behind the gateway; API CORS accepts
-  arbitrary origins without credentials, while user, billing, account, and
-  admin API routes retain authentication. Apply edge rate and connection limits
-  to `/images/` and `/v1/images/*/content` in public deployments.
-- Set `PUBLIC_BASE_URL` to the canonical HTTPS API origin so responses never
-  inherit an internal, legacy, or attacker-supplied request host.
-- Image generation/edit requests remain synchronous by default for OpenAI client
-  compatibility. Send `Prefer: respond-async` (or `?async=true`) to receive an
-  immediate `202` task object with `poll_url`; poll it until `completed` or
-  `failed`. Async requests always use an idempotency key, generated from the
-  request ID when the caller does not provide one.
-- Synchronous image requests that run longer than 10 seconds flush JSON-valid
-  leading whitespace every 10 seconds. The web proxy disables buffering for
-  `/v1/`, so CDN and downstream idle timers see progress while the final OpenAI
-  JSON response remains parseable without a client-specific streaming mode.
-- Default Adobe image routing uses ordinary accounts only. Points accounts are
-  reserved unless an administrator explicitly pins one for an account test;
-  Adobe video entitlement routing is unaffected.
+- `POSTGRES_DSN`, `REDIS_ADDR`
+- `RUSTFS_ENDPOINT`, `RUSTFS_BUCKET`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`
+- `ADMIN_BOOTSTRAP_TOKEN`
+- `PUBLIC_BASE_URL`, `CORS_ORIGINS`, `COOKIE_SECURE`
+- `TRUSTED_PROXY_CIDRS` for reverse proxies that append `X-Forwarded-For`
+
+Never commit the real `.env` or any provider credential. The backend imports BytePlus only from a complete Lumina Cookie header (or a browser export containing `cookie_string`, `cookie_header`, or `cookies[]`).
+
+## Database lifecycle
+
+Forward-only, checksummed migrations create administrator/API-credential identity, the 24-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Startup refuses unknown or modified applied migrations. `AutoMigrate` is limited to compatible columns on retained operational tables and does not seed retired models.
+
+## Verification
+
+```powershell
+go test ./...
+go vet ./...
+go build ./cmd/api
+```
+
+Operational probes are `GET /health/live` and `GET /health/ready`. Readiness requires PostgreSQL, Redis, the latest migration, and access to the configured private RustFS bucket.

@@ -52,11 +52,11 @@ func TestStatsigDiscoveryDiagnostics(t *testing.T) {
 	}
 
 	type hit struct {
-		path      string
-		depth     int
-		flags     []string
-		engine    string
-		verified  bool
+		path     string
+		depth    int
+		flags    []string
+		engine   string
+		verified bool
 	}
 	var hits []hit
 	const maxInspect = 200

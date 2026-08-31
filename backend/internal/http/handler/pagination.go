@@ -1,6 +1,19 @@
 package handler
 
-import "github.com/gin-gonic/gin"
+import (
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+func parseInt(raw string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return fallback
+	}
+	return value
+}
 
 // pageParams reads limit/offset query params with the given default page size.
 // A limit of 0 (or negative) is treated as "return everything" so callers that

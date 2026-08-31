@@ -45,6 +45,10 @@ func applyReferenceFaceSwap(inputs []string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		config, _, configErr := image.DecodeConfig(bytes.NewReader(data))
+		if configErr != nil || config.Width <= 0 || config.Height <= 0 || int64(config.Width)*int64(config.Height) > maxReferencePixels {
+			return nil, fmt.Errorf("%w: reference image dimensions are too large or invalid", ErrReferenceTooLarge)
+		}
 		src, _, err := image.Decode(bytes.NewReader(data))
 		if err != nil {
 			return nil, fmt.Errorf("%w: reference image is not decodable", ErrUnsupportedParams)

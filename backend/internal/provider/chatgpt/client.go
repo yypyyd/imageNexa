@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"backend/internal/netguard"
+
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -476,29 +478,58 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 // content stream) using the generating account's token — a plain GET 403s.
 // Mirrors downloadBytes but returns a live stream instead of buffering.
 func (c *Client) OpenAsset(ctx context.Context, accessToken, rawURL string) (io.ReadCloser, string, error) {
-	session, err := c.newProxySession(accessToken)
+	const maxAssetRedirects = 5
+	allowedHosts := []string{"chatgpt.com", "openai.com", "oaiusercontent.com"}
+	current, err := netguard.ValidateAssetURL(ctx, rawURL, allowedHosts)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: rejected asset URL", ErrTemporaryUpstream)
+	}
+	originalHost := strings.ToLower(current.Hostname())
+	session, err := c.newAssetSession()
 	if err != nil {
 		return nil, "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, "", err
+	for redirects := 0; redirects <= maxAssetRedirects; redirects++ {
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
+		if requestErr != nil {
+			return nil, "", requestErr
+		}
+		// Credentials are attached only to the originally validated host. A
+		// cross-host redirect gets a credential-free request even when the CDN is
+		// itself on the provider allowlist.
+		if strings.EqualFold(current.Hostname(), originalHost) {
+			req.Header = c.baseHeaders(accessToken)
+		} else {
+			req.Header = http.Header{"user-agent": {defaultUserAgent}}
+		}
+		req.Header.Set("accept", "image/*,application/octet-stream;q=0.8")
+		resp, doErr := session.Do(req)
+		if doErr != nil {
+			return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, doErr)
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location := resp.Header.Get("Location")
+			resp.Body.Close()
+			if redirects == maxAssetRedirects || location == "" {
+				return nil, "", fmt.Errorf("%w: invalid asset redirect", ErrTemporaryUpstream)
+			}
+			current, err = netguard.ResolveRedirect(ctx, current, location, allowedHosts)
+			if err != nil {
+				return nil, "", fmt.Errorf("%w: rejected asset redirect", ErrTemporaryUpstream)
+			}
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			return nil, "", fmt.Errorf("%w: chatgpt asset status %d", ErrTemporaryUpstream, resp.StatusCode)
+		}
+		body, contentType, guardErr := netguard.GuardStream(resp.Body, resp.Header.Get("Content-Type"), resp.ContentLength, netguard.MediaImage, netguard.MaxImageBytes)
+		if guardErr != nil {
+			return nil, "", fmt.Errorf("%w: invalid chatgpt image asset", ErrTemporaryUpstream)
+		}
+		return body, contentType, nil
 	}
-	req.Header = c.baseHeaders(accessToken)
-	req.Header.Set("accept", "*/*")
-	resp, err := session.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
-	}
-	if resp.StatusCode != 200 {
-		resp.Body.Close()
-		return nil, "", fmt.Errorf("%w: chatgpt asset status %d", ErrTemporaryUpstream, resp.StatusCode)
-	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		ct = "image/png"
-	}
-	return resp.Body, ct, nil
+	return nil, "", fmt.Errorf("%w: asset redirect limit", ErrTemporaryUpstream)
 }
 
 func ExtractAccountInfo(token string) map[string]any {
@@ -596,6 +627,19 @@ func (c *Client) newSubmitSession(accessToken string) (tlsclient.HttpClient, err
 
 func (c *Client) newProxySession(accessToken string) (tlsclient.HttpClient, error) {
 	return c.newSessionP(accessToken, true)
+}
+
+func (c *Client) newAssetSession() (tlsclient.HttpClient, error) {
+	options := []tlsclient.HttpClientOption{
+		tlsclient.WithTimeoutSeconds(600),
+		tlsclient.WithClientProfile(profiles.Chrome_110),
+		tlsclient.WithRandomTLSExtensionOrder(),
+		tlsclient.WithNotFollowRedirects(),
+	}
+	if proxy := c.proxyValue(); proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
+	}
+	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }
 
 // newDirectSession is used by the raw blob upload host only.

@@ -64,6 +64,24 @@ func (c *Client) Configured() bool {
 	return c != nil && c.endpoint != "" && c.bucket != "" && c.ak != "" && c.sk != ""
 }
 
+// Check verifies both the configured credentials and access to the target
+// bucket without reading or mutating any object. It is used by readiness, so a
+// pod never advertises itself while generated media would be lost.
+func (c *Client) Check(ctx context.Context) error {
+	if !c.Configured() {
+		return fmt.Errorf("rustfs is not configured")
+	}
+	resp, err := c.do(ctx, http.MethodHead, c.bucket, nil, nil, "", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return c.statusErr("check", c.bucket, resp)
+	}
+	return nil
+}
+
 // Put uploads body under key with the given content type.
 func (c *Client) Put(ctx context.Context, key string, body []byte, contentType string) error {
 	resp, err := c.do(ctx, http.MethodPut, c.bucket+"/"+key, nil, body, contentType, nil)

@@ -239,10 +239,11 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 	if err != nil {
 		return nil, err
 	}
-	// Per ops decision a rate-limit (403) is treated as a dead account too, same as
-	// a 401 — a throttled Runway token is considered done.
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+	if resp.StatusCode == 401 || resp.StatusCode == 403 && runwayDefinitiveAuth(body) {
 		return nil, ErrAuth
+	}
+	if resp.StatusCode == 403 {
+		return unknownBalance("http 403"), nil
 	}
 	if resp.StatusCode != 200 {
 		return unknownBalance(fmt.Sprintf("http %d: %s", resp.StatusCode, clip(body, 160))), nil
@@ -268,6 +269,19 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		"unknown":   false,
 		"error":     nil,
 	}, nil
+}
+
+func runwayDefinitiveAuth(body []byte) bool {
+	text := strings.ToLower(string(body))
+	for _, marker := range []string{
+		"invalid_access_token", "invalid access token", "invalid_token",
+		"token expired", "expired token", "jwt expired", "session expired",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func unknownBalance(reason string) map[string]any {

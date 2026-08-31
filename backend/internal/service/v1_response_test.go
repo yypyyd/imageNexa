@@ -1,13 +1,16 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"backend/internal/config"
 	"backend/internal/model"
+	"backend/internal/provider/byteplus"
 	"gorm.io/datatypes"
 )
 
@@ -43,6 +46,61 @@ func TestNormalizeImageResponseFormat(t *testing.T) {
 	}
 }
 
+func TestStoredImageResponseFormatPreservesRecoveryContract(t *testing.T) {
+	if got := storedImageResponseFormat("b64_json"); got != "b64_json" {
+		t.Fatalf("stored b64_json = %q", got)
+	}
+	for _, value := range []string{"", "url", "invalid-legacy-value"} {
+		if got := storedImageResponseFormat(value); got != "url" {
+			t.Fatalf("storedImageResponseFormat(%q) = %q, want url", value, got)
+		}
+	}
+}
+
+func TestRecoveredImageArtifactUsesActualAVIFTypeAndExtension(t *testing.T) {
+	avif := append([]byte{0, 0, 0, 24}, []byte("ftypavif")...)
+	avif = append(avif, make([]byte, 32)...)
+	key, contentType, err := recoveredImageArtifact("api-owner/result.png", "evt-1", avif)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "api-owner/result.avif" || contentType != "image/avif" {
+		t.Fatalf("recovered artifact = key %q, type %q", key, contentType)
+	}
+}
+
+func TestCanonicalImageInputDefaultsNToOne(t *testing.T) {
+	canonical, _, err := canonicalImageIdempotencyInput(V1ImageRequest{Model: "gpt-image-2", Prompt: "fox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.N != 1 {
+		t.Fatalf("canonical n = %d, want 1", canonical.N)
+	}
+}
+
+func TestPrepareMediaRejectsMissingAndIgnoredParametersAsBadRequest(t *testing.T) {
+	svc := &V1Service{}
+	imageCases := []V1ImageRequest{
+		{Prompt: "fox"},
+		{Model: "gpt-image-2"},
+		{Model: "gpt-image-2", Prompt: "fox", N: 2},
+		{Model: "gpt-image-2", Prompt: "fox", Background: "transparent"},
+		{Model: "gpt-image-2", Prompt: "fox", OutputFormat: "webp"},
+	}
+	for _, request := range imageCases {
+		if _, _, _, _, err := svc.prepareImage(context.Background(), nil, request, false); !errors.Is(err, ErrUnsupportedParams) {
+			t.Fatalf("prepareImage(%#v) error = %v, want ErrUnsupportedParams", request, err)
+		}
+	}
+	videoCases := []V1VideoRequest{{Prompt: "fox", Duration: "6s"}, {Model: "sora-2", Duration: "6s"}, {Model: "sora-2", Prompt: "fox"}}
+	for _, request := range videoCases {
+		if _, _, _, _, _, err := svc.prepareVideo(context.Background(), nil, request, false); !errors.Is(err, ErrUnsupportedParams) {
+			t.Fatalf("prepareVideo(%#v) error = %v, want ErrUnsupportedParams", request, err)
+		}
+	}
+}
+
 func TestPublicImageContentURL(t *testing.T) {
 	if got := publicImageContentURL("https://HOST:9445/", "evt-OPAQUE"); got != "https://HOST:9445/v1/images/evt-OPAQUE/content" {
 		t.Fatalf("publicImageContentURL() = %q", got)
@@ -67,7 +125,7 @@ func TestImageTaskURLUsesPublicOriginAndEscapesRequestID(t *testing.T) {
 }
 
 func TestAsyncImageJobResponseLifecycle(t *testing.T) {
-	job := newAsyncImageJob()
+	job := newAsyncImageJob("fingerprint")
 	response, pending := asyncImageJobResponse(job, "req-1", "/poll")
 	if !pending || response["status"] != "queued" {
 		t.Fatalf("pending response = %#v, pending=%v", response, pending)
@@ -81,11 +139,38 @@ func TestAsyncImageJobResponseLifecycle(t *testing.T) {
 }
 
 func TestAsyncImageJobResponseFailure(t *testing.T) {
-	job := newAsyncImageJob()
-	job.complete(nil, errors.New("render failed"))
+	job := newAsyncImageJob("fingerprint")
+	job.complete(nil, errors.New("render failed Authorization: Bearer sk-secret Cookie=sessionid-secret"))
 	response, pending := asyncImageJobResponse(job, "req-2", "/poll")
-	if pending || response["status"] != "failed" || response["error"] != "render failed" {
+	if pending || response["status"] != "failed" || response["error"] != ErrProviderExecution.Error() {
 		t.Fatalf("failed response = %#v, pending=%v", response, pending)
+	}
+}
+
+func TestAsyncImageJobResponseKeepsAcceptedTaskPending(t *testing.T) {
+	job := newAsyncImageJob("fingerprint")
+	job.complete(nil, errors.Join(ErrProviderTemporary, byteplus.ErrTaskAccepted))
+	response, pending := asyncImageJobResponse(job, "req-accepted", "/poll")
+	if !pending || response["status"] != "queued" {
+		t.Fatalf("accepted response = %#v, pending=%v", response, pending)
+	}
+}
+
+func TestWaitForImageResultReturnsDurablePendingImmediately(t *testing.T) {
+	svc := &V1Service{}
+	pending := map[string]any{
+		"id": "req-accepted", "request_id": "req-accepted", "status": "in_progress", "poll_url": "/v1/images/tasks?request_id=req-accepted",
+	}
+	started := time.Now()
+	response, err := svc.waitForImageResult(context.Background(), nil, "req-accepted", "fingerprint", pending)
+	if !errors.Is(err, ErrGenerationAccepted) {
+		t.Fatalf("waitForImageResult() error = %v, want ErrGenerationAccepted", err)
+	}
+	if response["request_id"] != "req-accepted" || response["status"] != "in_progress" || response["poll_url"] == "" {
+		t.Fatalf("pending response = %#v", response)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("durable pending response waited %s", elapsed)
 	}
 }
 

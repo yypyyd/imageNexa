@@ -1,805 +1,233 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
-import { api, jsonBody } from '../api'
-import { fmtTs, fmtIso, fmtDate, fmtClock } from '../utils/format'
-import ImportModal from '../components/ImportModal.vue'
-import UpstreamModal from '../components/UpstreamModal.vue'
-import AccountEditModal from '../components/AccountEditModal.vue'
-import AccountTestModal from '../components/AccountTestModal.vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import Icon from '../components/Icon.vue'
+import SelectMenu from '../components/SelectMenu.vue'
+import { api, jsonBody, listOf } from '../api'
+import { parseCredentialInput } from '../credential'
 
-const rows = ref([])
-const loading = ref(false)
-const quotaStatus = ref('')
-const refreshingQuota = ref(new Set())
-const showImport = ref(false)
-const showUpstream = ref(false)
-const editingUpstream = ref(null)
-function editUpstream(a) { editingUpstream.value = a; showUpstream.value = true }
-const editingAccount = ref(null)
-function editAccount(a) { editingAccount.value = a }
-const testingAccount = ref(null)
-function testAccount(a) { testingAccount.value = a }
-// 预加载模型列表，让「生图测试」弹窗即开即用(不显示加载中)。
-const allModels = ref([])
-async function loadModelList() {
-  const r = await api('/managed-models')
-  allModels.value = r.data?.data || []
-}
-// Reflect the saved values in the table without a full reload.
-function applyEdit(payload) {
-  const row = editingAccount.value
-  if (!row) return
-  if (payload.weight != null) row.weight = payload.weight
-  if (payload.concurrency != null) row.concurrency = payload.concurrency
-}
+const ALLOWED_PROVIDERS = ['chatgpt', 'byteplus', 'adobe', 'runway', 'grok', 'oreate', 'custom']
+const PROVIDER_OPTIONS = ALLOWED_PROVIDERS.map((value) => ({ value, label: value === 'chatgpt' ? 'ChatGPT' : value === 'oreate' ? 'OreateAI' : value[0].toUpperCase() + value.slice(1) }))
 
-const typeFilter = ref('')      // '' | provider account type
-const statusFilter = ref('')    // '' | 'active' | 'quota' | 'disabled'
-const search = ref('')
+const accounts = ref([])
+const loading = ref(true)
+const error = ref('')
+const query = ref('')
+const provider = ref('')
+const status = ref('')
+const expanded = ref(new Set())
+const busy = ref('')
+const importing = ref(false)
+const importForm = reactive({ provider: 'byteplus', label: '', credential: '' })
 
-const page = ref(1)
-const pageSize = ref(20)
-const total = ref(0)
-// Typing a search term must jump back to page 1 and re-query the server —
-// search is cross-page now (server-side).
-let searchTimer = null
-watch(search, () => {
-  clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => { resetAndLoad() }, 300)
-})
-
-const EMPTY_TYPE = { n: 0, ok: 0, dead: 0, quota: 0 }
-// 每个类型的 成功/失败/限额 三个数 — 由后端对全量账号统计(与筛选/分页无关)。
-const stats = ref({
-  total: 0, dead_total: 0,
-  openai: { ...EMPTY_TYPE }, adobe: { ...EMPTY_TYPE }, runway: { ...EMPTY_TYPE },
-  leonardo: { ...EMPTY_TYPE }, krea: { ...EMPTY_TYPE }, imagine: { ...EMPTY_TYPE },
-  grok: { ...EMPTY_TYPE }, oreate: { ...EMPTY_TYPE }, byteplus: { ...EMPTY_TYPE },
-})
-
-// 异常账号 = 已失效(401)被锁定的号(红色锁定行)。用于「一键删除异常账号」。
-const deadCount = computed(() => stats.value.dead_total || 0)
-
-function typePill(t) {
-  return {
-    adobe: 'bg-rose-500/10 text-rose-300 ring-rose-400/30',
-    byteplus: 'bg-indigo-500/10 text-indigo-300 ring-indigo-400/30',
-    openai: 'bg-emerald-500/10 text-emerald-300 ring-emerald-400/30',
-    runway: 'bg-violet-500/10 text-violet-300 ring-violet-400/30',
-    leonardo: 'bg-amber-500/10 text-amber-300 ring-amber-400/30',
-    krea: 'bg-sky-500/10 text-sky-300 ring-sky-400/30',
-    imagine: 'bg-teal-500/10 text-teal-300 ring-teal-400/30',
-    oreate: 'bg-cyan-500/10 text-cyan-300 ring-cyan-400/30',
-  }[t] || 'bg-white/[0.06] text-white/70 ring-white/15'
-}
-
-const CAPABILITY_LABEL = { chat: '对话', image: '图片', video: '视频' }
-function grokCapabilities(a) {
-  // Older rows do not have the new server field yet; Grok's routing policy is
-  // still deterministic from the account flags, so render a safe compatibility
-  // view until the next account refresh fills it in.
-  if (Array.isArray(a.capabilities) && a.capabilities.length) return a.capabilities
-  if (a.type !== 'grok') return []
-  // Grok's quota marker is media-only; chat remains routable while a media
-  // credit pool is paused.
-  const identityOK = a.status !== 'pending' && a.status !== 'disabled' && !a.dead
-  const mediaOK = identityOK && a.status === 'active'
-  return [
-    { kind: 'chat', available: identityOK, limited: false },
-    { kind: 'image', available: mediaOK && !a.image_limited, limited: !!a.image_limited },
-    { kind: 'video', available: mediaOK && !a.video_limited, limited: !!a.video_limited },
-  ]
-}
-
-// 导入时那次「生图」（领 50 赠分用）的结果，只有 oreate 号有。
-const FIRST_IMAGE_STATES = {
-  ok: { label: '生图✓', cls: 'bg-emerald-500/10 text-emerald-300 ring-emerald-400/20', hint: '导入时生图成功，已领首次赠分' },
-  partial: { label: '生图≈', cls: 'bg-sky-500/10 text-sky-300 ring-sky-400/20', hint: '图已生成但流中断，赠分通常已到账' },
-  spam: { label: '生图spam', cls: 'bg-rose-500/10 text-rose-300 ring-rose-400/20', hint: '上游判定 spam user，生图被拒（未扣分）' },
-  failed: { label: '生图✗', cls: 'bg-amber-500/10 text-amber-300 ring-amber-400/20', hint: '导入时生图失败' },
-  running: { label: '生图中', cls: 'bg-white/[0.06] text-white/60 ring-white/15', hint: '导入时生图进行中' },
-  unknown: { label: '生图?', cls: 'bg-white/[0.06] text-white/45 ring-white/15', hint: '该号导入时未记录生图结果' },
-}
-function firstImageBadge(a) {
-  if (a.type !== 'oreate') return null
-  const state = FIRST_IMAGE_STATES[a.first_image]
-  if (!state) return null
-  const parts = [state.hint]
-  if (a.first_image_error) parts.push(a.first_image_error)
-  if (a.first_image_at) parts.push(fmtTs(a.first_image_at))
-  return { ...state, title: parts.join(' · ') }
-}
-
-function accountConcurrency(a) {
-  if (Number(a.concurrency) > 0) return Number(a.concurrency)
-  if (a.type === 'grok') return 10
-  if (a.type === 'adobe' && Number(a.quota_total || 0) >= 10000) return 5
-  return 1
-}
-const STATUS_LABEL = { active: '正常', quota: '额度耗尽', disabled: '已禁用', pending: '检测中' }
-
-// Server-side pagination: rows IS the current page, already filtered/sorted
-// by the backend. total = server-side filtered count.
-const filtered = computed(() => rows.value)
-const pagedItems = computed(() => rows.value)
-
-const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
-function goPage(n) {
-  const target = Math.max(1, Math.min(totalPages.value, n))
-  if (target !== page.value) page.value = target
-}
-function setFilter(fn) { fn(); resetAndLoad() }
-function resetAndLoad() {
-  if (page.value !== 1) page.value = 1  // the page watcher triggers the load
-  else loadAccounts()
-}
-const pageNumbers = computed(() => {
-  const n = totalPages.value
-  const cur = page.value
-  if (n <= 7) return Array.from({ length: n }, (_, i) => i + 1)
-  const want = new Set([1, n, cur - 1, cur, cur + 1])
-  if (cur <= 3) { want.add(2); want.add(3); want.add(4) }
-  if (cur >= n - 2) { want.add(n - 1); want.add(n - 2); want.add(n - 3) }
-  const list = [...want].filter((x) => x >= 1 && x <= n).sort((a, b) => a - b)
-  const out = []
-  for (let i = 0; i < list.length; i++) {
-    if (i > 0 && list[i] - list[i - 1] > 1) out.push(null)
-    out.push(list[i])
-  }
-  return out
-})
-
-let pendingTimer = null
-
-function buildQs() {
-  const qs = new URLSearchParams({
-    limit: String(pageSize.value),
-    offset: String((page.value - 1) * pageSize.value),
+const filtered = computed(() => {
+  const q = query.value.trim().toLowerCase()
+  return accounts.value.filter((a) => {
+    if (!ALLOWED_PROVIDERS.includes(String(a.provider || '').toLowerCase())) return false
+    if (provider.value && a.provider !== provider.value) return false
+    if (status.value && a.status !== status.value) return false
+    if (q && !`${a.label || ''} ${a.email || ''} ${a.id || ''} ${a.provider || ''}`.toLowerCase().includes(q)) return false
+    return true
   })
-  if (typeFilter.value) qs.set('type', typeFilter.value)
-  if (statusFilter.value) qs.set('status', statusFilter.value)
-  if (search.value.trim()) qs.set('q', search.value.trim())
-  return qs.toString()
+})
+
+const stats = computed(() => ({
+  total: accounts.value.filter((a) => ALLOWED_PROVIDERS.includes(a.provider)).length,
+  active: accounts.value.filter((a) => ALLOWED_PROVIDERS.includes(a.provider) && ['active', 'enabled', 'healthy'].includes(a.status)).length,
+  cooldown: accounts.value.filter((a) => a.status === 'cooldown').length,
+  disabled: accounts.value.filter((a) => ['disabled', 'auth_error'].includes(a.status)).length,
+}))
+
+function listURL() {
+  const params = new URLSearchParams({ limit: '500' })
+  if (provider.value) params.set('provider', provider.value)
+  if (status.value) params.set('status', status.value)
+  if (query.value.trim()) params.set('q', query.value.trim())
+  return `/accounts?${params}`
 }
 
-async function fetchAccounts() {
-  const r = await api('/accounts?' + buildQs())
-  rows.value = r.data?.data || []
-  total.value = Number(r.data?.total ?? rows.value.length)
-  if (r.data?.stats) stats.value = r.data.stats
-}
-
-async function loadAccounts() {
+async function load() {
   loading.value = true
-  quotaStatus.value = ''
-  await fetchAccounts()
+  const response = await api(listURL())
+  if (response.ok) {
+    accounts.value = listOf(response.data)
+    error.value = ''
+  } else error.value = response.error
   loading.value = false
-  if (rows.value.length) reconcile()
-  schedulePendingPoll()
 }
 
-// While any imported account is still being checked server-side, re-fetch the
-// list so it flips pending → active/dead on its own (no manual refresh).
-function schedulePendingPoll() {
-  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null }
-  if (!rows.value.some((r) => r.pending)) return
-  pendingTimer = setTimeout(async () => {
-    await fetchAccounts()
-    schedulePendingPoll()
-  }, 2000)
+function toggleOpen(id) {
+  const next = new Set(expanded.value)
+  next.has(id) ? next.delete(id) : next.add(id)
+  expanded.value = next
 }
 
-// Background reconciliation: openai → live quota; adobe → reset_after;
-// adobe without email → fetch email. Active accounts are refreshed as before;
-// Oreate quota rows are also refreshed so a next-day grant can reactivate them.
-// Pending rows are handled by the import worker, while dead/disabled rows are
-// left alone unless an administrator explicitly uses the row refresh action.
-//
-// Scope: ONLY the accounts visible on the current page. Probing all 100+ rows on
-// every open floods the backend; the user only ever sees ~20 at a time, so we
-// re-check just those and re-run when the page (or filters) change. New imports
-// are hydrated server-side by the import worker and surfaced via the pending
-// poll reading the store — they don't need a frontend probe.
-let reconcileToken = 0
-async function reconcile() {
-  const myToken = ++reconcileToken   // supersede any in-flight run (fast page flips)
-  const visible = pagedItems.value
-  // NEW accounts (still pending the import worker's server-side check) are never
-  // probed here — the pending poll just reads the store until the worker writes
-  // their quota/email. OLD accounts (active) get a real live /quota probe for
-  // up-to-date remaining + refresh time.
-  const quotaRows = visible.filter((r) => !r.pending && (r.status === 'active' || (r.type === 'oreate' && r.status === 'quota')) && (r.type === 'openai' || r.type === 'adobe' || r.type === 'byteplus' || r.type === 'runway' || r.type === 'leonardo' || r.type === 'krea' || r.type === 'imagine' || r.type === 'grok' || r.type === 'oreate'))
-  const adobeNeedEmail = visible.filter((r) => !r.pending && r.type === 'adobe' && !r.email)
-  const total = quotaRows.length + adobeNeedEmail.length
-  if (total === 0) { quotaStatus.value = ''; return }
-
-  let done = 0, updates = 0
-  quotaStatus.value = `后台校对… 0/${total}`
-  const bump = () => {
-    done++
-    if (myToken !== reconcileToken) return  // a newer page-flip superseded us
-    quotaStatus.value = `后台校对… ${done}/${total}${updates ? ` · 更新 ${updates}` : ''}`
-  }
-
-  // Build thunks (NOT immediately-invoked) so the pool controls how many run at
-  // once. Each /accounts/.../quota probe is a *synchronous* backend call to
-  // OpenAI/Adobe. We only probe the visible page (≤ pageSize rows), so the
-  // limit below is effectively bounded by that — no full-list flood.
-  const jobs = []
-  for (const row of quotaRows) {
-    jobs.push(async () => {
-      const result = await fetchOneQuota(row.pool, row.id)
-      if (result && result.deleted) {
-        rows.value = rows.value.filter((item) => item.pool !== row.pool || item.id !== row.id)
-        updates++
-      } else if (result && result.auth_failed) {
-        // backend auto-disabled this dead (401) token — reflect it immediately
-        row.status = result.status || 'disabled'
-        row.dead = true
-        row.remaining = null
-        row._unknown = true
-        updates++
-      } else if (result && result.unchanged === false) {
-        applyQuota(row, result)
-        updates++
-      }
-      bump()
-    })
-  }
-  for (const row of adobeNeedEmail) {
-    jobs.push(async () => {
-      const result = await fetchOneEmail(row.pool, row.id)
-      if (result && result.email && (!row.email || row.email === '—')) {
-        row.email = result.email
-        updates++
-      }
-      bump()
-    })
-  }
-  await runWithLimit(jobs, Infinity)   // no JS-side cap — fire all visible-page probes at once (browser still limits ~6 conns/origin)
-  // clear the indicator when done — but only if we're still the current run
-  // (a page flip mid-reconcile starts a fresh one that owns the indicator).
-  if (myToken === reconcileToken) quotaStatus.value = ''
+function quotaPercent(bucket) {
+  const total = Number(bucket.total || 0)
+  if (!total) return 0
+  return Math.max(0, Math.min(100, Number(bucket.remaining || 0) / total * 100))
 }
 
-// Flipping pages re-queries the server for the new page; loadAccounts() then
-// reconciles just the freshly visible rows. Filter buttons go through
-// setFilter → resetAndLoad, so everything funnels into loadAccounts.
-watch(page, () => { loadAccounts() })
-
-// Bounded-concurrency runner: keeps at most `limit` thunks in flight at once.
-async function runWithLimit(thunks, limit) {
-  let next = 0
-  const workers = Array.from({ length: Math.min(limit, thunks.length) }, async () => {
-    while (next < thunks.length) {
-      const idx = next++
-      await thunks[idx]()
-    }
-  })
-  await Promise.all(workers)
+function quotaValue(value, unit) {
+  if (value === null || value === undefined) return '—'
+  return `${Number(value).toLocaleString('zh-CN')} ${unit || ''}`.trim()
 }
 
-async function fetchOneQuota(pool, id) {
-  try {
-    const r = await api(`/accounts/${pool}/${id}/quota`)
-    if (!r.ok) return { error: r.data?.detail || `额度刷新失败 (${r.status})` }
-    return r.data || {}
-  }
-  catch (e) { return { error: String(e) } }
-}
-async function fetchOneEmail(pool, id) {
-  try { return (await api(`/accounts/${pool}/${id}/email`)).data || {} }
-  catch (e) { return { error: String(e) } }
+function fmtTime(value) {
+  if (!value) return '—'
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleString('zh-CN', { hour12: false })
 }
 
-function applyQuota(row, result) {
-  // A transient probe error (e.g. connection reset when OpenAI is unreachable
-  // without a proxy) must NOT blank the cached number — keep the last-known
-  // value so a network blip doesn't turn the whole column into "—".
-  if (result.error) { row._quotaError = result.error; return }
-  row._quotaError = null
-  if (result.unknown && result.remaining === null) { row.remaining = null; row._unknown = true; return }
-  row._unknown = false
-  row.remaining = result.remaining
-  if (result.used != null) row.quota_used = result.used
-  if (result.total != null) row.quota_total = result.total
-  row.reset_after = result.reset_after
-  if (result.status) row.status = result.status
-  if (result.dead != null) row.dead = Boolean(result.dead)
+async function patchAccount(account, patch, key) {
+  busy.value = `${account.id}:${key}`
+  const response = await api(`/accounts/${encodeURIComponent(account.id)}`, jsonBody('PATCH', patch))
+  if (!response.ok) error.value = response.error
+  else Object.assign(account, response.data?.data || response.data || patch)
+  busy.value = ''
 }
 
-async function refreshAccountQuota(row) {
-  if (refreshingQuota.value.has(row.id)) return
-  const active = new Set(refreshingQuota.value)
-  active.add(row.id)
-  refreshingQuota.value = active
-  try {
-    const result = await fetchOneQuota(row.pool, row.id)
-    applyQuota(row, result)
-    if (!result.error) await fetchAccounts()
-  } finally {
-    const next = new Set(refreshingQuota.value)
-    next.delete(row.id)
-    refreshingQuota.value = next
-  }
+async function toggleAccount(account) {
+  const active = !['disabled', 'auth_error'].includes(account.status)
+  await patchAccount(account, { status: active ? 'disabled' : 'active' }, 'status')
 }
 
-async function toggleAccountStatus(pool, id, current) {
-  const row = rows.value.find((r) => r.pool === pool && r.id === id)
-  const next = current === 'active' ? 'disabled' : 'active'
-  // Optimistic: flip the switch instantly so the UI never waits on the network.
-  // The PATCH itself is a cheap in-memory update server-side; the old 5s lag came
-  // from the follow-up loadAccounts() → reconcile() probing every account's quota.
-  if (row) row.status = next
-  try {
-    const r = await api(`/tokens/${pool}/${id}`, jsonBody('PATCH', { status: next }))
-    if (!r.ok && row) row.status = current  // revert on server rejection
-  } catch (e) {
-    if (row) row.status = current           // revert on network error
-  }
+async function refreshQuota(account) {
+  busy.value = `${account.id}:quota`
+  const response = await api(`/accounts/${encodeURIComponent(account.id)}/refresh-quota`, jsonBody('POST', {}))
+  if (response.ok) {
+    await load()
+  } else error.value = response.error
+  busy.value = ''
 }
 
-async function deleteAccount(pool, id) {
-  if (!confirm(`确认删除 ${pool} / ${id}?`)) return
-  await api(`/tokens/${pool}/${id}`, { method: 'DELETE' })
-  loadAccounts()
+async function removeAccount(account) {
+  if (!confirm(`确认删除 ${account.label || account.email || account.id}？已产生的日志仍会保留快照。`)) return
+  const response = await api(`/accounts/${encodeURIComponent(account.id)}`, { method: 'DELETE' })
+  if (response.ok) accounts.value = accounts.value.filter((a) => a.id !== account.id)
+  else error.value = response.error
 }
 
-// 一键删除全部异常(已失效/红色锁定)账号。先向服务端要全量 dead 列表(跨页),再逐个删除。
-async function deleteDeadAccounts() {
-  if (!deadCount.value) return
-  if (!confirm(`确认删除全部 ${deadCount.value} 个异常(已失效)账号?此操作不可撤销。`)) return
-  const r = await api('/accounts?dead=1&limit=0')
-  const dead = r.data?.data || []
-  if (!dead.length) return
-  await Promise.all(dead.map((a) => api(`/tokens/${a.pool}/${a.id}`, { method: 'DELETE' })))
-  loadAccounts()
+async function importAccount() {
+  if (!importForm.credential.trim()) return
+  busy.value = 'import'
+  const response = await api('/accounts/import', jsonBody('POST', {
+    provider: importForm.provider,
+    label: importForm.label.trim(),
+    credential: parseCredentialInput(importForm.credential),
+  }))
+  if (response.ok) {
+    importing.value = false
+    importForm.label = ''
+    importForm.credential = ''
+    await load()
+  } else error.value = response.error
+  busy.value = ''
 }
 
-// ===== 多选删除 =====
-const selected = ref(new Set())
-function toggleSelect(id) {
-  const s = new Set(selected.value)
-  s.has(id) ? s.delete(id) : s.add(id)
-  selected.value = s
-}
-// Header checkbox selects/deselects the CURRENT PAGE only.
-const allSelected = computed(() =>
-  pagedItems.value.length > 0 && pagedItems.value.every((a) => selected.value.has(a.id)))
-function toggleSelectAll() {
-  const s = new Set(selected.value)
-  if (allSelected.value) pagedItems.value.forEach((a) => s.delete(a.id))
-  else pagedItems.value.forEach((a) => s.add(a.id))
-  selected.value = s
-}
-async function deleteSelected() {
-  const ids = [...selected.value]
-  if (!ids.length) return
-  if (!confirm(`确认删除选中的 ${ids.length} 个账号?此操作不可撤销。`)) return
-  const r = await api('/tokens/delete-bulk', jsonBody('POST', { ids }))
-  if (r.ok) {
-    selected.value = new Set()
-    loadAccounts()
-  }
-}
-
-onMounted(() => { loadAccounts(); loadModelList() })
+onMounted(load)
 </script>
 
 <template>
   <section class="space-y-4">
-    <!-- KPI strip — 每个类型显示 成功/失败/限额 三个数(绿/红/琥珀) -->
-    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-10 gap-3">
-      <div class="card p-4">
-        <div class="text-[11px] uppercase tracking-wider text-white/45">账号总数</div>
-        <div class="text-2xl font-semibold mt-1 tabular-nums">{{ stats.total }}</div>
-        <div class="text-[10px] text-white/35 mt-0.5">成功/失败/限额</div>
+    <div class="flex items-start justify-between gap-4">
+      <div>
+        <h2 class="text-xl font-semibold text-white/90">上游账号调度</h2>
+        <p class="mt-1 text-xs text-white/40">账号按 route 授权和真实额度桶调度；每次生成都会刷新额度。</p>
       </div>
-      <div v-for="t in [['openai','OpenAI','text-emerald-300/80'],['adobe','Adobe','text-rose-300/80'],['byteplus','BytePlus','text-indigo-300/80'],['runway','Runway','text-violet-300/80'],['leonardo','Leonardo','text-amber-300/80'],['krea','Krea','text-sky-300/80'],['imagine','Imagine','text-teal-300/80'],['grok','Grok','text-slate-300/80'],['oreate','OreateAI','text-cyan-300/80']]"
-           :key="t[0]" class="card p-4">
-        <div class="text-[11px] uppercase tracking-wider" :class="t[2]">{{ t[1] }}</div>
-        <div class="text-2xl font-semibold mt-1 tabular-nums">
-          <span class="text-emerald-300">{{ stats[t[0]].ok }}</span><span class="text-white/30">/</span><span class="text-rose-300">{{ stats[t[0]].dead }}</span><span class="text-white/30">/</span><span class="text-amber-300">{{ stats[t[0]].quota }}</span>
-        </div>
-        <div class="text-[10px] text-white/35 mt-0.5">共 {{ stats[t[0]].n }}</div>
+      <button class="btn-primary" @click="importing = true"><Icon name="plus" class="w-3.5 h-3.5" />导入账号</button>
+    </div>
+
+    <p v-if="error" class="notice">{{ error }}</p>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div v-for="item in [['总账号',stats.total],['可用',stats.active],['冷却',stats.cooldown],['已禁用',stats.disabled]]" :key="item[0]" class="card p-4">
+        <div class="text-[10px] uppercase tracking-wider text-white/40">{{ item[0] }}</div>
+        <div class="mt-1 text-2xl font-semibold tabular-nums">{{ item[1] }}</div>
       </div>
     </div>
 
-    <!-- Toolbar -->
-    <div class="card p-3 flex items-center gap-3 flex-wrap">
-      <div class="flex items-center gap-1">
-        <button @click="setFilter(() => typeFilter = '')" class="fp" :class="typeFilter === '' && 'fp-on'">全部类型</button>
-        <button @click="setFilter(() => typeFilter = 'openai')" class="fp" :class="typeFilter === 'openai' && 'fp-emerald'">
-          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>OpenAI
-        </button>
-        <button @click="setFilter(() => typeFilter = 'adobe')" class="fp" :class="typeFilter === 'adobe' && 'fp-rose'">
-          <span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span>Adobe
-        </button>
-        <button @click="setFilter(() => typeFilter = 'byteplus')" class="fp" :class="typeFilter === 'byteplus' && 'fp-violet'">
-          <span class="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>BytePlus
-        </button>
-        <button @click="setFilter(() => typeFilter = 'runway')" class="fp" :class="typeFilter === 'runway' && 'fp-violet'">
-          <span class="w-1.5 h-1.5 rounded-full bg-violet-400"></span>Runway
-        </button>
-        <button @click="setFilter(() => typeFilter = 'leonardo')" class="fp" :class="typeFilter === 'leonardo' && 'fp-amber'">
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>Leonardo
-        </button>
-        <button @click="setFilter(() => typeFilter = 'krea')" class="fp" :class="typeFilter === 'krea' && 'fp-sky'">
-          <span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span>Krea
-        </button>
-        <button @click="setFilter(() => typeFilter = 'imagine')" class="fp" :class="typeFilter === 'imagine' && 'fp-teal'">
-          <span class="w-1.5 h-1.5 rounded-full bg-teal-400"></span>Imagine
-        </button>
-        <button @click="setFilter(() => typeFilter = 'grok')" class="fp" :class="typeFilter === 'grok' && 'fp-on'">
-          <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Grok
-        </button>
-        <button @click="setFilter(() => typeFilter = 'oreate')" class="fp" :class="typeFilter === 'oreate' && 'fp-sky'">
-          <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>OreateAI
-        </button>
-      </div>
-      <div class="w-px h-5 bg-white/10"></div>
-      <div class="flex items-center gap-1">
-        <button @click="setFilter(() => statusFilter = '')" class="fp" :class="statusFilter === '' && 'fp-on'">所有状态</button>
-        <button @click="setFilter(() => statusFilter = 'active')" class="fp" :class="statusFilter === 'active' && 'fp-emerald'">
-          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>正常
-        </button>
-        <button @click="setFilter(() => statusFilter = 'quota')" class="fp" :class="statusFilter === 'quota' && 'fp-amber'">
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>额度耗尽
-        </button>
-        <button @click="setFilter(() => statusFilter = 'disabled')" class="fp" :class="statusFilter === 'disabled' && 'fp-rose'">
-          <span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span>已禁用
-        </button>
-      </div>
-      <div class="flex-1 min-w-[200px]">
-        <input v-model="search" class="field !py-1.5 text-xs" placeholder="搜索 邮箱 / ID / 类型…" />
-      </div>
-      <button v-if="selected.size" @click="deleteSelected" class="btn-soft danger" title="删除选中的账号">
-        <Icon name="trash" class="w-3.5 h-3.5" /> 删除选中 ({{ selected.size }})
-      </button>
-      <button v-if="deadCount" @click="deleteDeadAccounts" class="btn-soft danger" title="删除全部已失效(401)账号">
-        <Icon name="trash" class="w-3.5 h-3.5" /> 删除异常账号 ({{ deadCount }})
-      </button>
-      <button @click="loadAccounts" class="btn-soft">
-        <Icon name="refresh" class="w-3.5 h-3.5" /> 刷新
-      </button>
-      <button @click="showImport = true" class="btn-primary">
-        <Icon name="plus" class="w-3.5 h-3.5" /> 导入账号
-      </button>
-      <button @click="editingUpstream = null; showUpstream = true" class="btn-soft">
-        <Icon name="plus" class="w-3.5 h-3.5" /> 添加上游
-      </button>
+    <div class="card p-3 flex flex-wrap items-center gap-2">
+      <SelectMenu v-model="provider" class="w-36" :options="[{ value: '', label: '全部 Provider' }, ...PROVIDER_OPTIONS]" />
+      <SelectMenu v-model="status" class="w-32" :options="[{value:'',label:'全部状态'},{value:'active',label:'可用'},{value:'cooldown',label:'冷却'},{value:'disabled',label:'已禁用'},{value:'auth_error',label:'鉴权失效'}]" />
+      <input v-model="query" class="field !py-1.5 text-xs flex-1 min-w-52" placeholder="搜索标签、邮箱或 ID…" @keyup.enter="load" />
+      <button class="btn-soft" @click="load"><Icon name="refresh" class="w-3.5 h-3.5" />查询</button>
     </div>
 
-    <!-- Table -->
-    <div class="card overflow-x-auto">
-      <div v-if="loading && !rows.length" class="text-center text-sm text-white/40 py-20">加载中…</div>
-      <div v-else-if="!filtered.length" class="flex flex-col items-center gap-3 text-white/40 py-20">
-        <span class="w-14 h-14 rounded-2xl bg-white/[0.04] grid place-items-center">
-          <Icon name="accounts" class="w-6 h-6" />
-        </span>
-        <span class="text-sm">{{ stats.total ? '没有匹配的账号' : '还没有账号' }}</span>
-        <button v-if="!stats.total" @click="showImport = true" class="btn-soft mt-1">导入第一个</button>
-      </div>
-
-      <table v-else class="w-full text-sm table-fixed min-w-[1080px]">
-        <colgroup>
-          <col class="w-9" />      <!-- select -->
-          <col />                  <!-- identity (flex) -->
-          <col class="w-20" />     <!-- type -->
-          <col class="w-24" />     <!-- remaining -->
-          <col class="w-16" />     <!-- weight -->
-          <col class="w-16" />     <!-- concurrency -->
-          <col class="w-32" />     <!-- reset -->
-          <col class="w-28" />     <!-- created -->
-          <col class="w-28" />     <!-- last used -->
-          <col class="w-40" />     <!-- inflight/success/fail -->
-          <col class="w-16" />     <!-- status switch -->
-          <col class="w-32" />     <!-- actions -->
-        </colgroup>
-        <thead>
-          <tr class="text-[10px] uppercase tracking-[0.2em] text-white/40 border-b border-white/[0.06]">
-            <th class="text-center px-3 py-3 font-medium">
-              <input type="checkbox" :checked="allSelected" @change="toggleSelectAll"
-                     class="chk" title="全选" />
-            </th>
-            <th class="text-left px-5 py-3 font-medium">账户</th>
-            <th class="text-left px-3 py-3 font-medium">类型</th>
-            <th class="text-right px-3 py-3 font-medium">额度</th>
-            <th class="text-center px-3 py-3 font-medium">权重</th>
-            <th class="text-center px-3 py-3 font-medium">并发</th>
-            <th class="text-left px-3 py-3 font-medium">恢复时间</th>
-            <th class="text-left px-3 py-3 font-medium">创建时间</th>
-            <th class="text-left px-3 py-3 font-medium">最后使用</th>
-            <th class="text-center px-3 py-3 font-medium">在途 / 成功 / 失败</th>
-            <th class="text-left px-3 py-3 font-medium">状态</th>
-            <th class="text-right px-3 py-3 font-medium">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="a in pagedItems" :key="a.pool + '/' + a.id"
-              class="border-b border-white/[0.04] hover:bg-white/[0.03] transition-colors"
-              :class="a.dead && 'dead-row'">
-            <!-- select -->
-            <td class="px-3 py-3.5 align-middle text-center">
-              <input type="checkbox" :checked="selected.has(a.id)" @change="toggleSelect(a.id)" @click.stop
-                     class="chk" />
-            </td>
-            <!-- identity -->
-            <td class="px-5 py-3.5 align-middle">
-              <!-- email + per-kind quota markers on one line. Both-limited shows as
-                   额度耗尽 in the status column, so here we only surface the single
-                   case. -->
-              <div class="flex items-center gap-2 min-w-0">
-                <span class="text-sm text-white/90 truncate" :title="a.email || '-'">{{ a.email || '-' }}</span>
-                <span v-for="cap in grokCapabilities(a)" :key="cap.kind"
-                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1"
-                      :class="cap.available ? 'bg-emerald-500/10 text-emerald-300 ring-emerald-400/20' : 'bg-rose-500/10 text-rose-300 ring-rose-400/20'"
-                      :title="cap.available ? `可用${CAPABILITY_LABEL[cap.kind]}` : `${CAPABILITY_LABEL[cap.kind]}额度/权限不可用`">
-                  {{ CAPABILITY_LABEL[cap.kind] }}
-                </span>
-                <span v-if="a.type === 'leonardo' && a.paid_plan"
-                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-500/15 text-violet-300 ring-1 ring-violet-400/20"
-                      :title="a.plan ? `积分号 · ${a.plan}，点数按月续期` : '积分号，点数按月续期，不参与每日重置'">积分号</span>
-                <span v-if="firstImageBadge(a)"
-                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1"
-                      :class="firstImageBadge(a).cls"
-                      :title="firstImageBadge(a).title">{{ firstImageBadge(a).label }}</span>
-                <span v-if="a.image_limited && a.status !== 'quota'"
-                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/20"
-                      title="图片额度耗尽，仅视频可用">图片限额</span>
-                <span v-if="a.video_limited && a.status !== 'quota'"
-                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/20"
-                      title="视频额度耗尽，仅图片可用">视频限额</span>
-              </div>
-            </td>
-            <!-- type -->
-            <td class="px-3 py-3.5 align-middle">
-              <span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium ring-1 whitespace-nowrap"
-                    :class="typePill(a.type)">{{ a.type }}</span>
-            </td>
-            <!-- remaining -->
-            <td class="px-3 py-3.5 align-middle text-right text-sm tabular-nums whitespace-nowrap">
-              <!-- quota column: 数字 / —  (never "未知"/"失败"/"检测中") -->
-              <!-- remaining === -1 is the provider "unlimited" sentinel → show — not a scary red -1 -->
-              <span v-if="(a.type === 'openai' || a.type === 'adobe' || a.type === 'byteplus' || a.type === 'runway' || a.type === 'leonardo' || a.type === 'krea' || a.type === 'imagine' || a.type === 'grok' || a.type === 'oreate') && a.remaining != null && a.remaining !== -1"
-                    class="font-mono font-semibold"
-                    :class="a.remaining > 0 ? 'text-emerald-300' : 'text-rose-300'"
-                    :title="a.type === 'adobe' && a.quota_total != null ? `剩余 ${a.remaining} / 总额 ${a.quota_total}` : ''">{{ a.remaining }}{{ a.type === 'grok' ? '%' : '' }}</span>
-              <span v-else class="text-white/25" :title="a._quotaError || ''">—</span>
-            </td>
-            <!-- weight (edit via modal) -->
-            <td class="px-3 py-3.5 align-middle text-center whitespace-nowrap text-xs tabular-nums text-white/70">
-              {{ a.weight ?? 0 }}
-            </td>
-            <!-- Per-account concurrency; Adobe points accounts default to 5. -->
-            <td class="px-3 py-3.5 align-middle text-center whitespace-nowrap text-xs tabular-nums">
-              <span class="text-white/70">{{ accountConcurrency(a) }}</span>
-            </td>
-            <!-- reset_after -->
-            <td class="px-3 py-3.5 align-middle text-xs whitespace-nowrap">
-              <div v-if="a.reset_after" class="leading-tight" :title="fmtIso(a.reset_after)">
-                <div class="text-white/65 tabular-nums">{{ fmtDate(a.reset_after) }}</div>
-                <div class="text-white/35 tabular-nums">{{ fmtClock(a.reset_after) }}</div>
-              </div>
-              <span v-else class="text-white/25">—</span>
-            </td>
-            <!-- created_at -->
-            <td class="px-3 py-3.5 align-middle text-xs whitespace-nowrap">
-              <div class="leading-tight" :title="fmtTs(a.created_at)">
-                <div class="text-white/65 tabular-nums">{{ fmtDate(a.created_at) }}</div>
-                <div class="text-white/35 tabular-nums">{{ fmtClock(a.created_at) }}</div>
-              </div>
-            </td>
-            <!-- last_used_at -->
-            <td class="px-3 py-3.5 align-middle text-xs whitespace-nowrap">
-              <div v-if="a.last_used_at" class="leading-tight" :title="fmtTs(a.last_used_at)">
-                <div class="text-white/65 tabular-nums">{{ fmtDate(a.last_used_at) }}</div>
-                <div class="text-white/35 tabular-nums">{{ fmtClock(a.last_used_at) }}</div>
-              </div>
-              <span v-else class="text-white/25">从未</span>
-            </td>
-            <!-- inflight / success / fail -->
-            <td class="px-3 py-3.5 align-middle">
-              <div class="flex items-center justify-center gap-1.5 text-xs tabular-nums">
-                <span class="px-1.5 py-0.5 rounded"
-                      :class="a.in_flight ? 'bg-indigo-500/15 text-indigo-300 font-semibold' : 'text-white/25'"
-                      title="在途">{{ a.in_flight || 0 }}</span>
-                <span class="text-white/20">/</span>
-                <span class="px-1.5 py-0.5 rounded text-emerald-300 font-medium" title="成功">{{ a.success_total || 0 }}</span>
-                <span class="text-white/20">/</span>
-                <span class="px-1.5 py-0.5 rounded"
-                      :class="a.fail_total ? 'bg-rose-500/15 text-rose-300 font-medium' : 'text-white/25'"
-                      title="失败">{{ a.fail_total || 0 }}</span>
-              </div>
-            </td>
-            <!-- status (switch) -->
-            <td class="px-3 py-3.5 align-middle">
-              <button class="sw"
-                      :class="{ 'sw-on': a.status === 'active', 'sw-dead': a.dead, 'sw-pending': a.status === 'pending', 'sw-quota': a.status === 'quota', 'sw-locked': a.dead || a.status === 'pending' || a.status === 'quota' }"
-                      :disabled="a.dead || a.status === 'pending' || a.status === 'quota'"
-                      :aria-pressed="a.status === 'active'"
-                      :title="a.status === 'pending' ? '正在检测额度…（暂不调度）' : (a.dead ? '号已失效(401) · 已锁定（删除后重新导入有效令牌）' : (a.status === 'quota' ? '额度耗尽 · 已锁定，到恢复时间自动解开' : (a.status === 'active' ? '点击禁用' : '点击启用')))"
-                      @click="!(a.dead || a.status === 'pending' || a.status === 'quota') && toggleAccountStatus(a.pool, a.id, a.status)">
-                <span class="sw-thumb"></span>
-              </button>
-            </td>
-            <!-- actions -->
-            <td class="px-3 py-3.5 align-middle whitespace-nowrap">
-              <div class="flex items-center justify-end gap-2">
-                <button v-if="a.type === 'oreate' && !a.pending && !a.dead"
-                        @click="refreshAccountQuota(a)" class="act"
-                        :disabled="refreshingQuota.has(a.id)" title="刷新 OreateAI 额度">
-                  <Icon name="refresh" class="w-3.5 h-3.5" :class="refreshingQuota.has(a.id) && 'animate-spin'" />
-                </button>
-                <button @click="testAccount(a)" class="act" title="生图测试">
-                  <Icon name="spark" class="w-3.5 h-3.5" />
-                </button>
-                <button v-if="a.type !== 'custom'" @click="editAccount(a)" class="act" title="编辑">
-                  <Icon name="config" class="w-3.5 h-3.5" />
-                </button>
-                <button v-if="a.type === 'custom'" @click="editUpstream(a)" class="act" title="编辑上游">
-                  <Icon name="config" class="w-3.5 h-3.5" />
-                </button>
-                <button @click="deleteAccount(a.pool, a.id)" class="act danger" title="删除">
-                  <Icon name="trash" class="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-
-      <!-- pagination -->
-      <div v-if="!loading && totalPages > 1"
-           class="flex items-center justify-between gap-3 border-t border-white/[0.06] px-5 py-3 text-xs text-white/55">
-        <div>
-          <span class="tabular-nums text-white/85">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(total, page * pageSize) }}</span>
-          <span class="ml-1">/ {{ total }} 条</span>
+    <div class="space-y-2">
+      <article v-for="account in filtered" :key="account.id" class="card overflow-hidden">
+        <div class="px-4 py-3.5 grid grid-cols-[auto_minmax(0,1fr)_auto] lg:grid-cols-[auto_minmax(13rem,1fr)_9rem_9rem_8rem_auto] items-center gap-3">
+          <button class="text-white/35 hover:text-white/80" @click="toggleOpen(account.id)"><span class="inline-block transition-transform" :class="expanded.has(account.id) && 'rotate-90'">›</span></button>
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <span class="provider">{{ account.provider }}</span>
+              <strong class="text-xs text-white/85 truncate">{{ account.label || account.email || account.id }}</strong>
+            </div>
+            <div class="mt-1 text-[10px] text-white/35 truncate">{{ account.email || account.id }} · {{ (account.routes || []).filter((r) => r.enabled !== false).length }} 个 route</div>
+          </div>
+          <div class="hidden lg:block text-[10px] text-white/40">并发 <span class="text-white/75">{{ account.active_jobs || 0 }} / {{ account.max_concurrency || '∞' }}</span></div>
+          <div class="hidden lg:block text-[10px] text-white/40">权重 <span class="text-white/75">{{ account.weight ?? 1 }}</span></div>
+          <div class="hidden lg:block"><span class="status" :class="`status-${account.status}`">{{ account.status || 'unknown' }}</span></div>
+          <div class="flex items-center gap-1 justify-end">
+            <button class="icon-btn" title="校验账号并刷新真实额度" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
+            <button class="switch" :class="!['disabled','auth_error'].includes(account.status) && 'on'" @click="toggleAccount(account)"><span></span></button>
+            <button class="icon-btn danger" title="删除" @click="removeAccount(account)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
+          </div>
         </div>
-        <div class="flex items-center gap-1">
-          <template v-for="(n, i) in pageNumbers" :key="i">
-            <span v-if="n === null" class="px-1 text-white/35">…</span>
-            <button v-else @click="goPage(n)" class="pg" :class="page === n && 'pg-on'">{{ n }}</button>
-          </template>
+
+        <div v-if="expanded.has(account.id)" class="border-t border-white/[0.06] p-4 md:px-11 bg-white/[0.015] space-y-5">
+          <div>
+            <div class="section-title">额度桶</div>
+            <div v-if="(account.quota_buckets || []).length" class="grid md:grid-cols-2 xl:grid-cols-3 gap-2 mt-2">
+              <div v-for="bucket in account.quota_buckets" :key="bucket.id || bucket.name" class="quota">
+                <div class="flex justify-between gap-3 text-[10px]"><span class="text-white/65">{{ bucket.name || bucket.model_id || '默认额度' }}</span><span class="text-white/40">{{ quotaValue(bucket.remaining, bucket.unit) }} / {{ quotaValue(bucket.total, bucket.unit) }}</span></div>
+                <div class="mt-2 h-1.5 rounded-full bg-white/[0.07] overflow-hidden"><span class="block h-full bg-gradient-to-r from-violet-500 to-cyan-400" :style="{width:`${quotaPercent(bucket)}%`}"></span></div>
+                <div class="mt-2 flex justify-between text-[9px] text-white/30"><span>已预占 {{ quotaValue(bucket.reserved || 0, bucket.unit) }}</span><span>重置 {{ fmtTime(bucket.reset_at) }}</span></div>
+              </div>
+            </div>
+            <p v-else class="mt-2 text-xs text-white/30">暂无额度桶，请刷新账号授权。</p>
+          </div>
+          <div>
+            <div class="section-title">Route 授权</div>
+            <div class="mt-2 flex flex-wrap gap-1.5">
+              <span v-for="route in account.routes || []" :key="route.id" class="route" :class="route.enabled === false && 'off'">{{ route.model_id || route.logical_model_id }} <small>{{ route.enabled === false ? '停用' : '可用' }}</small></span>
+              <span v-if="!(account.routes || []).length" class="text-xs text-white/30">暂无 route 授权</span>
+            </div>
+          </div>
+          <div class="grid md:grid-cols-2 gap-3 max-w-2xl">
+            <label><span class="section-title">权重</span><input type="number" min="0" class="field mt-1.5" :value="account.weight ?? 1" @change="patchAccount(account,{weight:Number($event.target.value)},'weight')" /></label>
+            <label><span class="section-title">账号并发（0 = 不限）</span><input type="number" min="0" class="field mt-1.5" :value="account.max_concurrency || 0" @change="patchAccount(account,{max_concurrency:Number($event.target.value)},'concurrency')" /></label>
+          </div>
         </div>
-      </div>
+      </article>
+      <div v-if="!loading && !filtered.length" class="card py-16 text-center text-xs text-white/35">没有匹配的账号</div>
     </div>
 
-    <ImportModal v-if="showImport" @close="showImport = false" @imported="loadAccounts" />
-    <UpstreamModal v-if="showUpstream" :account="editingUpstream" @close="showUpstream = false; editingUpstream = null" @imported="loadAccounts" />
-    <AccountEditModal v-if="editingAccount" :account="editingAccount" @saved="applyEdit" @close="editingAccount = null" />
-    <AccountTestModal v-if="testingAccount" :account="testingAccount" :all-models="allModels" @close="testingAccount = null" />
+    <div v-if="importing" class="modal-bg" @click.self="importing = false">
+      <form class="modal-card" @submit.prevent="importAccount">
+        <div class="flex items-center justify-between"><h3 class="font-semibold text-white/90">导入上游账号</h3><button type="button" @click="importing = false"><Icon name="close" class="w-4 h-4" /></button></div>
+        <label class="block"><span class="section-title">Provider</span><SelectMenu v-model="importForm.provider" class="mt-1.5" :options="PROVIDER_OPTIONS.filter(option => option.value !== 'custom')" /></label>
+        <label class="block"><span class="section-title">显示标签（可选）</span><input v-model="importForm.label" class="field mt-1.5" placeholder="例如：BytePlus A" /></label>
+        <label class="block"><span class="section-title">凭据</span><textarea v-model="importForm.credential" rows="8" class="field mt-1.5 resize-y font-mono text-xs" :placeholder="importForm.provider === 'byteplus' ? 'Cookie Header、cookie_string 或浏览器 cookies[] JSON' : '粘贴 Token、Cookie 或账号 JSON'" /></label>
+        <p class="text-[10px] leading-5 text-white/35">导入后立即校验身份、route 授权和额度。前端不保存也不回显凭据。</p>
+        <button class="btn-primary w-full justify-center" :disabled="busy === 'import'">{{ busy === 'import' ? '校验中…' : '导入并校验' }}</button>
+      </form>
+    </div>
+
   </section>
 </template>
 
 <style scoped>
-/* --- filter pills (mirrors LogsView/UsersView/ModelsView) */
-.fp {
-  display: inline-flex; align-items: center; gap: 0.35rem;
-  padding: 0.35rem 0.7rem; font-size: 0.72rem;
-  border-radius: 0.55rem;
-  color: rgb(255 255 255 / 0.65);
-  background: rgb(255 255 255 / 0.05);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
-  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
-}
-.fp:hover { background: rgb(255 255 255 / 0.09); color: white; }
-.fp-on { background: rgb(255 255 255 / 0.92); color: rgb(15 23 42); box-shadow: none; }
-.fp-emerald {
-  background: rgb(16 185 129 / 0.22);
-  color: rgb(110 231 183);
-  box-shadow: inset 0 0 0 1px rgb(110 231 183 / 0.45);
-}
-.fp-rose {
-  background: rgb(244 63 94 / 0.22);
-  color: rgb(253 164 175);
-  box-shadow: inset 0 0 0 1px rgb(253 164 175 / 0.45);
-}
-.fp-amber {
-  background: rgb(245 158 11 / 0.22);
-  color: rgb(253 224 71);
-  box-shadow: inset 0 0 0 1px rgb(253 224 71 / 0.4);
-}
-.fp-violet {
-  background: rgb(139 92 246 / 0.22);
-  color: rgb(196 181 253);
-  box-shadow: inset 0 0 0 1px rgb(196 181 253 / 0.45);
-}
-.fp-sky {
-  background: rgb(56 189 248 / 0.22);
-  color: rgb(125 211 252);
-  box-shadow: inset 0 0 0 1px rgb(125 211 252 / 0.45);
-}
-.fp-teal {
-  background: rgb(20 184 166 / 0.22);
-  color: rgb(94 234 212);
-  box-shadow: inset 0 0 0 1px rgb(94 234 212 / 0.45);
-}
-
-/* --- icon-only action buttons */
-.act {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 1.9rem; height: 1.9rem;
-  border-radius: 0.5rem;
-  color: rgb(255 255 255 / 0.7);
-  background: rgb(255 255 255 / 0.04);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
-  transition: background 0.15s, color 0.15s;
-}
-.act:hover { background: rgb(255 255 255 / 0.1); color: white; }
-.act.danger {
-  color: rgb(253 164 175);
-  background: rgb(244 63 94 / 0.12);
-  box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.3);
-}
-.act.danger:hover { color: white; background: rgb(244 63 94 / 0.25); }
-
-/* toolbar 「删除异常账号」按钮 — rose 变体 */
-.btn-soft.danger {
-  color: rgb(253 164 175);
-  background: rgb(244 63 94 / 0.12);
-  box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.3);
-}
-.btn-soft.danger:hover { color: white; background: rgb(244 63 94 / 0.25); }
-
-/* iOS-style switch (mirrors UsersView/ModelsView) */
-.sw {
-  position: relative;
-  width: 2.25rem; height: 1.3rem;
-  border-radius: 9999px;
-  background: rgb(255 255 255 / 0.12);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
-  transition: background 0.18s ease;
-}
-.sw-thumb {
-  position: absolute;
-  top: 2px; left: 2px;
-  width: calc(1.3rem - 4px); height: calc(1.3rem - 4px);
-  border-radius: 9999px;
-  background: white;
-  box-shadow: 0 1px 2px rgb(15 23 42 / 0.3);
-  transition: transform 0.18s ease;
-}
-.sw-on {
-  background: rgb(16 185 129 / 0.7);
-  box-shadow: inset 0 0 0 1px rgb(16 185 129 / 0.5);
-}
-.sw-on .sw-thumb { transform: translateX(calc(2.25rem - 1.3rem)); }
-/* dead account (401) — red, thumb stays left */
-.sw-dead {
-  background: rgb(244 63 94 / 0.8);
-  box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.6);
-}
-/* pending (import quota probe in flight) — neutral indigo, thumb stays left */
-.sw-pending {
-  background: rgb(99 102 241 / 0.45);
-  box-shadow: inset 0 0 0 1px rgb(99 102 241 / 0.4);
-}
-/* quota exhausted — amber (NOT red/dead), thumb stays left, locked until reset */
-.sw-quota {
-  background: rgb(245 158 11 / 0.5);
-  box-shadow: inset 0 0 0 1px rgb(245 158 11 / 0.45);
-}
-/* dead / pending toggle is locked — can't be flipped */
-.sw-locked { cursor: not-allowed; }
-/* tint the whole row so a dead account is obvious at a glance */
-.dead-row { background: rgb(244 63 94 / 0.07); }
-.dead-row:hover { background: rgb(244 63 94 / 0.12); }
-
-/* --- numbered pagination buttons */
-.pg {
-  min-width: 1.75rem;
-  padding: 0.3rem 0.55rem;
-  font-size: 0.72rem;
-  font-weight: 500;
-  text-align: center;
-  border-radius: 0.45rem;
-  color: rgb(255 255 255 / 0.7);
-  background: rgb(255 255 255 / 0.04);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
-  transition: background 0.15s, color 0.15s;
-}
-.pg:hover:not(.pg-on) { background: rgb(255 255 255 / 0.1); color: white; }
-.pg-on { background: rgb(255 255 255 / 0.92); color: rgb(15 23 42); box-shadow: none; }
+.notice { border-radius: .7rem; padding: .7rem .9rem; font-size: .72rem; color: rgb(253 164 175); background: rgb(244 63 94 / .09); box-shadow: inset 0 0 0 1px rgb(244 63 94 / .22); }
+.provider,.status { display: inline-flex; border-radius: 999px; padding: .15rem .48rem; font: 600 .6rem ui-monospace,SFMono-Regular,monospace; color: rgb(196 181 253); background: rgb(139 92 246 / .12); box-shadow: inset 0 0 0 1px rgb(167 139 250 / .2); }
+.status { color: rgb(255 255 255 / .5); background: rgb(255 255 255 / .05); }
+.status-active,.status-healthy,.status-enabled { color: rgb(110 231 183); background: rgb(16 185 129 / .1); }
+.status-cooldown { color: rgb(252 211 77); background: rgb(245 158 11 / .1); }
+.status-disabled,.status-auth_error { color: rgb(253 164 175); background: rgb(244 63 94 / .1); }
+.icon-btn { width: 1.9rem; height: 1.9rem; display: inline-grid; place-items: center; flex: none; border-radius: .5rem; color: rgb(255 255 255 / .55); background: rgb(255 255 255 / .04); box-shadow: inset 0 0 0 1px rgb(255 255 255 / .07); }
+.icon-btn:hover { color: white; background: rgb(255 255 255 / .09); }.icon-btn.danger { color: rgb(253 164 175); }
+.switch { position: relative; width: 2.2rem; height: 1.25rem; flex: none; border-radius: 999px; background: rgb(255 255 255 / .12); }.switch span { position:absolute;width:.95rem;height:.95rem;left:.15rem;top:.15rem;border-radius:999px;background:white;transition:transform .15s}.switch.on{background:rgb(16 185 129 / .7)}.switch.on span{transform:translateX(.95rem)}
+.section-title { font-size: .65rem; font-weight: 600; letter-spacing: .04em; color: rgb(255 255 255 / .42); }
+.quota { border-radius: .65rem; padding: .75rem; background: rgb(255 255 255 / .03); box-shadow: inset 0 0 0 1px rgb(255 255 255 / .055); }
+.route { display:inline-flex;align-items:center;gap:.4rem;border-radius:999px;padding:.25rem .55rem;font:.62rem ui-monospace,SFMono-Regular,monospace;color:rgb(167 243 208);background:rgb(16 185 129 / .09);box-shadow:inset 0 0 0 1px rgb(16 185 129 / .18)}.route small{opacity:.55}.route.off{color:rgb(255 255 255 / .35);background:rgb(255 255 255 / .035)}
+.modal-bg { position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:1rem;background:rgb(0 0 0 / .65);backdrop-filter:blur(6px) }.modal-card{width:100%;max-width:36rem;display:flex;flex-direction:column;gap:1rem;border-radius:1rem;padding:1.25rem;color:rgb(255 255 255 / .7);background:#11131a;box-shadow:0 24px 80px rgb(0 0 0 / .45),inset 0 0 0 1px rgb(255 255 255 / .08)}
 </style>

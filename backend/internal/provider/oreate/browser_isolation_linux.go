@@ -18,25 +18,25 @@ import (
 const chromiumShutdownWait = 5 * time.Second
 
 func browserIsolationOptions() []chromedp.ExecAllocatorOption {
-	if os.Geteuid() != 0 {
-		return nil
+	var credential *syscall.Credential
+	if os.Geteuid() == 0 {
+		chromeUser, err := user.Lookup("chrome")
+		if err == nil {
+			uid, uidErr := strconv.ParseUint(chromeUser.Uid, 10, 32)
+			gid, gidErr := strconv.ParseUint(chromeUser.Gid, 10, 32)
+			if uidErr == nil && gidErr == nil {
+				credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
+			}
+		}
 	}
-	chromeUser, err := user.Lookup("chrome")
-	if err != nil {
-		return nil
-	}
-	uid, uidErr := strconv.ParseUint(chromeUser.Uid, 10, 32)
-	gid, gidErr := strconv.ParseUint(chromeUser.Gid, 10, 32)
-	if uidErr != nil || gidErr != nil {
-		return nil
-	}
-	credential := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
 	return []chromedp.ExecAllocatorOption{
 		chromedp.ModifyCmdFunc(func(cmd *exec.Cmd) {
-			for _, arg := range cmd.Args {
-				if profileDir, ok := strings.CutPrefix(arg, "--user-data-dir="); ok {
-					_ = os.Chown(profileDir, int(uid), int(gid))
-					break
+			if credential != nil {
+				for _, arg := range cmd.Args {
+					if profileDir, ok := strings.CutPrefix(arg, "--user-data-dir="); ok {
+						_ = os.Chown(profileDir, int(credential.Uid), int(credential.Gid))
+						break
+					}
 				}
 			}
 			configureChromiumCommand(cmd, credential)

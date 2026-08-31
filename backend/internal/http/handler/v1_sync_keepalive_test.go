@@ -5,33 +5,28 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
-	"time"
 
 	"backend/internal/service"
 	"github.com/gin-gonic/gin"
 )
 
-func TestSynchronousImageResponseFlushesKeepaliveBeforeSuccess(t *testing.T) {
+func TestSynchronousImageResponseReturnsSuccessWithoutEarlyFlush(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
-	results := make(chan imageSyncResult, 1)
-
-	go func() {
-		time.Sleep(25 * time.Millisecond)
-		results <- imageSyncResult{response: map[string]any{
-			"created": int64(123),
-			"data":    []map[string]any{{"url": "https://example.test/image.png"}},
-		}}
-	}()
+	result := imageSyncResult{response: map[string]any{
+		"created": int64(123),
+		"data":    []map[string]any{{"url": "https://example.test/image.png"}},
+	}}
 
 	h := &V1Handler{}
-	h.writeSynchronousImageResponse(c, results, 5*time.Millisecond, 5*time.Millisecond)
+	h.finishSynchronousImageResponse(c, result)
 
-	if !recorder.Flushed {
-		t.Fatal("expected the response writer to flush a keepalive")
+	if recorder.Flushed {
+		t.Fatal("synchronous response flushed before its final JSON")
 	}
 	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
@@ -40,25 +35,18 @@ func TestSynchronousImageResponseFlushesKeepaliveBeforeSuccess(t *testing.T) {
 	if body["created"] != float64(123) {
 		t.Fatalf("created = %#v, want 123", body["created"])
 	}
-	if recorder.Header().Get("X-Accel-Buffering") != "no" {
-		t.Fatalf("X-Accel-Buffering = %q, want no", recorder.Header().Get("X-Accel-Buffering"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
 }
 
-func TestSynchronousImageResponseKeepsSlowErrorJSONValid(t *testing.T) {
+func TestSynchronousImageResponsePreservesErrorStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil)
-	results := make(chan imageSyncResult, 1)
-
-	go func() {
-		time.Sleep(15 * time.Millisecond)
-		results <- imageSyncResult{err: service.ErrContentRejected}
-	}()
-
 	h := &V1Handler{}
-	h.writeSynchronousImageResponse(c, results, 5*time.Millisecond, 5*time.Millisecond)
+	h.finishSynchronousImageResponse(c, imageSyncResult{err: service.ErrContentRejected})
 
 	var body struct {
 		Error map[string]any `json:"error"`
@@ -69,8 +57,19 @@ func TestSynchronousImageResponseKeepsSlowErrorJSONValid(t *testing.T) {
 	if body.Error["code"] != "content_policy_violation" {
 		t.Fatalf("error code = %#v", body.Error["code"])
 	}
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("committed streaming status = %d, want 200", recorder.Code)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("error status = %d, want 400", recorder.Code)
+	}
+}
+
+func TestProviderQuotaUsesOpenAI429WithoutBearerChallenge(t *testing.T) {
+	status, body := v1ErrorResponse(service.ErrProviderQuota, nil)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", status)
+	}
+	encoded, _ := json.Marshal(body)
+	if !strings.Contains(string(encoded), `"code":"insufficient_quota"`) {
+		t.Fatalf("body = %s", encoded)
 	}
 }
 

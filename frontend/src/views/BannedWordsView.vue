@@ -1,219 +1,112 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
-import { api, jsonBody } from '../api'
+import { computed, onMounted, ref } from 'vue'
 import Icon from '../components/Icon.vue'
+import { api, jsonBody, listOf } from '../api'
 
-const items = ref([])
-const loading = ref(false)
+const tab = ref('words')
+const rows = ref([])
+const loading = ref(true)
+const error = ref('')
+const query = ref('')
 const newWord = ref('')
-const toast = ref('')
-let toastTimer = null
-function flash(msg) { toast.value = msg; clearTimeout(toastTimer); toastTimer = setTimeout(() => (toast.value = ''), 1800) }
+const importOpen = ref(false)
+const importText = ref('')
+const page = ref(1)
+const total = ref(0)
+const limit = 50
+const pages = computed(() => Math.max(1, Math.ceil(total.value / limit)))
 
 async function load() {
   loading.value = true
-  const qs = new URLSearchParams({
-    limit: String(pageSize),
-    offset: String((page.value - 1) * pageSize),
-  })
-  const r = await api('/banned-words?' + qs.toString())
-  items.value = r.data?.data || []
-  total.value = Number(r.data?.total ?? items.value.length)
+  const params = new URLSearchParams({ page: String(page.value), limit: String(limit) })
+  if (query.value.trim()) params.set('q', query.value.trim())
+  const response = await api(`/${tab.value === 'words' ? 'banned-words' : 'banned-word-hits'}?${params}`)
+  if (response.ok) {
+    rows.value = listOf(response.data)
+    total.value = Number(response.data?.total ?? rows.value.length)
+    error.value = ''
+  } else error.value = response.error
   loading.value = false
-  // Deleting the last row of the last page can leave the cursor past the end.
-  if (page.value > totalPages.value) page.value = totalPages.value
 }
 
-async function add() {
+function switchTab(value) { tab.value = value; page.value = 1; query.value = ''; load() }
+function search() { page.value = 1; load() }
+
+async function addWord() {
   const word = newWord.value.trim()
-  if (!word) { flash('违禁词不能为空'); return }
-  const r = await api('/banned-words', jsonBody('POST', { word }))
-  if (r.ok) { newWord.value = ''; flash('已添加'); load() }
-  else flash(r.data?.detail || '添加失败')
+  if (!word) return
+  const response = await api('/banned-words', jsonBody('POST', { word }))
+  if (response.ok) { newWord.value = ''; await load() } else error.value = response.error
 }
 
-// bulk import — paste words separated by newlines / commas / 、 / ;
-const importOpen = ref(false)
-const importText = ref('')
-const importing = ref(false)
-async function doImport() {
-  const text = importText.value.trim()
-  if (!text) { flash('请先粘贴要导入的违禁词'); return }
-  importing.value = true
-  const r = await api('/banned-words/import', jsonBody('POST', { text }))
-  importing.value = false
-  if (r.ok) {
-    importOpen.value = false
-    importText.value = ''
-    flash(`导入完成：新增 ${r.data?.added ?? 0} 个，跳过 ${r.data?.skipped ?? 0} 个`) 
-    load()
-  } else flash(r.data?.detail || '导入失败')
+async function importWords() {
+  if (!importText.value.trim()) return
+  const response = await api('/banned-words/import', jsonBody('POST', { text: importText.value }))
+  if (response.ok) { importOpen.value = false; importText.value = ''; await load() } else error.value = response.error
 }
 
-async function del(w) {
-  if (!confirm(`删除违禁词「${w.word}」?`)) return
-  const r = await api(`/banned-words/${w.id}`, { method: 'DELETE' })
-  if (r.ok) { flash('已删除'); selected.value.delete(w.id); load() }
-  else flash(r.data?.detail || '删除失败')
+async function removeWord(row) {
+  if (!confirm(`确认删除违禁词「${row.word}」？`)) return
+  const response = await api(`/banned-words/${encodeURIComponent(row.id)}`, { method: 'DELETE' })
+  if (response.ok) await load(); else error.value = response.error
 }
 
-// multi-select — header checkbox selects/deselects the CURRENT PAGE only.
-const selected = ref(new Set())
-function toggleSelect(id) {
-  const s = new Set(selected.value)
-  s.has(id) ? s.delete(id) : s.add(id)
-  selected.value = s
-}
-const allSelected = computed(() =>
-  pagedItems.value.length > 0 && pagedItems.value.every((w) => selected.value.has(w.id)))
-function toggleSelectAll() {
-  const s = new Set(selected.value)
-  if (allSelected.value) pagedItems.value.forEach((w) => s.delete(w.id))
-  else pagedItems.value.forEach((w) => s.add(w.id))
-  selected.value = s
-}
-async function delSelected() {
-  const ids = [...selected.value]
-  if (!ids.length) return
-  if (!confirm(`确认删除选中的 ${ids.length} 个违禁词?`)) return
-  let ok = 0
-  for (const id of ids) {
-    const r = await api(`/banned-words/${id}`, { method: 'DELETE' })
-    if (r.ok) ok++
-  }
-  selected.value = new Set()
-  flash(`已删除 ${ok} 个`)
-  load()
+function fmtTime(value) {
+  if (!value) return '—'
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleString('zh-CN', { hour12: false })
 }
 
-// Server-side pagination: items IS the current page.
-const page = ref(1)
-const pageSize = 20
-const total = ref(0)
-const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
-const pagedItems = computed(() => items.value)
-watch(page, () => { load() })
-function goPage(n) {
-  const t = Math.max(1, Math.min(totalPages.value, n))
-  if (t !== page.value) page.value = t
-}
-const pageNumbers = computed(() => {
-  const n = totalPages.value, cur = page.value
-  if (n <= 7) return Array.from({ length: n }, (_, i) => i + 1)
-  const want = new Set([1, n, cur - 1, cur, cur + 1])
-  if (cur <= 3) { want.add(2); want.add(3); want.add(4) }
-  if (cur >= n - 2) { want.add(n - 1); want.add(n - 2); want.add(n - 3) }
-  const list = [...want].filter((x) => x >= 1 && x <= n).sort((a, b) => a - b)
-  const out = []
-  for (let i = 0; i < list.length; i++) {
-    if (i > 0 && list[i] - list[i - 1] > 1) out.push(null)
-    out.push(list[i])
-  }
-  return out
-})
+function keyName(row) { return row.credential?.name || row.api_credential_name || row.key_preview || 'legacy/unknown' }
 
 onMounted(load)
 </script>
 
 <template>
-  <section class="theme-text space-y-4">
-    <div class="card p-4 flex items-center justify-between gap-3 flex-wrap">
-      <div>
-        <h2 class="text-sm font-semibold">违禁词管理</h2>
-        <p class="text-xs text-white/45 mt-0.5">提示词包含违禁词的生成请求(画图台 + API)会被<strong class="text-white/70">直接拦截</strong>,并累计触发次数(见用户管理)。匹配不区分大小写。</p>
-      </div>
-      <div class="flex items-center gap-2">
-        <button v-if="selected.size" @click="delSelected" class="btn-soft danger shrink-0" title="删除选中的违禁词">
-          <Icon name="trash" class="w-3.5 h-3.5" /> 删除选中 ({{ selected.size }})
-        </button>
-        <input v-model="newWord" @keyup.enter="add" class="field !py-1.5 text-xs w-52" placeholder="输入违禁词后回车" />
-        <button @click="add" class="btn-primary shrink-0">+ 添加</button>
-        <button @click="importOpen = true" class="btn-soft shrink-0">批量导入</button>
-      </div>
+  <section class="space-y-4">
+    <div>
+      <h2 class="text-xl font-semibold text-white/90">违禁词</h2>
+      <p class="mt-1 text-xs text-white/40">同时检查文本、图片和视频请求，命中记录按 API Key 归属。</p>
     </div>
+
+    <div class="card p-3 flex flex-wrap gap-2 items-center">
+      <div class="tabs"><button :class="tab === 'words' && 'on'" @click="switchTab('words')">词库</button><button :class="tab === 'hits' && 'on'" @click="switchTab('hits')">命中记录</button></div>
+      <template v-if="tab === 'words'">
+        <input v-model="newWord" class="field !py-1.5 text-xs min-w-48" placeholder="输入违禁词后回车" @keyup.enter="addWord" />
+        <button class="btn-primary" @click="addWord"><Icon name="plus" class="w-3.5 h-3.5" />添加</button>
+        <button class="btn-soft" @click="importOpen = true">批量导入</button>
+      </template>
+      <input v-model="query" class="field !py-1.5 text-xs flex-1 min-w-44" :placeholder="tab === 'words' ? '搜索词库…' : '搜索命中词、模型或 request_id…'" @keyup.enter="search" />
+      <button class="btn-soft" @click="search">查询</button>
+    </div>
+
+    <p v-if="error" class="notice">{{ error }}</p>
 
     <div class="card overflow-hidden">
-      <table class="w-full text-sm">
-        <thead>
-          <tr class="text-[10px] uppercase tracking-[0.2em] text-white/40 border-b border-white/[0.06]">
-            <th class="text-center px-3 py-3 font-medium w-9">
-              <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" class="chk" title="全选本页" />
-            </th>
-            <th class="text-left px-5 py-3 font-medium">违禁词</th>
-            <th class="text-right px-3 py-3 font-medium">触发次数</th>
-            <th class="text-left px-3 py-3 font-medium">添加时间</th>
-            <th class="text-right px-3 py-3 font-medium">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-if="loading && !items.length"><td colspan="5" class="text-center text-xs text-white/40 py-10">加载中…</td></tr>
-          <tr v-else-if="!items.length"><td colspan="5" class="text-center text-xs text-white/40 py-10">还没有违禁词</td></tr>
-          <tr v-for="w in pagedItems" :key="w.id" class="border-b border-white/[0.04] hover:bg-white/[0.03] transition-colors">
-            <td class="px-3 py-3.5 align-middle text-center">
-              <input type="checkbox" :checked="selected.has(w.id)" @change="toggleSelect(w.id)" @click.stop class="chk" />
-            </td>
-            <td class="px-5 py-3.5 align-middle text-sm font-medium text-white/90">{{ w.word }}</td>
-            <td class="px-3 py-3.5 align-middle text-right tabular-nums" :class="w.hits > 0 ? 'text-rose-300' : 'text-white/50'">{{ w.hits }}</td>
-            <td class="px-3 py-3.5 align-middle text-xs text-white/50">{{ new Date(w.created_at).toLocaleString() }}</td>
-            <td class="px-3 py-3.5 align-middle text-right">
-              <button @click="del(w)" class="act danger" title="删除"><Icon name="trash" class="w-3.5 h-3.5" /></button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-if="totalPages > 1" class="flex items-center justify-between px-5 py-3 border-t border-white/[0.06] text-xs text-white/45">
-        <div><span class="tabular-nums text-white/75">{{ total ? (Math.min(page, totalPages) - 1) * pageSize + 1 : 0 }}–{{ Math.min(total, Math.min(page, totalPages) * pageSize) }}</span><span class="ml-1">/ {{ total }} 条</span></div>
-        <div class="flex items-center gap-1">
-          <template v-for="(n, i) in pageNumbers" :key="i">
-            <span v-if="n === null" class="px-1 text-white/30">…</span>
-            <button v-else @click="goPage(n)" class="pg" :class="page === n && 'pg-on'">{{ n }}</button>
-          </template>
+      <div v-if="loading" class="empty">加载中…</div>
+      <div v-else-if="!rows.length" class="empty">{{ tab === 'words' ? '词库为空' : '暂无命中记录' }}</div>
+      <div v-else-if="tab === 'words'" class="divide-y divide-white/[0.05]">
+        <div v-for="row in rows" :key="row.id" class="px-4 py-3 flex gap-3 items-center hover:bg-white/[0.025]">
+          <Icon name="ban" class="w-4 h-4 text-rose-300/70" />
+          <span class="text-xs text-white/80 flex-1">{{ row.word }}</span>
+          <span class="text-[10px] text-white/30">{{ fmtTime(row.created_at) }}</span>
+          <button class="delete" @click="removeWord(row)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
         </div>
+      </div>
+      <div v-else class="overflow-x-auto">
+        <table class="w-full min-w-[850px] text-xs">
+          <thead><tr class="table-head"><th>时间</th><th>命中词</th><th>API Key</th><th>类型 / 模型</th><th>Request</th><th>内容摘要</th></tr></thead>
+          <tbody><tr v-for="row in rows" :key="row.id" class="table-row"><td>{{ fmtTime(row.created_at) }}</td><td><span class="hit">{{ row.word || row.matched_word }}</span></td><td>{{ keyName(row) }}</td><td><div>{{ row.kind || '—' }}</div><code class="text-[10px] text-white/35">{{ row.model || '—' }}</code></td><td><code class="text-[10px] text-white/40">{{ row.request_id || '—' }}</code></td><td class="max-w-72"><span class="line-clamp-2 text-white/45" :title="row.content_preview || row.prompt">{{ row.content_preview || row.prompt || '—' }}</span></td></tr></tbody>
+        </table>
       </div>
     </div>
 
-    <div v-if="importOpen" class="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" @click.self="importOpen = false">
-      <div class="card w-full max-w-lg p-5 space-y-3">
-        <h3 class="text-sm font-semibold">批量导入违禁词</h3>
-        <p class="text-xs text-white/45">每行一个，或用逗号、顿号、分号分隔；已存在的词会自动跳过。</p>
-        <textarea v-model="importText" rows="8" class="field w-full text-xs font-mono resize-y" placeholder="违禁词1&#10;违禁词2&#10;违禁词3"></textarea>
-        <div class="flex justify-end gap-2">
-          <button @click="importOpen = false" class="btn-soft">取消</button>
-          <button @click="doImport" :disabled="importing" class="btn-primary">{{ importing ? '导入中…' : '导入' }}</button>
-        </div>
-      </div>
-    </div>
+    <div class="flex justify-between items-center text-xs text-white/35"><span>共 {{ total }} 条</span><div class="flex gap-2 items-center"><button class="btn-soft" :disabled="page <= 1" @click="page--;load()">上一页</button><span>{{ page }} / {{ pages }}</span><button class="btn-soft" :disabled="page >= pages" @click="page++;load()">下一页</button></div></div>
 
-    <transition name="fade">
-      <div v-if="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] bg-slate-900 text-white text-xs px-4 py-2 rounded-lg shadow-lg">{{ toast }}</div>
-    </transition>
+    <div v-if="importOpen" class="modal-bg" @click.self="importOpen = false"><form class="modal-card" @submit.prevent="importWords"><div class="flex justify-between"><h3 class="font-semibold text-white/90">批量导入违禁词</h3><button type="button" @click="importOpen = false"><Icon name="close" class="w-4 h-4" /></button></div><textarea v-model="importText" rows="10" class="field resize-y" placeholder="每行一个词，重复项由服务端去重" /><button class="btn-primary justify-center">导入</button></form></div>
   </section>
 </template>
 
 <style scoped>
-.act {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 1.9rem; height: 1.9rem; border-radius: 0.5rem;
-  color: rgb(255 255 255 / 0.7); background: rgb(255 255 255 / 0.04);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
-  transition: background 0.15s, color 0.15s;
-}
-.act:hover { background: rgb(255 255 255 / 0.1); color: white; }
-.act.danger { color: rgb(253 164 175); background: rgb(244 63 94 / 0.12); box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.3); }
-.act.danger:hover { color: white; background: rgb(244 63 94 / 0.25); }
-.btn-soft.danger {
-  color: rgb(253 164 175);
-  background: rgb(244 63 94 / 0.12);
-  box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.3);
-}
-.btn-soft.danger:hover {
-  color: white;
-  background: rgb(244 63 94 / 0.25);
-}
-.chk { accent-color: rgb(217 70 239); width: 0.9rem; height: 0.9rem; cursor: pointer; }
-.pg { min-width: 1.75rem; padding: 0.3rem 0.55rem; font-size: 0.72rem; font-weight: 500; text-align: center; border-radius: 0.45rem; color: rgb(255 255 255 / 0.7); background: rgb(255 255 255 / 0.04); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08); transition: background 0.15s, color 0.15s; }
-.pg:hover:not(.pg-on) { background: rgb(255 255 255 / 0.1); color: white; }
-.pg-on { background: rgb(255 255 255 / 0.92); color: rgb(15 23 42); box-shadow: none; }
-.fade-enter-active, .fade-leave-active { transition: opacity 0.15s ease; }
-.fade-enter-from, .fade-leave-to { opacity: 0; }
+.tabs{display:flex;padding:.15rem;border-radius:.6rem;background:rgb(255 255 255 / .04)}.tabs button{padding:.35rem .7rem;border-radius:.45rem;font-size:.68rem;color:rgb(255 255 255 / .45)}.tabs button.on{background:rgb(139 92 246 / .28);color:white}.notice{border-radius:.7rem;padding:.7rem .9rem;font-size:.72rem;color:rgb(253 164 175);background:rgb(244 63 94 / .09)}.empty{padding:4rem;text-align:center;font-size:.72rem;color:rgb(255 255 255 / .3)}.delete{width:1.8rem;height:1.8rem;display:grid;place-items:center;border-radius:.45rem;color:rgb(253 164 175);background:rgb(244 63 94 / .08)}.table-head{font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:rgb(255 255 255 / .3);border-bottom:1px solid rgb(255 255 255 / .06)}.table-head th,.table-row td{padding:.75rem 1rem;text-align:left}.table-row{border-bottom:1px solid rgb(255 255 255 / .04);color:rgb(255 255 255 / .52)}.hit{display:inline-flex;border-radius:999px;padding:.15rem .45rem;color:rgb(253 164 175);background:rgb(244 63 94 / .1)}.modal-bg{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:1rem;background:rgb(0 0 0 / .65);backdrop-filter:blur(6px)}.modal-card{width:100%;max-width:32rem;display:flex;flex-direction:column;gap:1rem;border-radius:1rem;padding:1.25rem;background:#11131a;color:rgb(255 255 255 / .65);box-shadow:inset 0 0 0 1px rgb(255 255 255 / .08)}
 </style>

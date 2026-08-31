@@ -29,6 +29,8 @@ import (
 	"sync"
 	"time"
 
+	"backend/internal/netguard"
+
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -622,6 +624,16 @@ func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.n
 // newDirectTLSClient is used for reference uploads, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) {
 	return c.newTLSClientP(false)
+}
+
+func (c *Client) newAssetTLSClient(allowedHosts []string) (tlsclient.HttpClient, error) {
+	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
+		tlsclient.WithTimeoutSeconds(600),
+		tlsclient.WithClientProfile(profiles.Chrome_133),
+		tlsclient.WithRandomTLSExtensionOrder(),
+		tlsclient.WithNotFollowRedirects(),
+		tlsclient.WithDialContext(netguard.PinnedDialContext(allowedHosts)),
+	)
 }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {

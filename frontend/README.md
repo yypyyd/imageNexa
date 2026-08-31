@@ -1,44 +1,35 @@
-# ai-gateway frontend
+# 2API administrator console
 
-Vue 3 + Vite admin console for the ai-gateway backend. This replaces the old
-single-file `static/admin.html`.
+Vue 3 + Vite single-administrator control plane for the 2API gateway. There is
+no public user application: `/` resolves to one-time initialization, login, or
+the authenticated administrator console.
+
+Administrator authentication uses an HttpOnly session cookie. Every backend
+request sets `credentials: include`; mutations fetch `/admin/api/auth/csrf` and
+send `X-CSRF-Token`. No administrator credential is stored in localStorage.
+The one-time initialization form additionally sends the operator-provided
+`ADMIN_BOOTSTRAP_TOKEN` only in `X-Admin-Bootstrap-Token`; it is never placed
+in the JSON body or browser storage.
 
 ## Develop
 
 ```bash
-npm install
-npm run dev        # http://localhost:5173
+npm ci
+npm run dev
 ```
 
-The dev server proxies `/admin/api`, `/health`, `/images`, and `/v1` to the backend.
-Start the backend separately:
+The development server listens on `http://localhost:5173` and proxies
+`/admin/api`, `/health`, and `/v1` to `VITE_BACKEND` (default
+`http://127.0.0.1:6666`). Keep the UI and API on the same site so the secure
+session cookie and Origin protection work as intended.
+
+## Verify and build
 
 ```bash
-cd ../backend
-go run ./cmd/api   # http://127.0.0.1:6666
+npm test
+npm run lint:unused
+npm run build
 ```
 
-The account importer recognizes OreateAI account-export JSON. It forwards only
-the Cookie and required profile metadata; exported passwords are discarded in
-the browser and are never submitted to the backend.
-
-The extended `/v1/models` catalog exposes OreateAI Seedance 2.5 durations and
-the per-model image/video reference limits in both snake_case and camelCase for
-downstream importers. OreateAI currently advertises no reference-audio slots.
-
-If the backend runs elsewhere, set `VITE_BACKEND` before `npm run dev`:
-
-```bash
-VITE_BACKEND=http://192.168.1.10:6666 npm run dev
-```
-
-## Build
-
-```bash
-npm run build      # outputs static assets to ./dist
-npm run preview    # serve the production build locally
-```
-
-When hosting `dist/` on a different origin than the API, set `VITE_API_BASE`
-(e.g. `VITE_API_BASE=http://api-host:6666`) at build time, and add that frontend
-origin to the backend's `CORS_ORIGINS` env var.
+Production nginx serves the SPA on port 2000 and forwards the administrator
+API, `/v1`, `/health/live`, and `/health/ready` to the backend container.

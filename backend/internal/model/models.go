@@ -7,33 +7,6 @@ import (
 	"gorm.io/datatypes"
 )
 
-type User struct {
-	ID                 string  `gorm:"primaryKey;size:32"`
-	Email              string  `gorm:"size:255;uniqueIndex;not null"`
-	Name               string  `gorm:"size:255"`
-	PasswordHash       string  `gorm:"size:255"`
-	Role               string  `gorm:"size:32;index;not null"`
-	Status             string  `gorm:"size:32;index;not null"`
-	Credits            float64 `gorm:"not null;default:0"`
-	Notes              string  `gorm:"type:text"`
-	ConcurrencyGroupID string  `gorm:"size:32;index"`
-	AnnouncementSeen   string  `gorm:"size:32"`            // version hash of the last announcement this user dismissed
-	RechargeTotal      float64 `gorm:"not null;default:0"` // 累计充值金额(元)
-	InviteCode         string  `gorm:"size:32;uniqueIndex"`
-	InvitedBy          *string `gorm:"size:32;index"`
-	InviteRewardDone   bool    `gorm:"not null;default:false"`
-	InviteRewardAt     *time.Time
-	CheckinLast        string `gorm:"size:32"`
-	CheckinStreak      int    `gorm:"not null;default:0"`
-	GenerationCount    int64  `gorm:"not null;default:0"`
-	BannedWordHits     int64  `gorm:"not null;default:0"` // 提示词命中违禁词被拦截的累计次数
-	LastLoginAt        *time.Time
-	LastLoginIP        string `gorm:"size:128"`
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	APIKeys            []APIKey `gorm:"foreignKey:UserID"`
-}
-
 // BannedWord is an admin-managed prompt blocklist entry. Generation requests
 // whose prompt contains Word (case-insensitive substring) are rejected before
 // reaching any provider; Hits counts how many requests each word blocked.
@@ -57,33 +30,17 @@ type BannedWordHit struct {
 	CreatedAt time.Time `gorm:"index"`
 }
 
-type APIKey struct {
-	ID         string `gorm:"primaryKey;size:32"`
-	UserID     string `gorm:"size:32;index;not null"`
-	Name       string `gorm:"size:100;not null"`
-	KeyPreview string `gorm:"size:32;not null"`
-	KeyHash    string `gorm:"size:255;uniqueIndex;not null"`
-	CreatedAt  time.Time
-	LastUsedAt *time.Time
-}
-
-type ShowcaseItem struct {
-	ID        string `gorm:"primaryKey;size:32"`
-	Kind      string `gorm:"size:32;index;not null"`
-	Title     string `gorm:"size:255"`
-	Subtitle  string `gorm:"size:255"`
-	Prompt    string `gorm:"type:text"`
-	Gradient  string `gorm:"type:text"`
-	Span      string `gorm:"size:100"`
-	Image     string `gorm:"size:500;index"`
-	Weight    int    `gorm:"not null;default:0"`
-	CreatedAt time.Time
-	UpdatedAt time.Time
-}
-
 type EventLog struct {
-	ID         string         `gorm:"primaryKey;size:32"`
-	RequestID  string         `gorm:"size:191;index"`
+	ID                 string `gorm:"primaryKey;size:32"`
+	APICredentialID    string `gorm:"size:32;index"`
+	RequestID          string `gorm:"size:191;index"`
+	RequestFingerprint string `gorm:"size:64"`
+	// ResponseFormat preserves the OpenAI image response contract across an
+	// accepted upstream task and a later /v1/images/tasks recovery.
+	ResponseFormat string `gorm:"size:16;not null;default:''"`
+	// MimeType is the payload-magic-detected artifact type, never a filename or
+	// upstream Content-Type guess.
+	MimeType   string         `gorm:"size:100;not null;default:''"`
 	TS         time.Time      `gorm:"index;not null"`
 	Kind       string         `gorm:"size:32;index;not null"`
 	Status     string         `gorm:"size:32;index;not null"`
@@ -106,17 +63,12 @@ type EventLog struct {
 	// keep showing which mailbox fulfilled the generation even after the account
 	// is deleted or re-imported under a different ID.
 	AccountEmail string  `gorm:"size:255"`
-	UserID       string  `gorm:"size:32;index"`
 	Cost         float64 `gorm:"not null;default:0"`
-	// Refunded marks that this event's up-front charge has already been credited
-	// back, so the normal failure path and the abandoned-purge sweep can never
-	// double-refund the same generation.
-	Refunded  bool   `gorm:"not null;default:false"`
-	ElapsedMS int    `gorm:"not null;default:0"`
-	File      string `gorm:"size:500;index"`
-	Error     string `gorm:"type:text"`
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ElapsedMS    int     `gorm:"not null;default:0"`
+	File         string  `gorm:"size:500;index"`
+	Error        string  `gorm:"type:text"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type ModelConfig struct {
@@ -147,9 +99,8 @@ type ModelConfig struct {
 	// sent to the upstream OpenAI-compatible API; the base_url + key live on the
 	// matching custom account (pool="custom", meta.base_url). Empty for built-ins.
 	UpstreamModel string `gorm:"size:255;not null;default:''"`
-	// Weight controls display order in the model dropdown / admin list: higher
-	// weight floats to the top (matches ShowcaseItem.Weight semantics). Ties fall
-	// back to created_at desc. Default 0.
+	// Weight controls display order in the model list: higher weights come first;
+	// ties fall back to created_at descending. Default 0.
 	Weight int `gorm:"not null;default:0;index"`
 	// GenerationCount is a persistent success counter, incremented once per
 	// successful generation. Independent of the event_log (which is subject to
@@ -166,23 +117,10 @@ func (m ModelConfig) EffectiveName() string {
 	return m.ID
 }
 
-type CDKCode struct {
-	Code       string  `gorm:"primaryKey;size:32"`
-	Amount     int     `gorm:"not null"`
-	Status     string  `gorm:"size:32;index;not null"`
-	Type       string  `gorm:"size:16;not null;default:normal;index"` // normal | marketing
-	BatchID    string  `gorm:"size:32;index"`                         // groups one generate call
-	Note       string  `gorm:"type:text"`
-	RedeemedBy *string `gorm:"size:32;index"`
-	RedeemedAt *time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-}
-
 type TokenAccount struct {
 	ID        string `gorm:"primaryKey;size:64"`
 	Pool      string `gorm:"size:64;index;not null"`
-	Value     string `gorm:"type:text"`
+	Value     string `gorm:"type:text;not null;default:''"`
 	Status    string `gorm:"size:32;index;not null"`
 	Fails     int    `gorm:"not null;default:0"`
 	FailTotal int    `gorm:"not null;default:0"`
@@ -241,66 +179,16 @@ type SiteSetting struct {
 	UpdatedAt time.Time
 }
 
+// AutoMigrateModels contains only retained operational tables. Identity,
+// provider-account, routing, quota, and dispatch tables are owned exclusively
+// by checksummed SQL migrations; adding them here can silently relax constraints
+// or change PostgreSQL column types on startup.
 func AutoMigrateModels() []any {
 	return []any{
-		&User{},
 		&BannedWord{},
 		&BannedWordHit{},
-		&APIKey{},
-		&ShowcaseItem{},
 		&EventLog{},
-		&ModelConfig{},
-		&CDKCode{},
-		&TokenAccount{},
 		&RefreshProfile{},
 		&SiteSetting{},
-		&StatCounter{},
-		&ConcurrencyGroup{},
-		&Order{},
 	}
-}
-
-// Order is a points-recharge order paid via 易支付 (epay). ID is our merchant
-// order number (out_trade_no). Status: pending | paid | cancelled. Unpaid orders
-// auto-cancel 30 min after creation (ExpiresAt). Besides epay recharges, the
-// table also records credit grants from admin manual adjustments (source=admin)
-// and CDK redemptions (source=cdk) as already-paid rows, so 订单管理 shows the
-// full credit history in one place.
-type Order struct {
-	ID          string    `gorm:"primaryKey;size:40"`
-	UserID      string    `gorm:"size:32;index;not null"`
-	Amount      float64   `gorm:"not null"`                              // 充值金额(元)
-	Points      int       `gorm:"not null"`                              // 到账积分
-	PayType     string    `gorm:"size:16"`                               // wxpay | alipay | admin | cdk
-	Status      string    `gorm:"size:16;index;not null"`                // pending | paid | cancelled
-	Source      string    `gorm:"size:16;index;not null;default:'epay'"` // epay | admin | cdk
-	Remark      string    `gorm:"type:text"`                             // e.g. 兑换码 code / 管理员操作说明
-	TradeNo     string    `gorm:"size:64;index"`                         // 易支付平台订单号
-	PayInfo     string    `gorm:"type:text"`                             // 二维码 url / 跳转 url
-	PayInfoType string    `gorm:"size:16"`                               // qrcode | jump | html | ...
-	ExpiresAt   time.Time `gorm:"index"`
-	PaidAt      *time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-}
-
-// ConcurrencyGroup caps how many generations a member user may run AT ONCE
-// (across their API key + 画图台). MaxConcurrency 0 = unlimited. Exactly one
-// group is IsDefault — new users are bound to it and it can't be deleted.
-type ConcurrencyGroup struct {
-	ID             string `gorm:"primaryKey;size:32"`
-	Name           string `gorm:"size:100;not null"`
-	MaxConcurrency int    `gorm:"not null;default:10"` // 0 = 不限制
-	IsDefault      bool   `gorm:"not null;default:false;index"`
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-}
-
-// StatCounter is a persistent monotonic counter (key → value), independent of the
-// event_log (which is retention-pruned / clearable). Used for the dashboard
-// cumulative cards (total/success/failed/image/video/api) so they never reset.
-type StatCounter struct {
-	Key       string `gorm:"primaryKey;size:64"`
-	Value     int64  `gorm:"not null;default:0"`
-	UpdatedAt time.Time
 }

@@ -29,7 +29,9 @@ export default defineConfig({
     proxy: {
       // Only the admin API is proxied — bare /admin/* is an SPA route now
       // (the admin shell), handled client-side by vue-router.
-      '/admin/api': { target: backend, changeOrigin: true, configure: forwardClientIp },
+      // Regex keeps the SPA route /admin/api-keys on the frontend while all
+      // real control-plane calls (/admin/api/...) still reach the backend.
+      '^/admin/api/': { target: backend, changeOrigin: true, configure: forwardClientIp },
       '/health': { target: backend, changeOrigin: true, configure: forwardClientIp },
       // Generated artifacts are served from /images.
       '/images': { target: backend, changeOrigin: true, configure: forwardClientIp },

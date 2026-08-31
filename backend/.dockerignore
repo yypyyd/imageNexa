@@ -3,4 +3,6 @@
 .env.*
 bin/
 data/
+api
+api.exe
 *.log

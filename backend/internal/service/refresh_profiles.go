@@ -55,10 +55,7 @@ func (s *RefreshProfileService) RefreshNow(ctx context.Context, id string) error
 		if secs > 3600 {
 			secs = 3600
 		}
-		msg := err.Error()
-		if len(msg) > 300 {
-			msg = msg[:300]
-		}
+		msg := safeGenerationErrorText(err)
 		_, _ = s.profiles.Update(ctx, id, map[string]any{
 			"last_error":           msg,
 			"consecutive_failures": failures,

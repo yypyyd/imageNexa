@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- Stage 1: build the Go binary from source ---
-FROM golang:1.26-alpine AS build
+FROM golang:1.26.6-alpine AS build
 WORKDIR /src
 RUN apk add --no-cache git
 # Cache deps first for faster rebuilds.
@@ -41,13 +41,19 @@ RUN apk add --no-cache ca-certificates tzdata wget chromium openssl nss-tools \
     && rm -f /tmp/globalsign-gcc-r3-dv-tls-ca-2020.der \
     && apk del openssl nss-tools
 WORKDIR /app
-COPY --from=build /out/api /app/api
-COPY scripts/oreate-chromium /usr/local/bin/oreate-chromium
+COPY --chown=chrome:chrome --from=build /out/api /app/api
+COPY --chown=chrome:chrome scripts/oreate-chromium /usr/local/bin/oreate-chromium
 # Local fallback for generated media / reference uploads (RustFS/S3 is primary).
 RUN mkdir -p /app/data/generated \
-    && chmod +x /app/api /usr/local/bin/oreate-chromium
+	&& chown -R chrome:chrome /app/data \
+	&& chmod +x /app/api /usr/local/bin/oreate-chromium
 ENV OREATE_CHROME=/usr/local/bin/oreate-chromium
+# Docker's default seccomp profile blocks Chromium's user namespaces. The
+# entire API already runs as the unprivileged chrome UID; browser processes
+# also receive an empty environment, ephemeral profile, parent-death signal,
+# and process-group teardown as compensating controls.
 ENV OREATE_NO_SANDBOX=true
 ENV HTTP_ADDR=0.0.0.0:6666
 EXPOSE 6666
+USER chrome
 ENTRYPOINT ["/app/api"]

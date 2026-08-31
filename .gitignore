@@ -39,6 +39,7 @@ api_test_video.py       # hardcoded API key
 node_modules/
 /frontend/dist/
 /frontend/.vite/
+/.playwright-cli/
 
 # Go build/module caches (regenerated)
 .gocache/

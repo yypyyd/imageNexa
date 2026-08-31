@@ -73,7 +73,7 @@ func applyDeAI(b []byte) ([]byte, error) {
 // jitterChannel applies contrast/brightness around mid-gray plus ±2 noise to a
 // 16-bit color channel, returning the clamped 8-bit value.
 func jitterChannel(v uint32, contrast, brightness float64, rng *rand.Rand) uint8 {
-	f := float64(v>>8)
+	f := float64(v >> 8)
 	f = (f-128.0)*contrast + 128.0 + brightness + (rng.Float64()-0.5)*4.0
 	if f < 0 {
 		f = 0

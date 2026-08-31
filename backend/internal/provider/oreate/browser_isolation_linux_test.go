@@ -35,3 +35,18 @@ func TestConfigureChromiumCommandOwnsProcessGroup(t *testing.T) {
 		t.Fatalf("WaitDelay = %v, want %v", cmd.WaitDelay, chromiumShutdownWait)
 	}
 }
+
+func TestConfigureChromiumCommandKeepsIsolationWhenAlreadyUnprivileged(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "/bin/true")
+	configureChromiumCommand(cmd, nil)
+
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid || cmd.SysProcAttr.Pdeathsig != syscall.SIGKILL {
+		t.Fatalf("unprivileged Chromium isolation = %#v", cmd.SysProcAttr)
+	}
+	if cmd.SysProcAttr.Credential != nil {
+		t.Fatalf("unexpected credential drop = %#v", cmd.SysProcAttr.Credential)
+	}
+	if cmd.Cancel == nil || cmd.WaitDelay != chromiumShutdownWait {
+		t.Fatal("unprivileged Chromium lost cancellation or wait controls")
+	}
+}

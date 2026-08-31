@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"backend/internal/netguard"
+
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/google/uuid"
@@ -423,37 +425,59 @@ func (c *Client) OpenAsset(ctx context.Context, token, url string) (io.ReadClose
 	if token == "" {
 		return nil, "", ErrAuth
 	}
+	allowedHosts := []string{"grok.com", "x.ai"}
+	current, err := netguard.ValidateAssetURL(ctx, url, allowedHosts)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: rejected asset URL", ErrTemporaryUpstream)
+	}
+	originalHost := strings.ToLower(current.Hostname())
 	// Artifact streaming is a non-submit request and therefore stays direct.
-	client, err := c.newDirectTLSClient()
+	client, err := c.newAssetTLSClient(allowedHosts)
 	if err != nil {
 		return nil, "", err
 	}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	req = req.WithContext(ctx)
-	req.Header = http.Header{
-		"user-agent": {userAgent},
-		"referer":    {origin + "/"},
-		"cookie":     {"sso=" + token + "; sso-rw=" + token},
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		resp.Body.Close()
-		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			return nil, "", fmt.Errorf("%w: asset %d", ErrAuth, resp.StatusCode)
+	for redirects := 0; redirects <= netguard.MaxRedirects; redirects++ {
+		req, requestErr := http.NewRequest(http.MethodGet, current.String(), nil)
+		if requestErr != nil {
+			return nil, "", requestErr
 		}
-		return nil, "", fmt.Errorf("%w: asset %d", ErrTemporaryUpstream, resp.StatusCode)
+		req = req.WithContext(ctx)
+		req.Header = http.Header{"user-agent": {userAgent}}
+		credentialSent := strings.EqualFold(current.Hostname(), originalHost)
+		if credentialSent {
+			req.Header.Set("referer", origin+"/")
+			req.Header.Set("cookie", "sso="+token+"; sso-rw="+token)
+		}
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, doErr)
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location := resp.Header.Get("Location")
+			resp.Body.Close()
+			if redirects == netguard.MaxRedirects || location == "" {
+				return nil, "", fmt.Errorf("%w: invalid asset redirect", ErrTemporaryUpstream)
+			}
+			current, err = netguard.ResolveRedirect(ctx, current, location, allowedHosts)
+			if err != nil {
+				return nil, "", fmt.Errorf("%w: rejected asset redirect", ErrTemporaryUpstream)
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			resp.Body.Close()
+			if credentialSent && (resp.StatusCode == 401 || resp.StatusCode == 403) {
+				return nil, "", fmt.Errorf("%w: asset %d", ErrAuth, resp.StatusCode)
+			}
+			return nil, "", fmt.Errorf("%w: asset %d", ErrTemporaryUpstream, resp.StatusCode)
+		}
+		body, contentType, guardErr := netguard.GuardStream(resp.Body, resp.Header.Get("Content-Type"), resp.ContentLength, netguard.MediaAny, netguard.MaxVideoBytes)
+		if guardErr != nil {
+			return nil, "", fmt.Errorf("%w: invalid media asset", ErrTemporaryUpstream)
+		}
+		return body, contentType, nil
 	}
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = "video/mp4"
-	}
-	return resp.Body, ct, nil
+	return nil, "", fmt.Errorf("%w: asset redirect limit", ErrTemporaryUpstream)
 }
 
 // download fetches the rendered artifact. The clip is already generated at this

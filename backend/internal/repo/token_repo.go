@@ -409,10 +409,6 @@ func (r *TokenRepository) DeleteByIDs(ctx context.Context, ids []string) (int64,
 	return res.RowsAffected, res.Error
 }
 
-// leonardoDailyTokens is the free-tier daily allowance restored at each reset.
-// A paid account's true balance is reconciled on its next successful render.
-const leonardoDailyTokens = 150
-
 // RecoverQuota reactivates quota-exhausted tokens whose reset time has passed.
 // Reset source: cached_quota_reset_after (upstream marker) first, else the
 // quota_recover_at fallback stamped when the token was marked quota-exhausted.
@@ -461,38 +457,6 @@ func (r *TokenRepository) RecoverQuota(ctx context.Context) ([]model.TokenAccoun
 		if t.Status == "quota" {
 			patch["status"] = "active"
 		}
-		// Leonardo's free tokens fully renew at each daily reset — restore the
-		// balance and advance the reset marker to the next 08:00 Beijing (== next
-		// UTC midnight), so the account is immediately usable instead of stuck at a
-		// stale 0. 积分号 (paid credits) renew monthly and are handled separately below.
-		if t.Pool == "leonardo" || t.Pool == "krea" || t.Pool == "imagine" {
-			meta := cloneMeta(t.Meta)
-			if t.Pool == "leonardo" && isPaidLeonardo(t.Meta) {
-				// 积分号:余额是点数,按上游 tokenRenewalDate 月度续期 —— 不能补成每日
-				// 免费额度,也不能把恢复时间改成次日 08:00。丢掉过期的余额,让 sweep 的
-				// Quota 探测写回上游真实点数与下一次续期时间。
-				delete(meta, "cached_quota_remaining")
-				meta["cached_quota_at"] = int(now.Unix())
-				patch["meta"] = meta
-				patch["cached_quota_reset_after"] = nextMonthlyReset(reset, now)
-				if _, err := r.Update(ctx, t.Pool, t.ID, patch); err != nil {
-					return recovered, err
-				}
-				recovered = append(recovered, *t)
-				continue
-			}
-			if t.Pool == "leonardo" {
-				meta["cached_quota_remaining"] = leonardoDailyTokens
-			} else {
-				// Krea/Imagine balances re-sync from upstream (billing-data / v1/credit)
-				// on next probe — drop the stale value so the account isn't shown as
-				// empty after reset.
-				delete(meta, "cached_quota_remaining")
-			}
-			meta["cached_quota_at"] = int(now.Unix())
-			patch["meta"] = meta
-			patch["cached_quota_reset_after"] = time.Unix((now.Unix()/86400+1)*86400, 0).UTC().Format(time.RFC3339)
-		}
 		if _, err := r.Update(ctx, t.Pool, t.ID, patch); err != nil {
 			return recovered, err
 		}
@@ -501,38 +465,12 @@ func (r *TokenRepository) RecoverQuota(ctx context.Context) ([]model.TokenAccoun
 	return recovered, nil
 }
 
-// isPaidLeonardo reports whether a Leonardo row is a 积分号 (paid credits, monthly
-// renewal) rather than a free 普通号 whose tokens renew daily. The marker is
-// written by the balance probe (applyLeonardoPlanMeta).
-func isPaidLeonardo(meta datatypes.JSONMap) bool {
-	if meta == nil {
-		return false
-	}
-	paid, _ := meta["paid_account"].(bool)
-	return paid
-}
-
-// nextMonthlyReset advances a past renewal marker by whole months until it is in
-// the future (积分号 renew monthly). Falls back to +1 month from now when the old
-// marker is unusable.
-func nextMonthlyReset(reset *time.Time, now time.Time) string {
-	next := now.AddDate(0, 1, 0)
-	if reset != nil {
-		next = *reset
-		for !next.After(now) {
-			next = next.AddDate(0, 1, 0)
-		}
-	}
-	return next.UTC().Format(time.RFC3339)
-}
-
 // RollResetMarkers advances a stale (past) daily-reset marker to its next future
 // occurrence — same time-of-day, +N whole days — for ACTIVE accounts of the given
 // daily-reset pools, so the 恢复时间 column always shows the upcoming reset rather
 // than yesterday's. Only active accounts are rolled: a 限额 account must keep its
 // past marker so RecoverQuota can recover it (rolling it forward early would
-// prevent recovery). Leonardo 积分号 are skipped — their renewal is monthly, so a
-// daily roll would show a wrong date. Returns the number advanced.
+// prevent recovery). Returns the number advanced.
 func (r *TokenRepository) RollResetMarkers(ctx context.Context, pools []string) (int, error) {
 	var items []model.TokenAccount
 	if err := r.db.WithContext(ctx).
@@ -550,14 +488,8 @@ func (r *TokenRepository) RollResetMarkers(ctx context.Context, pools []string) 
 			continue // unparseable or already in the future
 		}
 		next := *reset
-		if t.Pool == "leonardo" && isPaidLeonardo(t.Meta) {
-			for !next.After(now) {
-				next = next.AddDate(0, 1, 0)
-			}
-		} else {
-			for !next.After(now) {
-				next = next.Add(24 * time.Hour)
-			}
+		for !next.After(now) {
+			next = next.Add(24 * time.Hour)
 		}
 		if _, err := r.Update(ctx, t.Pool, t.ID, map[string]any{
 			"cached_quota_reset_after": next.UTC().Format(time.RFC3339),

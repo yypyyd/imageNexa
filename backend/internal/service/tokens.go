@@ -15,14 +15,12 @@ import (
 	"time"
 
 	"backend/internal/model"
+	"backend/internal/netguard"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
-	"backend/internal/provider/imagine"
-	"backend/internal/provider/krea"
-	"backend/internal/provider/leonardo"
 	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
@@ -37,13 +35,14 @@ var validTokenPools = map[string]string{
 	"adobe":    "adobe",
 	"byteplus": "byteplus",
 	"runway":   "runway",
-	"leonardo": "leonardo",
-	"krea":     "krea",
-	"imagine":  "imagine",
 	"grok":     "grok",
 	"oreate":   "oreate",
 	"custom":   "custom",
 }
+
+// ErrNotFound is retained as the control-plane service sentinel after the
+// legacy public-site service that originally declared it was removed.
+var ErrNotFound = gorm.ErrRecordNotFound
 
 const (
 	bytePlusCredentialFingerprintMetaKey = "byteplus_credential_fingerprint"
@@ -173,9 +172,6 @@ type TokenService struct {
 	byteplusPending bytePlusPendingStore
 	chatgpt         *chatgpt.Client
 	runway          *runway.Client
-	leonardo        *leonardo.Client
-	krea            *krea.Client
-	imagine         *imagine.Client
 	grok            *grok.Client
 	oreate          *oreate.Client
 	custom          *custom.Client
@@ -183,14 +179,11 @@ type TokenService struct {
 	// 10-worker _quota_check_pool) so a big paste doesn't fire hundreds of
 	// simultaneous upstream requests.
 	sem chan struct{}
-	// kreaActivating guards the once-per-day krea /app activation sweep so the 60s
-	// maintenance tick can't pile up overlapping sweeps.
-	kreaActivating atomic.Bool
 	// oreateRefreshing guards the bounded low-credit balance refresh sweep.
 	oreateRefreshing atomic.Bool
 }
 
-func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
+func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
 	service := &TokenService{
 		tokens:   tokens,
 		refresh:  refresh,
@@ -200,15 +193,12 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 		byteplusPending: repoBytePlusPendingStore{
 			tokens: tokens,
 		},
-		chatgpt:  chatGPTClient,
-		runway:   runwayClient,
-		leonardo: leonardoClient,
-		krea:     kreaClient,
-		imagine:  imagineClient,
-		grok:     grokClient,
-		oreate:   oreateClient,
-		custom:   customClient,
-		sem:      make(chan struct{}, 10),
+		chatgpt: chatGPTClient,
+		runway:  runwayClient,
+		grok:    grokClient,
+		oreate:  oreateClient,
+		custom:  customClient,
+		sem:     make(chan struct{}, 10),
 	}
 	// Avoid storing a typed nil pointer in the interface: pending imports should
 	// take the explicit no-client path rather than attempting a network probe.
@@ -240,91 +230,6 @@ func (s *TokenService) applyProxy(ctx context.Context) {
 	if s.oreate != nil {
 		s.oreate.SetProxy(proxy)
 	}
-}
-
-// RefreshExpiringTokens proactively renews krea/imagine sessions ~10min before
-// the access token expires (the providers' refreshLeadSeconds gate), so a dormant
-// account's rotating refresh_token never lapses. A dead token can't be recovered
-// and — for krea — also means the daily free-credit meter can't be re-created, so
-// keeping it perpetually fresh is what lets额度 auto-recover each day. Called by
-// the maintenance sweep; refresh only hits the network for near-expiry accounts.
-func (s *TokenService) RefreshExpiringTokens(ctx context.Context) {
-	items, err := s.tokens.List(ctx)
-	if err != nil {
-		return
-	}
-	s.applyProxy(ctx)
-	for i := range items {
-		it := items[i]
-		if it.Dead || it.Status == "disabled" {
-			continue
-		}
-		switch it.Pool {
-		case "krea":
-			if s.krea == nil {
-				continue
-			}
-			if _, rerr := kreaRefreshAndPersist(ctx, s.krea, s.tokens, it.ID, it.Value); rerr != nil && errors.Is(rerr, krea.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, "krea", it.ID, map[string]any{"status": "disabled", "dead": true})
-			}
-		case "imagine":
-			if s.imagine == nil {
-				continue
-			}
-			if _, rerr := imagineRefreshAndPersist(ctx, s.imagine, s.tokens, it.ID, it.Value); rerr != nil && errors.Is(rerr, imagine.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, "imagine", it.ID, map[string]any{"status": "disabled", "dead": true})
-			}
-		}
-	}
-}
-
-// ActivateKreaDue loads /app (Activate) for each krea account that hasn't been
-// synced since the most recent daily reset, then re-syncs its balance. Krea only
-// grants the daily free balance after the SSR app page loads, so without this an
-// always-active account (one that never went 限额, hence never recovered) would
-// read 0 / 402 after the reset. Runs in the background off the maintenance tick,
-// guarded so sweeps never overlap, bounded concurrency to avoid a reset burst.
-func (s *TokenService) ActivateKreaDue(ctx context.Context) {
-	if s.krea == nil {
-		return
-	}
-	if !s.kreaActivating.CompareAndSwap(false, true) {
-		return // a sweep is already running
-	}
-	bg := context.WithoutCancel(ctx)
-	go func() {
-		defer s.kreaActivating.Store(false)
-		items, err := s.tokens.ListByPool(bg, "krea")
-		if err != nil {
-			return
-		}
-		s.applyProxy(bg)
-		// Most recent UTC midnight (== last Beijing-08:00 reset). An account whose
-		// last sync (cached_quota_at) predates this hasn't been activated today.
-		lastReset := (time.Now().Unix() / 86400) * 86400
-		sem := make(chan struct{}, 4)
-		var wg sync.WaitGroup
-		for i := range items {
-			it := items[i]
-			if it.Dead || it.Status == "disabled" || strings.TrimSpace(it.Value) == "" {
-				continue
-			}
-			if at, ok := jsonMapInt(it.Meta, "cached_quota_at"); ok && int64(at) >= lastReset {
-				continue // already activated/synced since the last reset
-			}
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(it model.TokenAccount) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				actx, cancel := context.WithTimeout(bg, 90*time.Second)
-				defer cancel()
-				s.krea.Activate(actx, it.Value) // load /app → grant daily balance
-				_, _ = s.Quota(actx, "krea", it.ID)
-			}(it)
-		}
-		wg.Wait()
-	}()
 }
 
 func (s *TokenService) List(ctx context.Context) (map[string][]ginToken, error) {
@@ -471,203 +376,6 @@ func (s *TokenService) ImportRunwayToken(ctx context.Context, accessToken, token
 	return item, nil
 }
 
-// ImportLeonardoCookie imports a Leonardo account. Unlike Adobe (which keeps a
-// refresh profile to re-mint a bearer), Leonardo's stored credential IS the
-// cookie — the bearer is derived on demand at generation time via get-session —
-// so there's no refresh profile. Lands a pending row, then the worker validates
-// the cookie + hydrates email/quota off-thread.
-func (s *TokenService) ImportLeonardoCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, error) {
-	s.applyProxy(ctx)
-	cookie = cleanAdobeCookie(cookie) // same paste-cleanup (JSON / "Cookie:" prefix)
-	if cookie == "" {
-		return nil, errors.New("cookie required")
-	}
-	if !leonardo.IsLeonardoCookie(cookie) {
-		return nil, errors.New("not a leonardo cookie")
-	}
-	if tokenID == "" {
-		tokenID = newTokenID("leonardo")
-	}
-	meta := datatypes.JSONMap{"pending_check": true}
-	item, err := s.createToken(ctx, "leonardo", tokenID, cookie, "pending", meta)
-	if err != nil {
-		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			item, err = s.tokens.Update(ctx, "leonardo", tokenID, map[string]any{
-				"value":  cookie,
-				"status": "pending",
-				"meta":   meta,
-			})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-	// Fill 恢复时间 synchronously at import (next 08:00 Beijing) so it appears
-	// alongside 创建时间 immediately — not only after the background quota probe.
-	if updated, uerr := s.tokens.Update(ctx, "leonardo", tokenID, map[string]any{
-		"cached_quota_reset_after": leonardoResetAfter(""),
-	}); uerr == nil {
-		item = updated
-	}
-	go s.checkPendingLeonardo(tokenID, cookie)
-	return item, nil
-}
-
-// checkPendingLeonardo validates a freshly imported Leonardo cookie off-thread:
-// get-session must succeed (else the cookie is dead → disabled), then it hydrates
-// email/display-name + the token balance and the daily renewal time (so the
-// maintenance sweep can auto-recover a 限额 account).
-func (s *TokenService) checkPendingLeonardo(tokenID, cookie string) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("token import: leonardo pending check panicked for %s: %v", tokenID, r)
-		}
-	}()
-	s.sem <- struct{}{}
-	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	if s.leonardo == nil {
-		s.finishPending(ctx, "leonardo", tokenID, "active", false, nil)
-		return
-	}
-	s.applyProxy(ctx)
-	data, err := s.leonardo.FetchCreditsBalance(ctx, cookie)
-	if err != nil {
-		if errors.Is(err, leonardo.ErrAuth) {
-			s.finishPending(ctx, "leonardo", tokenID, "disabled", true, nil)
-			return
-		}
-		// network/proxy blip — benefit of the doubt, activate.
-		s.finishPending(ctx, "leonardo", tokenID, "active", false, nil)
-		return
-	}
-	seed := map[string]any{}
-	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
-		seed["account_email"] = em
-	}
-	if dn := strings.TrimSpace(stringValue(data["display_name"])); dn != "" {
-		seed["account_display_name"] = dn
-	}
-	// Always fill 恢复时间: use upstream's renewal time if present, else the next
-	// daily reset (08:00 Beijing == next UTC midnight).
-	seed["cached_quota_reset_after"] = leonardoResetAfter(stringValue(data["available_until"]))
-	if len(seed) > 0 {
-		_, _ = s.tokens.Update(ctx, "leonardo", tokenID, seed)
-	}
-	quotaMeta := map[string]any{}
-	if rem, ok := data["remaining"].(int); ok {
-		quotaMeta["cached_quota_remaining"] = rem
-		quotaMeta["cached_quota_at"] = int(time.Now().Unix())
-	}
-	if uid := strings.TrimSpace(stringValue(data["user_id"])); uid != "" {
-		quotaMeta["user_id"] = uid
-	}
-	// 普通号 / 积分号 的区分,决定重置逻辑(积分号不参与每日重置)。
-	applyLeonardoPlanMeta(quotaMeta, data)
-	s.finishPending(ctx, "leonardo", tokenID, "active", false, quotaMeta)
-}
-
-// ImportKreaCookie imports a Krea account. Like Leonardo the stored credential
-// IS the cookie (Supabase session); quota/generation forward it directly.
-func (s *TokenService) ImportKreaCookie(ctx context.Context, cookie string) (*model.TokenAccount, error) {
-	s.applyProxy(ctx)
-	cookie = cleanAdobeCookie(cookie) // same paste-cleanup (JSON / "Cookie:" prefix)
-	if cookie == "" {
-		return nil, errors.New("cookie required")
-	}
-	if !krea.IsKreaCookie(cookie) {
-		return nil, errors.New("not a krea cookie")
-	}
-	// Identity is (pool, email), NOT the caller-supplied id — a colliding id from
-	// the upstream importer would otherwise raise a spurious 23505/400 for a brand
-	// new account. Reuse the existing row for this email; else mint a fresh unique
-	// id (never trust the caller's id for a new row).
-	email := krea.EmailFromCookie(cookie)
-	var tokenID string
-	if existing, _ := s.tokens.GetByPoolEmail(ctx, "krea", email); existing != nil {
-		tokenID = existing.ID
-	} else {
-		tokenID = newTokenID("krea")
-	}
-	meta := datatypes.JSONMap{"pending_check": true}
-	item, err := s.createToken(ctx, "krea", tokenID, cookie, "pending", meta)
-	if err != nil {
-		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			item, err = s.tokens.Update(ctx, "krea", tokenID, map[string]any{
-				"value":  cookie,
-				"status": "pending",
-				"meta":   meta,
-			})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-	// Email is in the cookie (no network) — hydrate up front, plus 恢复时间.
-	seed := map[string]any{"cached_quota_reset_after": leonardoResetAfter("")}
-	if email != "" {
-		seed["account_email"] = email
-	}
-	if updated, uerr := s.tokens.Update(ctx, "krea", tokenID, seed); uerr == nil {
-		item = updated
-	}
-	go s.checkPendingKrea(tokenID, cookie)
-	return item, nil
-}
-
-// checkPendingKrea validates a freshly imported Krea cookie off-thread and
-// hydrates the credit balance. A 401 from billing-data → the cookie is dead.
-func (s *TokenService) checkPendingKrea(tokenID, cookie string) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("token import: krea pending check panicked for %s: %v", tokenID, r)
-		}
-	}()
-	s.sem <- struct{}{}
-	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	if s.krea == nil {
-		s.finishPending(ctx, "krea", tokenID, "active", false, nil)
-		return
-	}
-	s.applyProxy(ctx)
-	cookie, rerr := kreaRefreshAndPersist(ctx, s.krea, s.tokens, tokenID, cookie)
-	if rerr != nil {
-		if errors.Is(rerr, krea.ErrAuth) {
-			s.finishPending(ctx, "krea", tokenID, "disabled", true, nil)
-			return
-		}
-		s.finishPending(ctx, "krea", tokenID, "active", false, nil)
-		return
-	}
-	data, err := s.krea.FetchCreditsBalance(ctx, cookie)
-	if err != nil {
-		if errors.Is(err, krea.ErrAuth) {
-			s.finishPending(ctx, "krea", tokenID, "disabled", true, nil)
-			return
-		}
-		s.finishPending(ctx, "krea", tokenID, "active", false, nil)
-		return
-	}
-	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
-		_, _ = s.tokens.Update(ctx, "krea", tokenID, map[string]any{"account_email": em})
-	}
-	quotaMeta := map[string]any{}
-	if rem, ok := data["remaining"].(int); ok {
-		quotaMeta["cached_quota_remaining"] = rem
-		quotaMeta["cached_quota_at"] = int(time.Now().Unix())
-	}
-	s.finishPending(ctx, "krea", tokenID, "active", false, quotaMeta)
-}
-
 // ImportBytePlusCookie imports the complete browser Cookie header used by
 // BytePlus Lumina. The CSRF value is required in both the Cookie header and
 // X-Csrf-Token; storing only csrfToken is therefore insufficient.
@@ -715,7 +423,7 @@ func (s *TokenService) ImportBytePlusCookie(ctx context.Context, cookie string) 
 func (s *TokenService) checkPendingBytePlus(tokenID, cookie, fingerprint, version string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("token import: byteplus pending check panicked for %s: %v", tokenID, r)
+			log.Printf("token import: byteplus pending check panicked for %s", tokenID)
 		}
 	}()
 	s.sem <- struct{}{}
@@ -817,103 +525,6 @@ func firstString(values map[string]any, keys ...string) string {
 	return ""
 }
 
-// ImportImagineToken imports an Imagine.art account. The stored credential IS the
-// JSON {"token","refreshToken"}; quota/generation forward it (refreshing the
-// access token from the refreshToken when expired).
-func (s *TokenService) ImportImagineToken(ctx context.Context, cred string) (*model.TokenAccount, error) {
-	s.applyProxy(ctx)
-	cred = strings.TrimSpace(cred)
-	if cred == "" {
-		return nil, errors.New("credential required")
-	}
-	if !imagine.IsImagineToken(cred) {
-		return nil, errors.New("not an imagine token")
-	}
-	// Identity is (pool, email=userId), NOT the caller-supplied id — reuse the
-	// existing row for this account; else mint a fresh unique id.
-	email := imagine.EmailFromCred(cred)
-	var tokenID string
-	if existing, _ := s.tokens.GetByPoolEmail(ctx, "imagine", email); existing != nil {
-		tokenID = existing.ID
-	} else {
-		tokenID = newTokenID("imagine")
-	}
-	meta := datatypes.JSONMap{"pending_check": true}
-	item, err := s.createToken(ctx, "imagine", tokenID, cred, "pending", meta)
-	if err != nil {
-		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			item, err = s.tokens.Update(ctx, "imagine", tokenID, map[string]any{
-				"value":  cred,
-				"status": "pending",
-				"meta":   meta,
-			})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-	// userId is in the token (no network) — hydrate up front, plus 恢复时间.
-	// Imagine free credits renew daily like Krea (next UTC midnight = 08:00 北京).
-	seed := map[string]any{"cached_quota_reset_after": leonardoResetAfter("")}
-	if email != "" {
-		seed["account_email"] = email
-	}
-	if updated, uerr := s.tokens.Update(ctx, "imagine", tokenID, seed); uerr == nil {
-		item = updated
-	}
-	go s.checkPendingImagine(tokenID, cred)
-	return item, nil
-}
-
-// checkPendingImagine validates a freshly imported Imagine token off-thread and
-// hydrates the credit balance. A 401 from /v1/credit → the token is dead.
-func (s *TokenService) checkPendingImagine(tokenID, cred string) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("token import: imagine pending check panicked for %s: %v", tokenID, r)
-		}
-	}()
-	s.sem <- struct{}{}
-	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	if s.imagine == nil {
-		s.finishPending(ctx, "imagine", tokenID, "active", false, nil)
-		return
-	}
-	s.applyProxy(ctx)
-	cred, rerr := imagineRefreshAndPersist(ctx, s.imagine, s.tokens, tokenID, cred)
-	if rerr != nil {
-		if errors.Is(rerr, imagine.ErrAuth) {
-			s.finishPending(ctx, "imagine", tokenID, "disabled", true, nil)
-			return
-		}
-		s.finishPending(ctx, "imagine", tokenID, "active", false, nil)
-		return
-	}
-	data, err := s.imagine.FetchCreditsBalance(ctx, cred)
-	if err != nil {
-		if errors.Is(err, imagine.ErrAuth) {
-			s.finishPending(ctx, "imagine", tokenID, "disabled", true, nil)
-			return
-		}
-		s.finishPending(ctx, "imagine", tokenID, "active", false, nil)
-		return
-	}
-	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
-		_, _ = s.tokens.Update(ctx, "imagine", tokenID, map[string]any{"account_email": em})
-	}
-	quotaMeta := map[string]any{}
-	if rem, ok := data["remaining"].(int); ok {
-		quotaMeta["cached_quota_remaining"] = rem
-		quotaMeta["cached_quota_at"] = int(time.Now().Unix())
-	}
-	s.finishPending(ctx, "imagine", tokenID, "active", false, quotaMeta)
-}
-
 func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, *model.RefreshProfile, error) {
 	s.applyProxy(ctx)
 	cookie = cleanAdobeCookie(cookie)
@@ -975,7 +586,7 @@ func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID st
 func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("token import: adobe pending check panicked for %s: %v", tokenID, r)
+			log.Printf("token import: adobe pending check panicked for %s", tokenID)
 		}
 	}()
 	s.sem <- struct{}{}
@@ -993,7 +604,7 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 		s.finishPending(ctx, "adobe", tokenID, "disabled", true, nil)
 		_, _ = s.refresh.Update(ctx, tokenID, map[string]any{
 			"last_attempt_at":      time.Now(),
-			"last_error":           err.Error(),
+			"last_error":           safeGenerationErrorText(err),
 			"consecutive_failures": 1,
 		})
 		return
@@ -1048,7 +659,7 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 func (s *TokenService) checkPendingChatGPT(tokenID, accessToken string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("token import: chatgpt pending check panicked for %s: %v", tokenID, r)
+			log.Printf("token import: chatgpt pending check panicked for %s", tokenID)
 		}
 	}()
 	s.sem <- struct{}{}
@@ -1108,7 +719,7 @@ func (s *TokenService) probeAndFinishChatGPT(ctx context.Context, tokenID, acces
 		// generation-time auth handling is the authority for permanently dead JWTs.
 		s.finishPending(ctx, "chatgpt", tokenID, "active", false, map[string]any{
 			"quota_probe_unknown": true,
-			"quota_probe_error":   data["error"],
+			"quota_probe_error":   safeQuotaProbeError(data),
 		})
 		return
 	}
@@ -1127,7 +738,7 @@ func (s *TokenService) probeAndFinishChatGPT(ctx context.Context, tokenID, acces
 	// RecoverQuota 到点自动复活、重新探测,而不会永久搁置。
 	reset := strings.TrimSpace(stringValue(data["reset_after"]))
 	if reset == "" {
-		reset = leonardoResetAfter("")
+		reset = nextUTCResetAfter()
 	}
 	_, _ = s.tokens.Update(ctx, "chatgpt", tokenID, map[string]any{"cached_quota_reset_after": reset})
 	// remaining<=0(0 / 负数)→ 置「限额」,池子不再调度,到点自动恢复。
@@ -1211,6 +822,10 @@ func (s *TokenService) ReprobeStalePendingAdobe(ctx context.Context, older time.
 // counter can go NEGATIVE on over-used accounts, and "—"(absent)means unknown —
 // both clamp to 0, and 0 counts as exhausted (→ 限额). Returns (remaining≥0,
 // exhausted).
+func nextUTCResetAfter() string {
+	return time.Unix((time.Now().Unix()/86400+1)*86400, 0).UTC().Format(time.RFC3339)
+}
+
 func chatgptRemaining(data map[string]any) (int, bool) {
 	raw, ok := data["remaining"]
 	if !ok || raw == nil {
@@ -1230,7 +845,7 @@ func chatgptRemaining(data map[string]any) (int, bool) {
 func (s *TokenService) checkPendingRunway(tokenID, accessToken string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("token import: runway pending check panicked for %s: %v", tokenID, r)
+			log.Printf("token import: runway pending check panicked for %s", tokenID)
 		}
 	}()
 	s.sem <- struct{}{}
@@ -1313,7 +928,7 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("token import: grok pending check panicked for %s: %v", tokenID, r)
+			log.Printf("token import: grok pending check panicked for %s", tokenID)
 		}
 	}()
 	s.sem <- struct{}{}
@@ -1520,7 +1135,7 @@ func (s *TokenService) ImportOreateAccount(ctx context.Context, cookie, email, o
 func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account, claimFirstImage bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("token import: oreate pending check panicked for %s: %v", tokenID, r)
+			log.Printf("token import: oreate pending check panicked for %s", tokenID)
 		}
 	}()
 	s.sem <- struct{}{}
@@ -1539,29 +1154,25 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 	}
 	if profileErr == nil {
 		patch := map[string]any{}
+		metaPatch := map[string]any{}
 		if profile.Email != "" {
 			patch["account_email"] = profile.Email
 			account.Email = profile.Email
 		}
-		item, _ := s.tokens.Get(ctx, "oreate", tokenID)
-		if item != nil {
-			meta := cloneJSONMap(item.Meta)
-			if profile.OUID != "" {
-				meta["ouid"] = profile.OUID
-				account.OUID = profile.OUID
-			}
-			if profile.VIP != "" {
-				meta["vip"] = profile.VIP
-				account.VIP = profile.VIP
-			}
-			if profile.RegTS != 0 {
-				meta["reg_ts"] = profile.RegTS
-				account.RegTS = profile.RegTS
-			}
-			patch["meta"] = meta
+		if profile.OUID != "" {
+			metaPatch["ouid"] = profile.OUID
+			account.OUID = profile.OUID
 		}
-		if len(patch) > 0 {
-			_, _ = s.tokens.Update(ctx, "oreate", tokenID, patch)
+		if profile.VIP != "" {
+			metaPatch["vip"] = profile.VIP
+			account.VIP = profile.VIP
+		}
+		if profile.RegTS != 0 {
+			metaPatch["reg_ts"] = profile.RegTS
+			account.RegTS = profile.RegTS
+		}
+		if len(patch) > 0 || len(metaPatch) > 0 {
+			_ = s.tokens.UpdateMergingMeta(ctx, "oreate", tokenID, metaPatch, patch)
 		}
 	}
 	data, quotaErr := s.oreate.FetchCreditsBalance(ctx, account)
@@ -1606,7 +1217,7 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Account) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("token import: oreate first-image claim panicked for %s: %v", tokenID, r)
+			log.Printf("token import: oreate first-image claim panicked for %s", tokenID)
 		}
 	}()
 	if s.oreate == nil {
@@ -1635,7 +1246,7 @@ func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Acco
 	}
 	imageURL, claimErr := s.oreate.ClaimFirstImageBonus(ctx, account)
 	if claimErr != nil {
-		log.Printf("token import: oreate first-use bonus not claimed for %s: %v", tokenID, claimErr)
+		log.Printf("token import: oreate first-use bonus not claimed for %s (%s)", tokenID, safeGenerationErrorText(claimErr))
 	}
 	s.recordOreateFirstImage(ctx, tokenID, imageURL, claimErr)
 	// The grant lands asynchronously, so read the balance until it grows past the
@@ -1645,7 +1256,7 @@ func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Acco
 		data, balanceErr := s.oreate.FetchCreditsBalance(ctx, account)
 		if balanceErr == nil {
 			if _, persistErr := persistOreateQuotaSnapshot(ctx, s.tokens, tokenID, data, time.Now()); persistErr != nil {
-				log.Printf("token import: could not persist oreate balance for %s: %v", tokenID, persistErr)
+				log.Printf("token import: could not persist oreate balance for %s", tokenID)
 				return
 			}
 			if remaining, ok := data["remaining"].(int); ok && remaining > before {
@@ -1669,10 +1280,7 @@ func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Acco
 func (s *TokenService) recordOreateFirstImage(ctx context.Context, tokenID, imageURL string, claimErr error) {
 	state, detail := oreateFirstImageOK, ""
 	if claimErr != nil {
-		detail = claimErr.Error()
-		if len(detail) > oreateFirstImageErrMaxLen {
-			detail = detail[:oreateFirstImageErrMaxLen]
-		}
+		detail = safeGenerationErrorText(claimErr)
 		switch {
 		case errors.Is(claimErr, oreate.ErrSpamUser):
 			state = oreateFirstImageSpam
@@ -1687,7 +1295,7 @@ func (s *TokenService) recordOreateFirstImage(ctx context.Context, tokenID, imag
 		oreateFirstImageStateMetaKey: state,
 		oreateFirstImageErrMetaKey:   detail,
 	}, nil); err != nil {
-		log.Printf("token import: could not persist oreate first-image state for %s: %v", tokenID, err)
+		log.Printf("token import: could not persist oreate first-image state for %s", tokenID)
 	}
 }
 
@@ -1712,7 +1320,6 @@ const (
 	// attempt's outcome (and its upstream message) in the accounts list.
 	oreateFirstImageStateMetaKey = "oreate_first_image_state"
 	oreateFirstImageErrMetaKey   = "oreate_first_image_error"
-	oreateFirstImageErrMaxLen    = 200
 	oreateFirstImageRunning      = "running"
 	oreateFirstImageOK           = "ok"
 	oreateFirstImageSpam         = "spam"
@@ -1868,7 +1475,7 @@ func (s *TokenService) RefreshLowCreditOreateAccounts(ctx context.Context) {
 					return
 				}
 				if _, updateErr := persistOreateQuotaSnapshot(probeCtx, s.tokens, item.ID, data, time.Unix(int64(nowUnix), 0)); updateErr != nil {
-					log.Printf("oreate maintenance: could not persist refreshed quota for %s: %v", item.ID, updateErr)
+					log.Printf("oreate maintenance: could not persist refreshed quota for %s", item.ID)
 					return
 				}
 				refreshed.Add(1)
@@ -1887,7 +1494,7 @@ func (s *TokenService) RefreshLowCreditOreateAccounts(ctx context.Context) {
 // matched to custom models by id at generation time. Custom upstream calls use
 // direct server egress and do not inherit the residential proxy setting.
 func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey, models, name string, weight, concurrency int, tokenID string) (*model.TokenAccount, error) {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	baseURL = strings.TrimSpace(baseURL)
 	apiKey = strings.TrimSpace(apiKey)
 	// Edit mode: tokenID points at an existing custom account. base_url required;
 	// a blank key keeps the stored one.
@@ -1898,6 +1505,10 @@ func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey,
 		}
 		if baseURL == "" {
 			return nil, errors.New("base_url required")
+		}
+		baseURL, gerr = normalizeCustomBaseURL(ctx, baseURL)
+		if gerr != nil {
+			return nil, gerr
 		}
 		meta := datatypes.JSONMap{"base_url": baseURL}
 		if m := strings.TrimSpace(models); m != "" {
@@ -1916,6 +1527,10 @@ func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey,
 	}
 	if baseURL == "" || apiKey == "" {
 		return nil, errors.New("base_url and key required")
+	}
+	baseURL, err := normalizeCustomBaseURL(ctx, baseURL)
+	if err != nil {
+		return nil, err
 	}
 	meta := datatypes.JSONMap{"base_url": baseURL}
 	if m := strings.TrimSpace(models); m != "" {
@@ -1944,19 +1559,27 @@ func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey,
 	return item, nil
 }
 
+func normalizeCustomBaseURL(ctx context.Context, raw string) (string, error) {
+	parsed, err := netguard.ValidateAssetURL(ctx, strings.TrimSpace(raw), nil)
+	if err != nil {
+		return "", fmt.Errorf("invalid base_url: public HTTPS on port 443 is required: %w", err)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("invalid base_url: query and fragment are not allowed: %w", netguard.ErrUnsafeAssetURL)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
 // finishPending writes the terminal status/dead flag and clears the pending_check
 // marker (merging any cached quota) for a background import probe.
 func (s *TokenService) finishPending(ctx context.Context, pool, id, status string, dead bool, quotaMeta map[string]any) {
-	item, err := s.tokens.Get(ctx, pool, id)
-	if err != nil {
-		return
-	}
-	meta := cloneJSONMap(item.Meta)
-	meta["pending_check"] = false
+	metaPatch := map[string]any{"pending_check": false}
 	for k, v := range quotaMeta {
-		meta[k] = v
+		metaPatch[k] = v
 	}
-	patch := map[string]any{"status": status, "meta": meta}
+	patch := map[string]any{"status": status}
 	if dead {
 		patch["dead"] = true
 	} else if status == "active" || status == "quota" {
@@ -1965,7 +1588,7 @@ func (s *TokenService) finishPending(ctx context.Context, pool, id, status strin
 		// continues treating the freshly supplied, authenticated token as dead.
 		patch["dead"] = false
 	}
-	_, _ = s.tokens.Update(ctx, pool, id, patch)
+	_ = s.tokens.UpdateMergingMeta(ctx, pool, id, metaPatch, patch)
 }
 
 func (s *TokenService) Update(ctx context.Context, pool, id string, body map[string]any) (*model.TokenAccount, error) {
@@ -2105,19 +1728,17 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		// the conversation endpoint. Never permanently kill an account from this
 		// admin refresh path; a real generation 401 remains the final authority.
 		patch := map[string]any{}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
+		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 		unknown := boolValueWithDefault(data["unknown"], false)
 		rem, exhausted := chatgptRemaining(data)
 		// Only trust a definitive reading. An unknown read (403/429/timeout) must
 		// not clobber the cached balance with a bogus 0 nor sink the account.
 		if !unknown {
-			meta["cached_quota_remaining"] = rem
+			metaPatch["cached_quota_remaining"] = rem
 		}
-		patch["meta"] = meta
 		resetAfter := strings.TrimSpace(stringValue(data["reset_after"]))
 		if resetAfter == "" {
-			resetAfter = leonardoResetAfter("")
+			resetAfter = nextUTCResetAfter()
 		}
 		patch["cached_quota_reset_after"] = resetAfter
 		item.CachedQuotaResetAfter = resetAfter
@@ -2131,74 +1752,56 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 				patch["status"] = "active"
 			}
 		}
-		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-			item = updated
-		}
+		_ = s.tokens.UpdateMergingMeta(ctx, item.Pool, item.ID, metaPatch, patch)
 		return map[string]any{
 			"supported":       true,
 			"remaining":       rem,
 			"total":           nil,
 			"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
-			"quota_cached_at": meta["cached_quota_at"],
+			"quota_cached_at": metaPatch["cached_quota_at"],
 			"unchanged":       false,
 			"unknown":         boolValueWithDefault(data["unknown"], false),
-			"error":           data["error"],
+			"error":           safeQuotaProbeError(data),
 		}, nil
 	}
 	if poolToType(item.Pool) == "adobe" && s.adobe != nil {
 		data, err := s.adobe.FetchCreditsBalance(ctx, item.Value)
 		if err != nil {
-			if errors.Is(err, adobe.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled",
-					"dead":   true,
-					"fails":  gorm.Expr("fails + 1"),
-				})
-			}
+			// A balance endpoint can be independently challenged (notably generic
+			// 403s). Only a real generation verdict may disable an account/route.
 			return nil, err
 		}
 		patch := map[string]any{}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
+		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 		if remaining, ok := data["remaining"].(int); ok {
-			meta["cached_quota_remaining"] = remaining
+			metaPatch["cached_quota_remaining"] = remaining
 		}
 		if used, ok := data["used"].(int); ok {
-			meta["cached_quota_used"] = used
+			metaPatch["cached_quota_used"] = used
 		}
 		if total, ok := data["total"].(int); ok {
-			meta["cached_quota_total"] = total
+			metaPatch["cached_quota_total"] = total
 		}
-		patch["meta"] = meta
 		if resetAfter := strings.TrimSpace(stringValue(data["available_until"])); resetAfter != "" {
 			patch["cached_quota_reset_after"] = resetAfter
 			item.CachedQuotaResetAfter = resetAfter
 		}
-		if len(patch) > 0 {
-			if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-				item = updated
-			}
-		}
+		_ = s.tokens.UpdateMergingMeta(ctx, item.Pool, item.ID, metaPatch, patch)
 		return map[string]any{
 			"supported":       true,
 			"remaining":       data["remaining"],
 			"used":            data["used"],
 			"total":           data["total"],
 			"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
-			"quota_cached_at": meta["cached_quota_at"],
+			"quota_cached_at": metaPatch["cached_quota_at"],
 			"unchanged":       false,
 			"unknown":         boolValueWithDefault(data["unknown"], false),
-			"error":           data["error"],
+			"error":           safeQuotaProbeError(data),
 		}, nil
 	}
 	if poolToType(item.Pool) == "byteplus" && s.byteplus != nil {
 		data, err := s.byteplus.FetchCreditsBalance(ctx, item.Value)
 		if err != nil {
-			if errors.Is(err, byteplus.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
-				})
-			}
 			return nil, err
 		}
 		metaPatch := map[string]any{}
@@ -2240,181 +1843,29 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		return map[string]any{
 			"supported": true, "remaining": data["remaining"], "used": data["used"], "total": data["total"],
 			"reset_after": emptyToNil(item.CachedQuotaResetAfter), "quota_cached_at": quotaCachedAt,
-			"unchanged": false, "unknown": boolValueWithDefault(data["unknown"], false), "error": data["error"],
-		}, nil
-	}
-	if poolToType(item.Pool) == "krea" && s.krea != nil {
-		s.applyProxy(ctx)
-		cookie, rerr := kreaRefreshAndPersist(ctx, s.krea, s.tokens, item.ID, item.Value)
-		if rerr != nil {
-			if errors.Is(rerr, krea.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
-				})
-			}
-			return nil, rerr
-		}
-		data, err := s.krea.FetchCreditsBalance(ctx, cookie)
-		if err != nil {
-			if errors.Is(err, krea.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
-				})
-			}
-			return nil, err
-		}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
-		rem, hasRem := data["remaining"].(int)
-		if hasRem {
-			meta["cached_quota_remaining"] = rem
-		}
-		// 每日免费额度在 UTC 零点(北京 08:00)重置 —— 恢复时间始终重算为"下一个零点",
-		// 不保留已过期的旧值(否则过了 08:00 还一直显示今天 08:00,不会变明天)。
-		resetAfter := leonardoResetAfter("")
-		patch := map[string]any{"meta": meta, "cached_quota_reset_after": resetAfter}
-		// Krea 限额由生成时的 402 判定;一旦余额恢复(galactus 触发刷新后 >0),把之前
-		// 沉下去的 quota 翻回 active,避免有余额却卡在限额。
-		if item.Status == "quota" && hasRem && rem > 0 {
-			patch["status"] = "active"
-		}
-		_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
-		return map[string]any{
-			"supported":       true,
-			"remaining":       data["remaining"],
-			"used":            data["used"],
-			"total":           data["total"],
-			"reset_after":     emptyToNil(resetAfter),
-			"quota_cached_at": meta["cached_quota_at"],
-			"unchanged":       false,
-			"unknown":         boolValueWithDefault(data["unknown"], false),
-			"error":           data["error"],
-		}, nil
-	}
-	if poolToType(item.Pool) == "imagine" && s.imagine != nil {
-		s.applyProxy(ctx)
-		cred, rerr := imagineRefreshAndPersist(ctx, s.imagine, s.tokens, item.ID, item.Value)
-		if rerr != nil {
-			if errors.Is(rerr, imagine.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
-				})
-			}
-			return nil, rerr
-		}
-		data, err := s.imagine.FetchCreditsBalance(ctx, cred)
-		if err != nil {
-			if errors.Is(err, imagine.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
-				})
-			}
-			return nil, err
-		}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
-		rem, hasRem := data["remaining"].(int)
-		if hasRem {
-			meta["cached_quota_remaining"] = rem
-		}
-		// 每日免费额度在 UTC 零点(北京 08:00)重置 —— 恢复时间始终重算为"下一个零点",
-		// 不保留已过期的旧值(否则过了 08:00 还一直显示今天 08:00,不会变明天)。
-		resetAfter := leonardoResetAfter("")
-		patch := map[string]any{"meta": meta, "cached_quota_reset_after": resetAfter}
-		// 余额恢复(>0)→ 把之前因 402 沉下去的 quota 翻回 active。
-		if item.Status == "quota" && hasRem && rem > 0 {
-			patch["status"] = "active"
-		}
-		_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
-		return map[string]any{
-			"supported":       true,
-			"remaining":       data["remaining"],
-			"used":            data["used"],
-			"total":           data["total"],
-			"reset_after":     emptyToNil(resetAfter),
-			"quota_cached_at": meta["cached_quota_at"],
-			"unchanged":       false,
-			"unknown":         boolValueWithDefault(data["unknown"], false),
-			"error":           data["error"],
-		}, nil
-	}
-	if poolToType(item.Pool) == "leonardo" && s.leonardo != nil {
-		s.applyProxy(ctx)
-		data, err := s.leonardo.FetchCreditsBalance(ctx, item.Value)
-		if err != nil {
-			if errors.Is(err, leonardo.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled",
-					"dead":   true,
-					"fails":  gorm.Expr("fails + 1"),
-				})
-			}
-			return nil, err
-		}
-		patch := map[string]any{}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
-		if remaining, ok := data["remaining"].(int); ok {
-			meta["cached_quota_remaining"] = remaining
-			// Below the per-generation floor → sink to "限额" so it stops being
-			// scheduled. The daily renewal time (below) lets the sweep auto-recover.
-			if remaining < leonardoMinCredits && item.Status == "active" {
-				patch["status"] = "quota"
-			}
-		}
-		if uid := strings.TrimSpace(stringValue(data["user_id"])); uid != "" {
-			meta["user_id"] = uid
-		}
-		applyLeonardoPlanMeta(meta, data)
-		patch["meta"] = meta
-		// Daily reset (08:00 Beijing == next UTC midnight) unless upstream gives an
-		// explicit renewal time. Drives RecoverQuota.
-		resetAfter := leonardoResetAfter(stringValue(data["available_until"]))
-		patch["cached_quota_reset_after"] = resetAfter
-		_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
-		return map[string]any{
-			"supported":       true,
-			"remaining":       data["remaining"],
-			"used":            data["used"],
-			"total":           data["total"],
-			"reset_after":     emptyToNil(resetAfter),
-			"quota_cached_at": meta["cached_quota_at"],
-			"unchanged":       false,
-			"unknown":         boolValueWithDefault(data["unknown"], false),
-			"error":           data["error"],
+			"unchanged": false, "unknown": boolValueWithDefault(data["unknown"], false), "error": safeQuotaProbeError(data),
 		}, nil
 	}
 	if poolToType(item.Pool) == "runway" && s.runway != nil {
 		data, err := s.runway.FetchCreditsBalance(ctx, item.Value)
 		if err != nil {
-			if errors.Is(err, runway.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled",
-					"dead":   true,
-					"fails":  gorm.Expr("fails + 1"),
-				})
-			}
 			return nil, err
 		}
 		patch := map[string]any{}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
+		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 		if remaining, ok := data["remaining"].(int); ok {
 			// Refresh only updates the displayed balance number — it never flips
 			// status. Out-of-credits is judged at generation time (dead/401), so a
 			// refresh can't sink a runway account into a revivable "quota" state.
-			meta["cached_quota_remaining"] = remaining
+			metaPatch["cached_quota_remaining"] = remaining
 		}
 		if used, ok := data["used"].(int); ok {
-			meta["cached_quota_used"] = used
+			metaPatch["cached_quota_used"] = used
 		}
 		if total, ok := data["total"].(int); ok {
-			meta["cached_quota_total"] = total
+			metaPatch["cached_quota_total"] = total
 		}
-		patch["meta"] = meta
-		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-			item = updated
-		}
+		_ = s.tokens.UpdateMergingMeta(ctx, item.Pool, item.ID, metaPatch, patch)
 		// Recovery time stays the JWT expiry (cached at import) — Runway credits
 		// reset monthly, so the credits endpoint carries no reset timestamp.
 		return map[string]any{
@@ -2423,39 +1874,30 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			"used":            data["used"],
 			"total":           data["total"],
 			"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
-			"quota_cached_at": meta["cached_quota_at"],
+			"quota_cached_at": metaPatch["cached_quota_at"],
 			"unchanged":       false,
 			"unknown":         boolValueWithDefault(data["unknown"], false),
-			"error":           data["error"],
+			"error":           safeQuotaProbeError(data),
 		}, nil
 	}
 	if poolToType(item.Pool) == "grok" && s.grok != nil {
 		data, err := s.grok.FetchCreditsBalance(ctx, item.Value)
 		if err != nil {
-			if errors.Is(err, grok.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled",
-					"dead":   true,
-					"fails":  gorm.Expr("fails + 1"),
-				})
-			}
 			return nil, err
 		}
 		patch := map[string]any{}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
+		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 		if remaining, ok := data["remaining"].(int); ok {
 			// Refresh only updates the displayed credit number; never flips status.
 			// Out-of-credits is judged at generation time (dead/401, no renewal).
-			meta["cached_quota_remaining"] = remaining
+			metaPatch["cached_quota_remaining"] = remaining
 		}
 		if used, ok := data["used"].(int); ok {
-			meta["cached_quota_used"] = used
+			metaPatch["cached_quota_used"] = used
 		}
 		if total, ok := data["total"].(int); ok {
-			meta["cached_quota_total"] = total
+			metaPatch["cached_quota_total"] = total
 		}
-		patch["meta"] = meta
 		// Recovery time is the credits' weekly reset (when the grant refills) —
 		// purely informational, NOT a death deadline (liveness is judged by the
 		// subscriptions sweep / real 401s), so it's safe to refresh every time.
@@ -2463,29 +1905,22 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			patch["cached_quota_reset_after"] = reset
 			item.CachedQuotaResetAfter = reset
 		}
-		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-			item = updated
-		}
+		_ = s.tokens.UpdateMergingMeta(ctx, item.Pool, item.ID, metaPatch, patch)
 		return map[string]any{
 			"supported":       true,
 			"remaining":       data["remaining"],
 			"used":            data["used"],
 			"total":           data["total"],
 			"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
-			"quota_cached_at": meta["cached_quota_at"],
+			"quota_cached_at": metaPatch["cached_quota_at"],
 			"unchanged":       false,
 			"unknown":         boolValueWithDefault(data["unknown"], false),
-			"error":           data["error"],
+			"error":           safeQuotaProbeError(data),
 		}, nil
 	}
 	if poolToType(item.Pool) == "oreate" && s.oreate != nil {
 		data, err := s.oreate.FetchCreditsBalance(ctx, oreateAccountFromToken(*item))
 		if err != nil {
-			if errors.Is(err, oreate.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
-				})
-			}
 			return nil, err
 		}
 		now := time.Now()
@@ -2496,7 +1931,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		return map[string]any{
 			"supported": true, "remaining": data["remaining"], "used": data["used"], "total": data["total"],
 			"reset_after": emptyToNil(item.CachedQuotaResetAfter), "quota_cached_at": int(now.Unix()),
-			"unchanged": false, "unknown": false, "status": item.Status, "dead": item.Dead, "error": data["error"],
+			"unchanged": false, "unknown": false, "status": item.Status, "dead": item.Dead, "error": safeQuotaProbeError(data),
 		}, nil
 	}
 	remaining, hasRemaining := jsonMapFloat(item.Meta, "cached_quota_remaining")
@@ -2671,8 +2106,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 	if item.Meta != nil {
 		teamID = strings.TrimSpace(stringValue(item.Meta["team_id"]))
 	}
-	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "byteplus" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok" || typeLabel == "oreate"
-	paidPlan, _ := jsonMapBool(item.Meta, "paid_account")
+	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "byteplus" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "oreate"
 	firstImageAt, _ := jsonMapInt(item.Meta, oreateFirstImageAtMetaKey)
 	firstImageState := strings.TrimSpace(stringValue(item.Meta[oreateFirstImageStateMetaKey]))
 	if firstImageState == "" && firstImageAt != 0 {
@@ -2712,12 +2146,8 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"needs_reset_fetch": typeLabel == "adobe" && item.Status == "active" && strings.TrimSpace(item.CachedQuotaResetAfter) == "",
 		"weight":            item.Weight,
 		"concurrency":       item.Concurrency,
-		// Leonardo 积分号 (paid credits, monthly renewal) vs 普通号 (daily free tokens)
-		// — surfaced so the accounts table can label them; nil for other providers.
-		"plan":      emptyToNil(strings.TrimSpace(stringValue(item.Meta["plan"]))),
-		"paid_plan": paidPlan,
-		"base_url":  emptyToNil(strings.TrimSpace(stringValue(item.Meta["base_url"]))),
-		"models":    strings.TrimSpace(stringValue(item.Meta["models"])),
+		"base_url":          emptyToNil(strings.TrimSpace(stringValue(item.Meta["base_url"]))),
+		"models":            strings.TrimSpace(stringValue(item.Meta["models"])),
 		// Import-time image (oreate only): state + upstream message so the table can
 		// show whether the account ever generated and claimed its first-use bonus.
 		"first_image":       emptyToNil(firstImageState),
@@ -2893,15 +2323,6 @@ func newTokenID(pool string) string {
 	}
 	if pool == "runway" {
 		prefix = "RW"
-	}
-	if pool == "leonardo" {
-		prefix = "LN"
-	}
-	if pool == "krea" {
-		prefix = "KR"
-	}
-	if pool == "imagine" {
-		prefix = "IM"
 	}
 	if pool == "oreate" {
 		prefix = "OR"

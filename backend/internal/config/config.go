@@ -1,32 +1,40 @@
 package config
 
 import (
+	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type Config struct {
-	AppEnv            string
-	HTTPAddr          string
-	PublicBaseURL     string
-	AppTitle          string
-	PostgresDSN       string
-	RedisAddr         string
-	RedisPassword     string
-	RedisDB           int
-	SessionCookieName string
-	CookieSecure      bool
-	SessionTTL        time.Duration
-	SessionSlideAfter time.Duration
-	CORSOrigins       []string
-	GeneratedRoot     string
-	RustFSEndpoint    string
-	RustFSBucket      string
-	RustFSAccessKey   string
-	RustFSSecretKey   string
+	AppEnv              string
+	HTTPAddr            string
+	PublicBaseURL       string
+	AppTitle            string
+	PostgresDSN         string
+	RedisAddr           string
+	RedisPassword       string
+	RedisDB             int
+	SessionCookieName   string
+	CookieSecure        bool
+	SessionTTL          time.Duration
+	SessionSlideAfter   time.Duration
+	CORSOrigins         []string
+	TrustedProxyCIDRs   []netip.Prefix
+	AdminBootstrapToken string
+	GeneratedRoot       string
+	RustFSEndpoint      string
+	RustFSBucket        string
+	RustFSAccessKey     string
+	RustFSSecretKey     string
 }
 
 func Load() (*Config, error) {
@@ -37,20 +45,31 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	appEnv := envString("APP_ENV", "development")
+	trustedProxyCIDRs, err := parseCIDRs(envList("TRUSTED_PROXY_CIDRS", []string{
+		"127.0.0.0/8",
+		"::1/128",
+	}))
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
-		AppEnv:            envString("APP_ENV", "development"),
-		HTTPAddr:          envString("HTTP_ADDR", ":6061"),
-		PublicBaseURL:     strings.TrimRight(envString("PUBLIC_BASE_URL", ""), "/"),
-		AppTitle:          envString("APP_TITLE", "Vivid AI"),
-		PostgresDSN:       envString("POSTGRES_DSN", "host=127.0.0.1 user=postgres password=postgres dbname=vivid_ai port=5432 sslmode=disable TimeZone=Asia/Shanghai"),
-		RedisAddr:         envString("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword:     envString("REDIS_PASSWORD", ""),
-		RedisDB:           envInt("REDIS_DB", 0),
-		SessionCookieName: envString("SESSION_COOKIE_NAME", "vivid_session"),
-		CookieSecure:      envBool("COOKIE_SECURE", false),
-		SessionTTL:        time.Duration(envInt("SESSION_TTL_HOURS", 24)) * time.Hour,
-		SessionSlideAfter: time.Duration(envInt("SESSION_SLIDE_AFTER_HOURS", 22)) * time.Hour,
-		CORSOrigins:       envList("CORS_ORIGINS", []string{"http://localhost:5173", "http://127.0.0.1:5173"}),
+		AppEnv:              appEnv,
+		HTTPAddr:            envString("HTTP_ADDR", ":6061"),
+		PublicBaseURL:       strings.TrimRight(envString("PUBLIC_BASE_URL", ""), "/"),
+		AppTitle:            envString("APP_TITLE", "2API"),
+		PostgresDSN:         envString("POSTGRES_DSN", "host=127.0.0.1 user=postgres password=postgres dbname=vivid_ai port=5432 sslmode=disable TimeZone=Asia/Shanghai"),
+		RedisAddr:           envString("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:       envString("REDIS_PASSWORD", ""),
+		RedisDB:             envInt("REDIS_DB", 0),
+		SessionCookieName:   envString("SESSION_COOKIE_NAME", "twoapi_admin_session"),
+		CookieSecure:        envBool("COOKIE_SECURE", appEnv != "development"),
+		SessionTTL:          time.Duration(envInt("SESSION_TTL_HOURS", 24)) * time.Hour,
+		SessionSlideAfter:   time.Duration(envInt("SESSION_SLIDE_AFTER_HOURS", 22)) * time.Hour,
+		CORSOrigins:         envList("CORS_ORIGINS", []string{"http://localhost:5173", "http://127.0.0.1:5173"}),
+		TrustedProxyCIDRs:   trustedProxyCIDRs,
+		AdminBootstrapToken: envString("ADMIN_BOOTSTRAP_TOKEN", ""),
 		GeneratedRoot: filepath.Clean(envString(
 			"GENERATED_ROOT",
 			// vivid-ai's own data dir (backend/data/generated) — NOT the Python
@@ -63,8 +82,164 @@ func Load() (*Config, error) {
 		RustFSAccessKey: envString("RUSTFS_ACCESS_KEY", ""),
 		RustFSSecretKey: envString("RUSTFS_SECRET_KEY", ""),
 	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 
 	return cfg, nil
+}
+
+func (c *Config) validate() error {
+	appEnv := strings.ToLower(strings.TrimSpace(c.AppEnv))
+	if appEnv == "development" {
+		return nil
+	}
+	if appEnv != "production" {
+		return fmt.Errorf("APP_ENV must be either development or production")
+	}
+	if err := validateProductionOrigin("PUBLIC_BASE_URL", c.PublicBaseURL); err != nil {
+		return err
+	}
+	if len(c.CORSOrigins) == 0 {
+		return fmt.Errorf("CORS_ORIGINS must contain at least one HTTPS origin in production")
+	}
+	for _, origin := range c.CORSOrigins {
+		if err := validateProductionOrigin("CORS_ORIGINS", origin); err != nil {
+			return err
+		}
+	}
+	if !c.CookieSecure {
+		return fmt.Errorf("COOKIE_SECURE must be true in production")
+	}
+	if err := validatePostgresDSN(c.PostgresDSN); err != nil {
+		return err
+	}
+	if err := validateServiceEndpoint("RUSTFS_ENDPOINT", c.RustFSEndpoint); err != nil {
+		return err
+	}
+	if err := validateIdentifier("RUSTFS_BUCKET", c.RustFSBucket); err != nil {
+		return err
+	}
+	for _, secret := range []struct {
+		name   string
+		value  string
+		minLen int
+	}{
+		{name: "ADMIN_BOOTSTRAP_TOKEN", value: c.AdminBootstrapToken, minLen: 32},
+		{name: "RUSTFS_ACCESS_KEY", value: c.RustFSAccessKey, minLen: 16},
+		{name: "RUSTFS_SECRET_KEY", value: c.RustFSSecretKey, minLen: 32},
+	} {
+		if err := validateProductionSecret(secret.name, secret.value, secret.minLen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateProductionOrigin(name, raw string) error {
+	value := strings.TrimSpace(raw)
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+		return fmt.Errorf("%s must be an absolute HTTPS origin in production", name)
+	}
+	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s must not contain a path, query, user info, or fragment in production", name)
+	}
+	if isLocalHostname(parsed.Hostname()) {
+		return fmt.Errorf("%s must not use a loopback or localhost origin in production", name)
+	}
+	if err := validateURLPort(name, parsed); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateServiceEndpoint(name, raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+		return fmt.Errorf("%s must be an absolute HTTP(S) endpoint in production", name)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s must not contain a query, user info, or fragment in production", name)
+	}
+	if err := validateURLPort(name, parsed); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateURLPort(name string, parsed *url.URL) error {
+	if parsed == nil || parsed.Port() == "" {
+		return nil
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%s contains an invalid port in production", name)
+	}
+	return nil
+}
+
+func validatePostgresDSN(raw string) error {
+	parsed, err := pgx.ParseConfig(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("POSTGRES_DSN is invalid in production")
+	}
+	if err := validateProductionSecret("POSTGRES_DSN password", parsed.Password, 16); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateIdentifier(name, raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" || exampleValue(value) {
+		return fmt.Errorf("%s is required and cannot use an example value in production", name)
+	}
+	return nil
+}
+
+func validateProductionSecret(name, raw string, minLen int) error {
+	value := strings.TrimSpace(raw)
+	if len([]byte(value)) < minLen || exampleValue(value) {
+		return fmt.Errorf("%s must be at least %d bytes and cannot use a default or example value in production", name, minLen)
+	}
+	return nil
+}
+
+func exampleValue(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if strings.Contains(normalized, "replace-with-") || strings.Contains(normalized, "changeme") || strings.Contains(normalized, "example") {
+		return true
+	}
+	switch normalized {
+	case "postgres", "password", "secret", "admin", "rustfs", "minioadmin":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLocalHostname(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return false
+}
+
+func parseCIDRs(values []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("invalid TRUSTED_PROXY_CIDRS entry %q: %w", value, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
 
 // loadDotEnv loads a .env file (KEY=VALUE per line) into the process environment

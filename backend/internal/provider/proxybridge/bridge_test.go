@@ -23,8 +23,8 @@ func TestBridgeAuthenticatesUpstreamConnect(t *testing.T) {
 	}))
 	defer target.Close()
 
-	const username, password = "proxy-user", "proxy-pass"
-	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+	const proxyUser, proxyPass = "proxy-user", "proxy-pass"
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(proxyUser+":"+proxyPass))
 	var authenticated atomic.Bool
 	upstreamProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Proxy-Authorization") != wantAuth {
@@ -62,7 +62,7 @@ func TestBridgeAuthenticatesUpstreamConnect(t *testing.T) {
 	}))
 	defer upstreamProxy.Close()
 
-	rawProxy := "http://" + username + ":" + password + "@" + strings.TrimPrefix(upstreamProxy.URL, "http://")
+	rawProxy := "http://" + proxyUser + ":" + proxyPass + "@" + strings.TrimPrefix(upstreamProxy.URL, "http://")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	bridge, err := Start(ctx, rawProxy)
@@ -96,12 +96,12 @@ func TestBridgeAuthenticatesUpstreamConnect(t *testing.T) {
 }
 
 func TestStartErrorDoesNotExposeCredentials(t *testing.T) {
-	const secret = "credential-that-must-not-leak"
-	_, err := Start(context.Background(), "socks5://user:"+secret+"@proxy.example:1080")
+	const credentialSentinel = "credential-that-must-not-leak"
+	_, err := Start(context.Background(), "socks5://user:"+credentialSentinel+"@proxy.example:1080")
 	if err == nil {
 		t.Fatal("authenticated SOCKS proxy unexpectedly accepted")
 	}
-	if strings.Contains(err.Error(), secret) {
+	if strings.Contains(err.Error(), credentialSentinel) {
 		t.Fatalf("error disclosed proxy credentials: %v", err)
 	}
 }

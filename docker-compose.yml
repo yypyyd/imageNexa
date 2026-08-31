@@ -1,21 +1,18 @@
-# image2api — one-command stack: PostgreSQL + Redis + RustFS (S3) + backend
-# (built from source) + frontend/nginx (HTTP only on port 2000). Self-contained:
+# 2API stack: PostgreSQL + Redis + RustFS + API + admin SPA.
+# Copy .env.example to .env, replace every secret, then run:
 #   docker compose up -d --build
-# No .env needed — all values are inline below. TLS + domain are handled by YOUR
-# OWN reverse proxy in front of the web container (host port 2000).
-# ⚠ Before exposing to production, change the passwords/keys (POSTGRES_PASSWORD,
-#   RUSTFS_ACCESS_KEY/SECRET_KEY) and set CORS_ORIGINS to your real site origin.
+# TLS terminates at your reverse proxy in front of host port 2000.
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: vivid_ai
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: change-me-postgres
+      POSTGRES_DB: ${POSTGRES_DB:-vivid_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d vivid_ai"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -34,13 +31,13 @@ services:
     restart: unless-stopped
 
   # RustFS — S3-compatible object storage. The backend talks plain S3 (v4-signed)
-  # on port 9000. Media is served (cookie-authed) via the backend's /images
-  # proxy, so the bucket stays private.
+  # on port 9000. Generated media is served through Bearer-protected /v1 content
+  # endpoints, so the bucket stays private.
   rustfs:
     image: rustfs/rustfs:latest
     environment:
-      RUSTFS_ACCESS_KEY: vividai
-      RUSTFS_SECRET_KEY: vividai-secret-change-me
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in .env}
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_VOLUMES: /data
     volumes:
@@ -53,12 +50,16 @@ services:
     image: minio/mc:latest
     depends_on:
       - rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in .env}
+      RUSTFS_BUCKET: ${RUSTFS_BUCKET:-twoapi}
     entrypoint: >
       /bin/sh -c "
-      until mc alias set s3 http://rustfs:9000 vividai vividai-secret-change-me; do
+      until mc alias set s3 http://rustfs:9000 $$RUSTFS_ACCESS_KEY $$RUSTFS_SECRET_KEY; do
         echo 'waiting for rustfs...'; sleep 2;
       done;
-      mc mb -p s3/vivid-ai || true;
+      mc mb -p s3/$$RUSTFS_BUCKET || true;
       echo 'bucket ready';
       "
     restart: "no"
@@ -68,26 +69,25 @@ services:
     build:
       context: ./backend
     environment:
-      APP_ENV: production
-      APP_TITLE: image2api
+      APP_ENV: ${APP_ENV:-production}
+      APP_TITLE: ${APP_TITLE:-2API}
       HTTP_ADDR: 0.0.0.0:6666
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
-      POSTGRES_DSN: host=postgres user=postgres password=change-me-postgres dbname=vivid_ai port=5432 sslmode=disable TimeZone=Asia/Shanghai
+      POSTGRES_DSN: host=postgres user=${POSTGRES_USER:-postgres} password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env} dbname=${POSTGRES_DB:-vivid_ai} port=5432 sslmode=disable TimeZone=Asia/Shanghai
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: ""
       REDIS_DB: "0"
       RUSTFS_ENDPOINT: http://rustfs:9000
-      RUSTFS_BUCKET: vivid-ai
-      RUSTFS_ACCESS_KEY: vividai
-      RUSTFS_SECRET_KEY: vividai-secret-change-me
-      # Optional ChatGPT-only full-path proxy. Bootstrap, quota, uploads,
-      # generation, polling, and protected asset downloads all use it.
-      # Optional Grok-only proxy (does not affect other providers). Use HTTP(S)
-      # when grok-4.5 Build OAuth/chat must also traverse the proxy.
+      RUSTFS_BUCKET: ${RUSTFS_BUCKET:-twoapi}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in .env}
       # Set to the URL your reverse proxy serves the site on (comma-separated).
-      CORS_ORIGINS: http://localhost:2000
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:2000}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-twoapi_admin_session}
+      ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:?set ADMIN_BOOTSTRAP_TOKEN in .env}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.16.0.0/12,127.0.0.0/8,::1/128}
       # true only if your reverse proxy serves HTTPS; false for plain HTTP.
-      COOKIE_SECURE: "false"
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
     volumes:
       - generated:/app/data/generated
     depends_on:
@@ -98,10 +98,11 @@ services:
       createbucket:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:6666/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:6666/health/ready"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 15s
     restart: unless-stopped
 
   web:
@@ -112,7 +113,8 @@ services:
     ports:
       - "2000:2000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

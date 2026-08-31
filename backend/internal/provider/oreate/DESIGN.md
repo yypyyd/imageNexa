@@ -154,8 +154,9 @@ the listener, rejects late registrations, and closes both ends of every active
 tunnel; relying on `http.Server.Close` alone would leave hijacked connections
 outside the server lifecycle.
 
-On Linux, the backend starts Chromium as the dedicated `chrome` UID with an
-empty environment, a temporary chromedp profile, and a parent-death signal. The
+On Linux, the container runs the backend and Chromium as the dedicated,
+unprivileged `chrome` UID. Chromium starts with an empty environment, a
+temporary chromedp profile, and a parent-death signal. The
 runtime wrapper uses `exec`, so Chromium replaces the wrapper instead of
 becoming its child. Each browser is also a process-group leader: context
 cancellation or signer timeout kills the complete browser process group, and
@@ -164,7 +165,7 @@ runs with a container init process to reap any Chromium descendant that exits
 after being orphaned. Chromium is an Oreate-only dependency; no other provider
 starts it. The runtime wrapper exposes only `HOME`, `PATH`, and locale. Docker's
 default seccomp profile prevents Chromium namespaces, so the
-already-unprivileged child uses `--no-sandbox`; the dedicated UID, empty
+already-unprivileged process uses `--no-sandbox`; the dedicated UID, empty
 environment, ephemeral profile, and restricted egress are mandatory
 compensating controls.
 

@@ -1,9 +1,8 @@
-// Light/dark theme state. Default is LIGHT. The choice persists in localStorage
-// and is reflected as a `dark` class on <html>, which drives the CSS-variable
-// palette in style.css (and the conditional `.public-dark` override layer).
+// Light/dark theme is the only local preference stored in localStorage.
+// Administrator session credentials remain in an HttpOnly cookie.
 import { ref } from 'vue'
 
-const KEY = 'gw_theme'
+const KEY = '2api_theme'
 const mql = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null
 
 function systemTheme() {

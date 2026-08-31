@@ -13,10 +13,12 @@ server {
 
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
+    # Append the actual TCP peer. The backend walks this chain from right to
+    # left and honors forwarded hops only while they are in TRUSTED_PROXY_CIDRS.
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    # Preserve HTTPS from an outer TLS terminator. Direct access has no incoming
-    # header and correctly falls back to the internal HTTP scheme in the app.
-    proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    # Never forward a client-supplied scheme. PUBLIC_BASE_URL is authoritative
+    # for public links when TLS terminates at an outer reverse proxy.
+    proxy_set_header X-Forwarded-Proto $scheme;
 
     # video / large-image generation can block minutes — avoid the 60s 504.
     proxy_connect_timeout 600s;
@@ -37,14 +39,14 @@ server {
 
     # ---- API / media / health -> backend ----
     location ^~ /admin/api/ { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
-    location ^~ /images/    { proxy_pass http://backend:6666; }
-    location = /health      { proxy_pass http://backend:6666; }
+    location = /health/live  { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
+    location = /health/ready { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
     # /v1 is per-API-key authenticated — never cache.
     location ^~ /v1/ {
         proxy_pass http://backend:6666;
-        # Sync image generation emits JSON whitespace heartbeats before the
-        # final object. Forward each chunk immediately so outer CDNs and API
-        # clients do not treat a healthy long-running request as idle.
+        # Stream chat SSE and media responses without nginx buffering. Sync
+        # image generation still waits for one final JSON response so provider
+        # failures retain their real non-2xx HTTP status.
         proxy_buffering off;
         proxy_cache off;
         add_header Cache-Control "no-store" always;

@@ -407,9 +407,15 @@ func (c *Client) apiJSON(ctx context.Context, client tlsclient.HttpClient, token
 		return nil, err
 	}
 	switch {
-	case resp.StatusCode == 401 || resp.StatusCode == 403:
-		// Rate-limit (403) is treated as a dead account too, same as a 401.
-		return nil, fmt.Errorf("%w: %s %d %s", ErrAuth, path, resp.StatusCode, clip(raw, 200))
+	case resp.StatusCode == 401:
+		return nil, fmt.Errorf("%w: %s %d", ErrAuth, path, resp.StatusCode)
+	case resp.StatusCode == 403 && runwayDefinitiveAuth(raw):
+		return nil, fmt.Errorf("%w: %s %d", ErrAuth, path, resp.StatusCode)
+	case resp.StatusCode == 403:
+		// A bare 403 can be edge/risk/rate-limit policy and is not evidence that
+		// the durable account credential is invalid. Never destructively disable
+		// an account unless the response carries a definitive token verdict.
+		return nil, fmt.Errorf("%w: %s 403", ErrTemporaryUpstream, path)
 	case resp.StatusCode == 429:
 		return nil, fmt.Errorf("%w: %s 429 %s", ErrQuotaExhausted, path, clip(raw, 200))
 	case resp.StatusCode >= 500:

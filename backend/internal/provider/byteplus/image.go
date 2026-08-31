@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"backend/internal/netguard"
 )
 
 const (
@@ -153,22 +155,43 @@ func (c *Client) GenerateImage(ctx context.Context, cookie string, request Image
 	}
 
 	// From this point onward create_task has been accepted and must never be
-	// repeated. Polling and downloading share one bounded post-acceptance window.
+	// repeated. Keep the post-acceptance path in ResumeImageTask so a process
+	// restart or a later /v1/images/tasks poll can continue this exact task id
+	// without replaying the non-idempotent submission.
+	asset, meta, err := c.ResumeImageTask(ctx, cookie, parentTaskID, request.DownloadResult)
+	if meta != nil {
+		meta["model"] = spec.Key
+		meta["model_id"] = spec.ID
+	}
+	return asset, meta, err
+}
+
+// ResumeImageTask continues an already accepted Lumina parent task. It never
+// uploads references and never calls create_task, which makes it safe to invoke
+// after a timeout or process restart when the durable parent task id is known.
+func (c *Client) ResumeImageTask(ctx context.Context, cookie, taskID string, downloadResult bool) ([]byte, map[string]any, error) {
+	cookie = normalizeCookie(cookie)
+	if cookie == "" || CSRFTokenFromCookie(cookie) == "" {
+		return nil, nil, ErrAuth
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return nil, nil, fmt.Errorf("%w: accepted task id is required", ErrInvalidParams)
+	}
+
 	acceptedCtx, cancelAccepted := context.WithTimeout(ctx, maxGenerationWait)
 	defer cancelAccepted()
-	task, imageURL, contentType, status, err := c.pollImageTask(acceptedCtx, cookie, parentTaskID)
+	task, imageURL, contentType, status, err := c.pollImageTask(acceptedCtx, cookie, taskID)
 	if err != nil {
-		return nil, nil, acceptedTaskError(parentTaskID, "poll", err)
+		return nil, nil, acceptedTaskError(taskID, "poll", err)
 	}
 	imageURL, err = normalizeAssetURL(imageURL)
 	if err != nil {
-		return nil, nil, acceptedTaskError(parentTaskID, "validate result URL", err)
+		return nil, nil, acceptedTaskError(taskID, "validate result URL", err)
 	}
 	meta := map[string]any{
 		"provider":     "byteplus",
-		"model":        spec.Key,
-		"model_id":     spec.ID,
-		"task_id":      parentTaskID,
+		"task_id":      taskID,
 		"status":       status,
 		"image_url":    imageURL,
 		"content_type": contentType,
@@ -176,12 +199,12 @@ func (c *Client) GenerateImage(ctx context.Context, cookie string, request Image
 	if inferenceInfo, ok := task["inference_info"]; ok {
 		meta["inference_info"] = inferenceInfo
 	}
-	if !request.DownloadResult {
+	if !downloadResult {
 		return nil, meta, nil
 	}
 	asset, detectedType, err := c.openAcceptedAsset(acceptedCtx, cookie, imageURL)
 	if err != nil {
-		return nil, nil, acceptedTaskError(parentTaskID, "download result", err)
+		return nil, nil, acceptedTaskError(taskID, "download result", err)
 	}
 	if detectedType != "" {
 		meta["content_type"] = detectedType
@@ -198,6 +221,7 @@ func taskSubmissionUnknownError(cause error) error {
 type acceptedTaskFailure struct {
 	message  string
 	business error
+	taskID   string
 }
 
 func (failure *acceptedTaskFailure) Error() string {
@@ -227,7 +251,19 @@ func acceptedTaskError(taskID, stage string, cause error) error {
 	return &acceptedTaskFailure{
 		message:  fmt.Sprintf("%s: %s for task %s: %v", ErrTaskAccepted, stage, taskID, cause),
 		business: business,
+		taskID:   strings.TrimSpace(taskID),
 	}
+}
+
+// AcceptedTaskID returns the durable upstream identifier only when create_task
+// definitely succeeded. Callers must not scrape Error() text because messages
+// are sanitized and may change independently of recovery state.
+func AcceptedTaskID(err error) string {
+	var failure *acceptedTaskFailure
+	if errors.As(err, &failure) {
+		return failure.taskID
+	}
+	return ""
 }
 
 func buildCreateTaskPayload(spec ModelSpec, request ImageRequest, refs []string) (createTaskPayload, error) {
@@ -934,18 +970,13 @@ func (c *Client) OpenAsset(ctx context.Context, cookie, rawURL string) ([]byte, 
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: asset download: %v", ErrTemporaryUpstream, err)
 	}
-	declaredType := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
-	detectedType := strings.ToLower(http.DetectContentType(raw))
-	if !strings.HasPrefix(detectedType, "image/") && !isAVIF(raw) {
+	detectedType := netguard.DetectMediaType(raw)
+	if !strings.HasPrefix(detectedType, "image/") || detectedType == "image/svg+xml" {
 		return nil, "", fmt.Errorf("%w: asset response is not an image", ErrTemporaryUpstream)
 	}
-	contentType := detectedType
-	if isAVIF(raw) {
-		contentType = "image/avif"
-	} else if strings.HasPrefix(declaredType, "image/") && declaredType == detectedType {
-		contentType = declaredType
-	}
-	return raw, contentType, nil
+	// Payload magic is authoritative. BytePlus resource-utils and CDN responses
+	// can carry stale image/png headers for JPEG/WebP/AVIF results.
+	return raw, detectedType, nil
 }
 
 func setAssetHeaders(req *http.Request, cookie string) {
@@ -962,11 +993,6 @@ func setAssetHeaders(req *http.Request, cookie string) {
 		req.Header.Del("Cookie")
 		req.Header.Del("X-Csrf-Token")
 	}
-}
-
-func isAVIF(raw []byte) bool {
-	return len(raw) >= 12 && bytes.Equal(raw[4:8], []byte("ftyp")) &&
-		(bytes.Equal(raw[8:12], []byte("avif")) || bytes.Equal(raw[8:12], []byte("avis")))
 }
 
 func normalizeAssetURL(rawURL string) (string, error) {
@@ -1402,16 +1428,10 @@ func allowedImageXUploadURL(parsed *url.URL) bool {
 }
 
 func imageExtension(raw []byte) string {
-	switch http.DetectContentType(raw) {
-	case "image/jpeg":
-		return ".jpg"
-	case "image/webp":
-		return ".webp"
-	case "image/gif":
-		return ".gif"
-	default:
-		return ".png"
+	if extension, ok := netguard.MediaExtension(netguard.DetectMediaType(raw)); ok {
+		return extension
 	}
+	return ".png"
 }
 
 func normalizeStoreKey(value string) string {

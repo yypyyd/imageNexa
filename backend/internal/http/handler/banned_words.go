@@ -54,8 +54,7 @@ func (h *BannedWordsHandler) Create(c *gin.Context) {
 	var body struct {
 		Word string `json:"word"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+	if !bindAdminJSON(c, &body, "invalid request body") {
 		return
 	}
 	item, err := h.words.Create(c.Request.Context(), body.Word)
@@ -72,7 +71,10 @@ func (h *BannedWordsHandler) Import(c *gin.Context) {
 	var body struct {
 		Text string `json:"text"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Text) == "" {
+	if !bindAdminJSON(c, &body, "请提供要导入的违禁词") {
+		return
+	}
+	if strings.TrimSpace(body.Text) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "请提供要导入的违禁词"})
 		return
 	}

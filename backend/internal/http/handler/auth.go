@@ -1,8 +1,12 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
+	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -19,12 +23,10 @@ type AuthHandler struct {
 	limiter *service.RateLimitService
 }
 
+const AdminBootstrapTokenHeader = "X-Admin-Bootstrap-Token"
+
 func NewAuthHandler(cfg *config.Config, auth *service.AuthService, limiter *service.RateLimitService) *AuthHandler {
-	return &AuthHandler{
-		cfg:     cfg,
-		auth:    auth,
-		limiter: limiter,
-	}
+	return &AuthHandler{cfg: cfg, auth: auth, limiter: limiter}
 }
 
 func (h *AuthHandler) Config(c *gin.Context) {
@@ -33,73 +35,56 @@ func (h *AuthHandler) Config(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load auth config"})
 		return
 	}
+	initialized, _ := data["initialized"].(bool)
+	data["bootstrap_token_required"] = !initialized
 	c.JSON(http.StatusOK, data)
 }
 
-func (h *AuthHandler) SendCode(c *gin.Context) {
-	var body struct {
-		Email   string `json:"email"`
-		Purpose string `json:"purpose"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+// Initialize creates the singleton administrator. The repository serializes
+// concurrent attempts, so this endpoint permanently closes after one success.
+func (h *AuthHandler) Initialize(c *gin.Context) {
+	initialized, err := h.auth.Initialized(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load initialization status"})
 		return
 	}
-	ip := clientIP(c)
-	if err := h.enforceRateLimit(c, "auth:send-code:ip:"+ip, 5, time.Hour); err != nil {
+	if initialized {
+		c.JSON(http.StatusConflict, gin.H{"detail": "超级管理员已初始化"})
 		return
 	}
-	if email, err := service.ValidateEmail(body.Email); err == nil {
-		if err := h.enforceRateLimit(c, "auth:send-code:email:"+email, 3, 10*time.Minute); err != nil {
-			return
-		}
-	}
-	if err := h.auth.SendCode(c.Request.Context(), body.Email, body.Purpose); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+	if !h.requireBootstrapToken(c) {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
+	ip := clientIP(c, h.cfg.TrustedProxyCIDRs)
+	if err := h.enforceRateLimit(c, "auth:initialize:ip:"+ip, 5, time.Hour); err != nil {
+		return
+	}
 
-func (h *AuthHandler) Register(c *gin.Context) {
 	var body struct {
-		Email      string `json:"email"`
-		Username   string `json:"username"`
-		Name       string `json:"name"`
-		Password   string `json:"password"`
-		InviteCode string `json:"invite_code"`
-		EmailCode  string `json:"email_code"`
-		Code       string `json:"code"`
+		Username string `json:"username"`
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+	if !bindAdminJSON(c, &body, "invalid request body") {
 		return
 	}
 	username := strings.TrimSpace(body.Username)
 	if username == "" {
 		username = strings.TrimSpace(body.Name)
 	}
-	if err := h.enforceRateLimit(c, "auth:register:ip:"+clientIP(c), 10, time.Hour); err != nil {
-		return
-	}
-	emailCode := strings.TrimSpace(body.EmailCode)
-	if emailCode == "" {
-		emailCode = strings.TrimSpace(body.Code)
-	}
-	user, token, session, err := h.auth.Register(
-		c.Request.Context(),
-		body.Email,
-		username,
-		body.Password,
-		body.InviteCode,
-		emailCode,
-		clientIP(c),
+	admin, token, session, err := h.auth.Initialize(
+		c.Request.Context(), username, body.Email, body.Password, ip,
 	)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		if errors.Is(err, service.ErrAdminAlreadyInitialized) {
+			c.JSON(http.StatusConflict, gin.H{"detail": "超级管理员已初始化"})
+			return
+		}
+		writeAuthServiceError(c, err)
 		return
 	}
-	h.writeSession(c, token, session, user)
+	h.writeSession(c, token, session, admin)
 }
 
 func (h *AuthHandler) Login(c *gin.Context) {
@@ -109,90 +94,65 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		Username   string `json:"username"`
 		Password   string `json:"password"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+	if !bindAdminJSON(c, &body, "invalid request body") {
 		return
 	}
-
 	identifier := strings.TrimSpace(body.Identifier)
 	if identifier == "" {
-		if strings.TrimSpace(body.Email) != "" {
-			identifier = strings.TrimSpace(body.Email)
-		} else {
-			identifier = strings.TrimSpace(body.Username)
-		}
+		identifier = strings.TrimSpace(body.Email)
+	}
+	if identifier == "" {
+		identifier = strings.TrimSpace(body.Username)
 	}
 	if identifier == "" || body.Password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "账号或密码不能为空"})
 		return
 	}
-	ip := clientIP(c)
+	ip := clientIP(c, h.cfg.TrustedProxyCIDRs)
 	if err := h.enforceRateLimit(c, "auth:login:ip:"+ip, 20, 15*time.Minute); err != nil {
 		return
 	}
-	if normalized, err := service.ValidateLoginIdentifier(identifier); err == nil {
-		if err := h.enforceRateLimit(c, "auth:login:target:"+ip+":"+strings.ToLower(normalized), 8, 15*time.Minute); err != nil {
-			return
-		}
-	}
-
-	user, token, session, err := h.auth.Login(c.Request.Context(), identifier, body.Password, ip)
+	admin, token, session, err := h.auth.Login(c.Request.Context(), identifier, body.Password, ip)
 	if err != nil {
 		if writeLoginLocked(c, err) {
 			return
 		}
-		if err == service.ErrAuthFailed {
+		if errors.Is(err, service.ErrAuthFailed) {
 			c.JSON(http.StatusUnauthorized, gin.H{"detail": "账号或密码错误"})
 			return
 		}
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		writeAuthServiceError(c, err)
 		return
 	}
-
-	h.writeSession(c, token, session, user)
+	h.writeSession(c, token, session, admin)
 }
 
-func (h *AuthHandler) ResetPassword(c *gin.Context) {
-	var body struct {
-		Email     string `json:"email"`
-		Password  string `json:"password"`
-		EmailCode string `json:"email_code"`
-		Code      string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
-		return
-	}
-	ip := clientIP(c)
-	if err := h.enforceRateLimit(c, "auth:reset:ip:"+ip, 5, time.Hour); err != nil {
-		return
-	}
-	if email, err := service.ValidateEmail(body.Email); err == nil {
-		if err := h.enforceRateLimit(c, "auth:reset:email:"+email, 5, time.Hour); err != nil {
-			return
-		}
-	}
-	emailCode := strings.TrimSpace(body.EmailCode)
-	if emailCode == "" {
-		emailCode = strings.TrimSpace(body.Code)
-	}
-	if err := h.auth.ResetPassword(c.Request.Context(), body.Email, body.Password, emailCode, ip); err != nil {
-		if writeLoginLocked(c, err) {
-			return
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
-		return
-	}
+func (h *AuthHandler) Logout(c *gin.Context) {
+	token := readAdminCookie(c, h.cfg.SessionCookieName)
+	_ = h.auth.Logout(c.Request.Context(), token)
+	h.clearSessionCookie(c)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func (h *AuthHandler) ChangePassword(c *gin.Context) {
-	user := currentUser(c)
-	if user == nil {
+func (h *AuthHandler) Me(c *gin.Context) {
+	admin := currentAdmin(c)
+	session := currentSession(c)
+	if admin == nil || session == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
 		return
 	}
-	if err := h.enforceRateLimit(c, "auth:change-password:user:"+user.ID, 10, 30*time.Minute); err != nil {
+	c.JSON(http.StatusOK, gin.H{
+		"ok":         true,
+		"expires_at": session.ExpiresAt,
+		"csrf_token": session.CSRFToken,
+		"admin":      service.PublicAdmin(admin),
+	})
+}
+
+func (h *AuthHandler) ChangePassword(c *gin.Context) {
+	admin := currentAdmin(c)
+	if admin == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
 		return
 	}
 	var body struct {
@@ -201,102 +161,92 @@ func (h *AuthHandler) ChangePassword(c *gin.Context) {
 		NewPassword     string `json:"new_password"`
 		Password        string `json:"password"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+	if !bindAdminJSON(c, &body, "invalid request body") {
 		return
 	}
-	current := strings.TrimSpace(body.CurrentPassword)
-	if current == "" {
-		current = strings.TrimSpace(body.Current)
+	currentPassword := body.CurrentPassword
+	if currentPassword == "" {
+		currentPassword = body.Current
 	}
-	next := strings.TrimSpace(body.NewPassword)
-	if next == "" {
-		next = body.Password
+	newPassword := body.NewPassword
+	if newPassword == "" {
+		newPassword = body.Password
 	}
-	if err := h.auth.ChangePassword(c.Request.Context(), user.ID, current, next); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+	if err := h.auth.ChangePassword(c.Request.Context(), admin.ID, currentPassword, newPassword); err != nil {
+		writeAuthServiceError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	// Password changes invalidate all sessions by version; also eagerly remove
+	// the current Redis entry and cookie so the browser cannot look logged in.
+	_ = h.auth.Logout(c.Request.Context(), readAdminCookie(c, h.cfg.SessionCookieName))
+	h.clearSessionCookie(c)
+	c.JSON(http.StatusOK, gin.H{"ok": true, "reauthenticate": true})
 }
 
-func (h *AuthHandler) Checkin(c *gin.Context) {
-	user := currentUser(c)
-	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
+func writeAuthServiceError(c *gin.Context, err error) {
+	if errors.Is(err, service.ErrAuthServiceUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "administrator authentication is temporarily unavailable"})
 		return
 	}
-	result, err := h.auth.Checkin(c.Request.Context(), user.ID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+	if message, ok := safeAuthValidationMessage(err); ok {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": message})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"ok":      true,
-		"already": result.Already,
-		"awarded": result.Awarded,
-		"streak":  result.Streak,
-		"credits": result.Credits,
-	})
+	c.JSON(http.StatusInternalServerError, gin.H{"detail": "authentication operation failed"})
 }
 
-func (h *AuthHandler) Invites(c *gin.Context) {
-	user := currentUser(c)
-	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
-		return
+func safeAuthValidationMessage(err error) (string, bool) {
+	if err == nil {
+		return "", false
 	}
-	items, err := h.auth.InviteList(c.Request.Context(), user.ID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load invites"})
-		return
+	message := strings.TrimSpace(err.Error())
+	for _, safe := range []string{
+		"邮箱不能为空", "邮箱长度不能超过 254 个字符", "邮箱格式不正确",
+		"用户名不能为空", "用户名长度需为 6 到 24 个字符", "用户名长度不能超过 24 个字符", "用户名只能使用字母和数字",
+		"密码不能为空", "密码长度需为 12 到 64 个字符且不能超过 72 字节", "密码不能包含空白字符", "密码包含不允许的字符", "密码必须同时包含大写字母、小写字母、数字和符号",
+		"账号不能为空", "当前密码不能为空", "当前密码错误",
+	} {
+		if message == safe {
+			return message, true
+		}
 	}
-	c.JSON(http.StatusOK, gin.H{"data": items, "reward": h.auth.InviteReward(c.Request.Context())})
+	return "", false
 }
 
-func (h *AuthHandler) Logout(c *gin.Context) {
-	token := service.ParseBearer(c.GetHeader("Authorization"))
-	if token == "" {
-		token = readCookie(c, h.cfg.SessionCookieName)
-	}
-	_ = h.auth.Logout(c.Request.Context(), token)
-	c.SetCookie(h.cfg.SessionCookieName, "", -1, "/", "", h.cfg.CookieSecure, true)
-	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
-
-func (h *AuthHandler) Me(c *gin.Context) {
-	userValue, ok := c.Get("current_user")
+func currentAdmin(c *gin.Context) *model.Admin {
+	value, ok := c.Get("current_admin")
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
-		return
+		return nil
 	}
-	sessionValue, ok := c.Get("current_session")
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
-		return
-	}
+	admin, _ := value.(*model.Admin)
+	return admin
+}
 
-	user, _ := userValue.(*model.User)
-	session, _ := sessionValue.(*service.SessionPayload)
-	if user == nil || session == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "账号或密码错误"})
-		return
+func currentSession(c *gin.Context) *service.SessionPayload {
+	value, ok := c.Get("current_session")
+	if !ok {
+		return nil
 	}
-	publicUser, err := h.auth.PublicUser(c.Request.Context(), user)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load user profile"})
-		return
-	}
+	session, _ := value.(*service.SessionPayload)
+	return session
+}
+
+func (h *AuthHandler) writeSession(c *gin.Context, token string, session *service.SessionPayload, admin *model.Admin) {
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie(h.cfg.SessionCookieName, token, int(h.cfg.SessionTTL.Seconds()), "/", "", h.cfg.CookieSecure, true)
 	c.JSON(http.StatusOK, gin.H{
 		"ok":         true,
 		"expires_at": session.ExpiresAt,
-		"user":       publicUser,
+		"csrf_token": session.CSRFToken,
+		"admin":      service.PublicAdmin(admin),
 	})
 }
 
-// writeLoginLocked maps a LoginGuard lockout error to HTTP 429 with a
-// Retry-After header (mirrors Python api/auth.py:226-237). Returns true when it
-// handled the error so the caller stops processing.
+func (h *AuthHandler) clearSessionCookie(c *gin.Context) {
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie(h.cfg.SessionCookieName, "", -1, "/", "", h.cfg.CookieSecure, true)
+}
+
 func writeLoginLocked(c *gin.Context, err error) bool {
 	var locked *service.LoginLockedError
 	if errors.As(err, &locked) {
@@ -307,15 +257,75 @@ func writeLoginLocked(c *gin.Context, err error) bool {
 	return false
 }
 
-func clientIP(c *gin.Context) string {
-	if fwd := strings.TrimSpace(c.GetHeader("X-Forwarded-For")); fwd != "" {
-		parts := strings.Split(fwd, ",")
-		return strings.TrimSpace(parts[0])
+func clientIP(c *gin.Context, trustedProxies []netip.Prefix) string {
+	peer, ok := parseIPAddress(c.Request.RemoteAddr)
+	if !ok {
+		return "unknown"
 	}
-	if real := strings.TrimSpace(c.GetHeader("X-Real-Ip")); real != "" {
-		return real
+	if !addressInPrefixes(peer, trustedProxies) {
+		return peer.String()
 	}
-	return c.ClientIP()
+
+	// X-Forwarded-For is ordered from the original client to the newest proxy.
+	// Walk it backwards and discard only explicitly trusted proxy hops. The first
+	// untrusted address is the rate-limit identity; client-supplied values farther
+	// left can therefore never override the peer that actually reached our edge.
+	forwarded := strings.Split(c.GetHeader("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		address, valid := parseIPAddress(forwarded[index])
+		if !valid {
+			// A malformed hop makes everything to its left unauthenticated data.
+			// Fall back to the socket peer instead of skipping across the gap.
+			return peer.String()
+		}
+		if !addressInPrefixes(address, trustedProxies) {
+			return address.String()
+		}
+	}
+	return peer.String()
+}
+
+func parseIPAddress(value string) (netip.Addr, bool) {
+	value = strings.TrimSpace(value)
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	} else {
+		value = strings.Trim(value, "[]")
+	}
+	address, err := netip.ParseAddr(value)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return address.Unmap(), true
+}
+
+func addressInPrefixes(address netip.Addr, prefixes []netip.Prefix) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *AuthHandler) requireBootstrapToken(c *gin.Context) bool {
+	if validBootstrapToken(h.cfg.AdminBootstrapToken, c.GetHeader(AdminBootstrapTokenHeader)) {
+		return true
+	}
+	// Use one response for a missing, invalid, or locally unconfigured token and
+	// never reflect either value. Production cannot reach this state without a
+	// configured token because config validation fails during process startup.
+	c.JSON(http.StatusForbidden, gin.H{"detail": "初始化凭据无效"})
+	return false
+}
+
+func validBootstrapToken(expected, provided string) bool {
+	expected = strings.TrimSpace(expected)
+	provided = strings.TrimSpace(provided)
+	expectedHash := sha256.Sum256([]byte(expected))
+	providedHash := sha256.Sum256([]byte(provided))
+	equal := subtle.ConstantTimeCompare(expectedHash[:], providedHash[:])
+	return expected != "" && provided != "" && equal == 1
 }
 
 func (h *AuthHandler) enforceRateLimit(c *gin.Context, bucket string, limit int64, window time.Duration) error {
@@ -333,18 +343,10 @@ func (h *AuthHandler) enforceRateLimit(c *gin.Context, bucket string, limit int6
 	return nil
 }
 
-func (h *AuthHandler) writeSession(c *gin.Context, token string, session *service.SessionPayload, user *model.User) {
-	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(h.cfg.SessionCookieName, token, int(h.cfg.SessionTTL.Seconds()), "/", "", h.cfg.CookieSecure, true)
-	publicUser, err := h.auth.PublicUser(c.Request.Context(), user)
+func readAdminCookie(c *gin.Context, name string) string {
+	value, err := c.Cookie(name)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load user profile"})
-		return
+		return ""
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"ok":         true,
-		"token":      token,
-		"expires_at": session.ExpiresAt,
-		"user":       publicUser,
-	})
+	return value
 }

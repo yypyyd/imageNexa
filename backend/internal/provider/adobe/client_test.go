@@ -225,3 +225,14 @@ func TestContentRejectionClassification(t *testing.T) {
 		t.Fatal("non-451 response must not be classified as a content rejection")
 	}
 }
+
+func TestAccessErrorSeparatesRouteEntitlementFromCredentialAuth(t *testing.T) {
+	entitlement := accessError(http.StatusForbidden, "", []byte(`{"error_code":"user_not_entitled"}`))
+	if !errors.Is(entitlement, ErrEntitlement) || errors.Is(entitlement, ErrAuth) {
+		t.Fatalf("user_not_entitled = %v, want only ErrEntitlement", entitlement)
+	}
+	auth := accessError(http.StatusForbidden, "invalid_token", []byte(`{"message":"forbidden"}`))
+	if !errors.Is(auth, ErrAuth) || errors.Is(auth, ErrEntitlement) {
+		t.Fatalf("generic 403 = %v, want only ErrAuth", auth)
+	}
+}

@@ -3,22 +3,19 @@ package bootstrap
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
 	"backend/internal/config"
 	"backend/internal/http/handler"
 	"backend/internal/http/router"
+	"backend/internal/migrations"
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
-	"backend/internal/provider/imagine"
-	"backend/internal/provider/krea"
-	"backend/internal/provider/leonardo"
 	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
@@ -32,11 +29,11 @@ import (
 )
 
 type App struct {
-	Config            *config.Config
-	DB                *gorm.DB
-	Redis             *redis.Client
-	Engine            *gin.Engine
-	maintenanceCancel context.CancelFunc
+	Config *config.Config
+	DB     *gorm.DB
+	Redis  *redis.Client
+	Engine *gin.Engine
+	cancel context.CancelFunc
 }
 
 func NewApp(ctx context.Context) (*App, error) {
@@ -44,21 +41,14 @@ func NewApp(ctx context.Context) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Ensure the media root (generated outputs + uploaded reference images)
-	// exists from the first request — don't rely on lazy per-file MkdirAll.
 	if err := os.MkdirAll(cfg.GeneratedRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create generated root %s: %w", cfg.GeneratedRoot, err)
 	}
 
-	// TranslateError: 把驱动层错误(如 Postgres 23505 唯一冲突)翻译成 gorm.ErrDuplicatedKey,
-	// 否则各 import-*（krea/adobe/leonardo/runway）里的 errors.Is(err, gorm.ErrDuplicatedKey)
-	// 兜底命不中,重复导入会直接抛原始错误 → 400,而不是按预期 Update 已有行。
 	db, err := gorm.Open(postgres.Open(cfg.PostgresDSN), &gorm.Config{TranslateError: true})
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
-
 	sqlDB, err := db.DB()
 	if err != nil {
 		return nil, fmt.Errorf("sql db: %w", err)
@@ -67,149 +57,99 @@ func NewApp(ctx context.Context) (*App, error) {
 	sqlDB.SetMaxOpenConns(20)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 
+	// Forward-only migrations own identity, routing, provider accounts, quota,
+	// dispatch, and idempotency constraints. AutoMigrate runs afterwards only to
+	// add compatible columns on retained operational tables.
+	if err := migrations.Run(ctx, db); err != nil {
+		return nil, fmt.Errorf("run migrations: %w", err)
+	}
 	if err := db.WithContext(ctx).AutoMigrate(model.AutoMigrateModels()...); err != nil {
-		return nil, fmt.Errorf("auto migrate: %w", err)
-	}
-	// Hard backstop for "one marketing code per user per batch": a partial unique
-	// index. Concurrent double-redeems that slip past the in-tx count check still
-	// fail here. AutoMigrate can't express partial indexes, so do it raw.
-	if err := db.WithContext(ctx).Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_cdk_marketing_batch_user ` +
-		`ON cdk_codes (batch_id, redeemed_by) WHERE type = 'marketing' AND redeemed_by IS NOT NULL`).Error; err != nil {
-		return nil, fmt.Errorf("cdk marketing index: %w", err)
-	}
-	// API image idempotency is scoped to one user. Empty request IDs belong to
-	// legacy synchronous calls and intentionally remain repeatable.
-	if err := db.WithContext(ctx).Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_event_v1_image_request ` +
-		`ON event_logs (user_id, request_id) WHERE source = 'v1' AND kind = 'image' AND request_id <> ''`).Error; err != nil {
-		return nil, fmt.Errorf("v1 image idempotency index: %w", err)
+		return nil, fmt.Errorf("auto migrate operational tables: %w", err)
 	}
 	if err := seedDefaults(ctx, db); err != nil {
 		return nil, fmt.Errorf("seed defaults: %w", err)
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDB,
-	})
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB})
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("ping redis: %w", err)
 	}
 
-	userRepo := repo.NewUserRepository(db)
-	showcaseRepo := repo.NewShowcaseRepository(db)
-	siteRepo := repo.NewSiteSettingRepository(db, rdb)
+	adminRepo := repo.NewAdminRepository(db)
+	credentialRepo := repo.NewAPICredentialRepository(db)
 	modelRepo := repo.NewModelRepository(db)
 	eventRepo := repo.NewEventRepository(db)
-	cdkRepo := repo.NewCDKRepository(db)
-	apiKeyRepo := repo.NewAPIKeyRepository(db)
 	tokenRepo := repo.NewTokenRepository(db)
 	refreshRepo := repo.NewRefreshProfileRepository(db)
-	cgroupRepo := repo.NewConcurrencyGroupRepository(db)
-	// Seed the "默认并发" group (cap 10) and bind any ungrouped users to it.
-	if err := cgroupRepo.EnsureDefault(ctx); err != nil {
-		log.Printf("ensure default concurrency group: %v", err)
-	}
-	concSvc := service.NewConcurrencyService(rdb)
-	cgroupSvc := service.NewConcurrencyGroupService(cgroupRepo, concSvc)
-	announcementSvc := service.NewAnnouncementService(siteRepo, userRepo)
-	orderRepo := repo.NewOrderRepository(db)
-	paymentSvc := service.NewPaymentService(orderRepo, userRepo, siteRepo)
+	settingsRepo := repo.NewSiteSettingRepository(db, rdb)
+	bannedRepo := repo.NewBannedWordRepository(db)
+
 	sessionSvc := service.NewSessionService(rdb, cfg.SessionTTL, cfg.SessionSlideAfter)
-	emailCodeSvc := service.NewEmailCodeService(rdb)
-	smtpSvc := service.NewSMTPService()
+	authSvc := service.NewAdminAuthService(adminRepo, sessionSvc, rdb)
+	concurrencySvc := service.NewConcurrencyService(rdb)
+	credentialSvc := service.NewAPICredentialService(credentialRepo)
+	credentialSvc.SetConcurrency(concurrencySvc)
 	rateLimitSvc := service.NewRateLimitService(rdb)
-	rustfsClient := storage.New(cfg.RustFSEndpoint, cfg.RustFSBucket, cfg.RustFSAccessKey, cfg.RustFSSecretKey)
-	authSvc := service.NewAuthService(userRepo, siteRepo, sessionSvc, emailCodeSvc, smtpSvc, cgroupRepo)
-	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
-	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
+
 	adobeClient := adobe.NewClient("clio-playground-web", "")
 	bytePlusClient := byteplus.NewClient("")
-	// The persisted proxy is restricted to providers whose protected control
-	// plane has a verified residential-egress requirement. Other providers start
-	// and remain direct; protected clients split bulk media onto direct egress.
 	chatGPTClient := chatgpt.NewClient("")
 	runwayClient := runway.NewClient("")
-	leonardoClient := leonardo.NewClient("")
-	kreaClient := krea.NewClient("")
-	imagineClient := imagine.NewClient("")
 	grokClient := grok.NewClient("")
 	oreateClient := oreate.NewClient("")
-	globalProxy, err := siteRepo.GetValue(context.Background(), "proxy.url")
-	if err != nil {
-		return nil, fmt.Errorf("load global proxy setting: %w", err)
-	}
-	chatGPTClient.SetProxy(globalProxy)
-	grokClient.SetProxy(globalProxy)
-	oreateClient.SetProxy(globalProxy)
 	customClient := custom.NewClient()
-	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, bytePlusClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient, rustfsClient)
-	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
-	showcaseSvc := service.NewShowcaseService(showcaseRepo)
-	adminReadSvc := service.NewAdminReadService(cfg, userRepo, modelRepo, eventRepo, siteRepo, tokenRepo, cdkRepo, rustfsClient, showcaseRepo)
-	adminWriteSvc := service.NewAdminWriteService(userRepo, showcaseRepo, modelRepo, eventRepo, apiKeyRepo, tokenRepo, orderRepo)
-	cdkSvc := service.NewCDKService(cdkRepo, userRepo, siteRepo, orderRepo)
-	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
-	tokenSvc := service.NewTokenService(tokenRepo, refreshRepo, eventRepo, siteRepo, adobeClient, bytePlusClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient)
-	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient)
-	// Enable refresh-then-retry on a mid-request Adobe 401 (re-mint access token
-	// from the cookie). Wired post-construction to avoid a ctor init cycle.
-	v1Svc.SetRefresh(refreshSvc)
-	bannedWordRepo := repo.NewBannedWordRepository(db)
-	v1Svc.SetBannedWords(bannedWordRepo)
-	userGenSvc := service.NewUserGenerationService(v1Svc, eventRepo, userRepo, modelRepo)
+	objectStore := storage.New(cfg.RustFSEndpoint, cfg.RustFSBucket, cfg.RustFSAccessKey, cfg.RustFSSecretKey)
 
-	engine := router.New(cfg, authSvc, router.Handlers{
-		Health:        handler.NewHealthHandler(),
-		Images:        handler.NewImageHandler(cfg, imageAccessSvc, rustfsClient),
-		V1:            handler.NewV1Handler(v1Svc),
-		Site:          handler.NewSiteHandler(siteSvc),
-		Showcase:      handler.NewShowcaseHandler(showcaseSvc),
-		Auth:          handler.NewAuthHandler(cfg, authSvc, rateLimitSvc),
-		SiteSettings:  handler.NewSiteSettingsHandler(siteSvc),
-		AppSettings:   handler.NewAppSettingsHandler(appSettingsSvc),
-		AdminRead:     handler.NewAdminReadHandler(adminReadSvc),
-		AdminWrite:    handler.NewAdminWriteHandler(adminWriteSvc),
-		CDK:           handler.NewCDKHandler(cdkSvc),
-		UserTools:     handler.NewUserToolsHandler(apiKeySvc, cdkSvc),
-		UserGen:       handler.NewUserGenerationHandler(userGenSvc, adminReadSvc),
-		ProviderAdmin: handler.NewProviderAdminHandler(tokenSvc, refreshSvc),
-		ConcGroups:    handler.NewConcurrencyGroupHandler(cgroupSvc),
-		Announcement:  handler.NewAnnouncementHandler(announcementSvc),
-		Payment:       handler.NewPaymentHandler(paymentSvc),
-		BannedWords:   handler.NewBannedWordsHandler(bannedWordRepo),
+	tokenSvc := service.NewTokenService(
+		tokenRepo, refreshRepo, eventRepo, settingsRepo,
+		adobeClient, bytePlusClient, chatGPTClient, runwayClient,
+		grokClient, oreateClient, customClient,
+	)
+	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient)
+	v1Svc := service.NewV1Service(
+		cfg, modelRepo, credentialSvc, eventRepo, tokenRepo, settingsRepo, concurrencySvc,
+		adobeClient, bytePlusClient, chatGPTClient, runwayClient,
+		grokClient, oreateClient, customClient, objectStore,
+	)
+	v1Svc.SetRefresh(refreshSvc)
+	v1Svc.SetBannedWords(bannedRepo)
+	adminConsoleSvc := service.NewAdminConsoleService(cfg, db, modelRepo, tokenRepo, tokenSvc, settingsRepo)
+	maintenanceCtx, cancelMaintenance := context.WithCancel(ctx)
+	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, refreshSvc, settingsRepo, modelRepo, objectStore, v1Svc)
+	go maintenanceSvc.Run(maintenanceCtx)
+
+	engine := router.New(cfg, authSvc, credentialSvc, router.Handlers{
+		Health:         handler.NewHealthHandler(db, rdb, objectStore),
+		V1:             handler.NewV1Handler(v1Svc),
+		Auth:           handler.NewAuthHandler(cfg, authSvc, rateLimitSvc),
+		APICredentials: handler.NewUserToolsHandler(credentialSvc),
+		Admin:          handler.NewAdminConsoleHandler(adminConsoleSvc),
+		BannedWords:    handler.NewBannedWordsHandler(bannedRepo),
 	})
 
-	// Background self-healing sweep (quota recovery, cookie refresh, stale-pending
-	// cleanup, log retention) — the Go equivalent of the Python daemon thread.
-	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, userRepo, refreshSvc, siteRepo, rustfsClient, v1Svc.Inflight(), showcaseRepo, orderRepo)
-	loopCtx, loopCancel := context.WithCancel(context.Background())
-	go maintenanceSvc.Run(loopCtx)
-
-	return &App{
-		Config:            cfg,
-		DB:                db,
-		Redis:             rdb,
-		Engine:            engine,
-		maintenanceCancel: loopCancel,
-	}, nil
+	return &App{Config: cfg, DB: db, Redis: rdb, Engine: engine, cancel: cancelMaintenance}, nil
 }
 
 func (a *App) Close() error {
-	if a.maintenanceCancel != nil {
-		a.maintenanceCancel()
+	var firstErr error
+	if a.cancel != nil {
+		a.cancel()
 	}
 	if a.Redis != nil {
 		if err := a.Redis.Close(); err != nil {
-			return err
+			firstErr = err
 		}
 	}
 	if a.DB != nil {
 		sqlDB, err := a.DB.DB()
 		if err != nil {
-			return err
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else if err := sqlDB.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
-		return sqlDB.Close()
 	}
-	return nil
+	return firstErr
 }

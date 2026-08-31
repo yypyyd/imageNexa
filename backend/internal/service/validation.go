@@ -12,14 +12,14 @@ import (
 const (
 	MinUsernameLength = 6
 	MaxUsernameLength = 24
-	MinPasswordLength = 8
-	MaxPasswordLength = 24
+	MinPasswordLength = 12
+	MaxPasswordLength = 64
+	MaxPasswordBytes  = 72
 )
 
 var (
 	usernamePattern      = regexp.MustCompile(`^[A-Za-z0-9]{6,24}$`)
 	loginUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9]{1,24}$`)
-	emailCodePattern     = regexp.MustCompile(`^\d{6}$`)
 )
 
 func ValidateEmail(email string) (string, error) {
@@ -58,8 +58,10 @@ func ValidateUsername(username string) (string, error) {
 
 func ValidatePassword(password string) error {
 	length := utf8.RuneCountInString(password)
-	if length < MinPasswordLength || length > MaxPasswordLength {
-		return errors.New("密码长度需为 8 到 24 个字符")
+	if length < MinPasswordLength || length > MaxPasswordLength || len([]byte(password)) > MaxPasswordBytes {
+		// bcrypt only consumes 72 bytes. Reject overlong Unicode passphrases
+		// instead of silently hashing a truncated prefix.
+		return errors.New("密码长度需为 12 到 64 个字符且不能超过 72 字节")
 	}
 
 	var hasLetter bool
@@ -109,14 +111,6 @@ func isAllowedPasswordRune(r rune) bool {
 	}
 }
 
-func ValidateEmailCode(code string) (string, error) {
-	normalized := strings.TrimSpace(code)
-	if !emailCodePattern.MatchString(normalized) {
-		return "", errors.New("邮箱验证码必须是 6 位纯数字")
-	}
-	return normalized, nil
-}
-
 func ValidateLoginIdentifier(identifier string) (string, error) {
 	normalized := strings.TrimSpace(identifier)
 	if normalized == "" {
@@ -132,37 +126,4 @@ func ValidateLoginIdentifier(identifier string) (string, error) {
 		return "", errors.New("用户名只能使用字母和数字")
 	}
 	return normalized, nil
-}
-
-func ValidateAllowedEmailDomains(domains []string) []string {
-	out := make([]string, 0, len(domains))
-	seen := map[string]struct{}{}
-	for _, raw := range domains {
-		normalized := strings.TrimSpace(strings.ToLower(strings.TrimPrefix(raw, "@")))
-		if normalized == "" || strings.Contains(normalized, " ") {
-			continue
-		}
-		if _, ok := seen[normalized]; ok {
-			continue
-		}
-		seen[normalized] = struct{}{}
-		out = append(out, normalized)
-	}
-	return out
-}
-
-func EmailDomainAllowed(email string, domains []string) bool {
-	if len(domains) == 0 {
-		return true
-	}
-	_, domain, ok := strings.Cut(strings.ToLower(strings.TrimSpace(email)), "@")
-	if !ok {
-		return false
-	}
-	for _, allowed := range ValidateAllowedEmailDomains(domains) {
-		if domain == allowed {
-			return true
-		}
-	}
-	return false
 }

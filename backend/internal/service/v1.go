@@ -3,12 +3,15 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
-	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -24,14 +27,12 @@ import (
 
 	"backend/internal/config"
 	"backend/internal/model"
+	"backend/internal/netguard"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
-	"backend/internal/provider/imagine"
-	"backend/internal/provider/krea"
-	"backend/internal/provider/leonardo"
 	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
@@ -41,13 +42,17 @@ import (
 )
 
 var (
-	ErrMissingAPIKey          = errors.New("missing api key")
-	ErrInvalidAPIKey          = errors.New("invalid api key")
-	ErrUnknownModel           = errors.New("unknown model")
-	ErrUnsupportedParams      = errors.New("unsupported or unpriced parameters for this model")
-	ErrBannedPrompt           = errors.New("prompt contains banned content")
-	ErrInsufficientFunds      = errors.New("insufficient credits")
-	ErrGenerationPending      = errors.New("generation executor not implemented yet")
+	ErrMissingAPIKey     = errors.New("missing api key")
+	ErrInvalidAPIKey     = errors.New("invalid api key")
+	ErrUnknownModel      = errors.New("unknown model")
+	ErrUnsupportedParams = errors.New("unsupported or unpriced parameters for this model")
+	ErrBannedPrompt      = errors.New("prompt contains banned content")
+	ErrInsufficientFunds = errors.New("insufficient credits")
+	ErrGenerationPending = errors.New("generation executor not implemented yet")
+	// ErrGenerationAccepted means a synchronous image request has durable state
+	// and must be continued through its poll URL. HTTP handlers map the attached
+	// task payload to 202 instead of holding the connection past proxy timeouts.
+	ErrGenerationAccepted     = errors.New("image generation accepted; poll the task URL")
 	ErrProviderAuth           = errors.New("provider token invalid or expired")
 	ErrNoProviderAccount      = errors.New("no provider account available, please ask an admin to configure one")
 	ErrProviderQuota          = errors.New("provider quota exhausted")
@@ -67,16 +72,15 @@ var (
 	// generations in flight (画图台 + API key combined). 0 = unlimited.
 	ErrUserConcurrencyFull = errors.New("too many generations in progress, please wait for one to finish")
 	// ErrVideoJobNotFound / ErrVideoNotReady — /v1/videos async job lookups.
-	ErrVideoJobNotFound  = errors.New("video job not found")
-	ErrVideoNotReady     = errors.New("video is not ready yet")
-	ErrImageTaskNotFound = errors.New("image task not found")
+	ErrVideoJobNotFound    = errors.New("video job not found")
+	ErrVideoNotReady       = errors.New("video is not ready yet")
+	ErrImageTaskNotFound   = errors.New("image task not found")
+	ErrIdempotencyConflict = errors.New("idempotency key was already used with a different request")
 	// A provider account can be unable to fund one expensive request while still
 	// remaining valid for cheaper work. It participates in quota failover but
 	// must not be moved to the pool-wide quota state.
 	errAccountTaskQuota = errors.New("provider account balance below current task cost")
 )
-
-const byteplusMinUsableCredits = 1.0
 
 // maxReferenceImageBytes bounds a single decoded reference image. 20 MB
 // comfortably covers real photos/screenshots; anything larger is almost
@@ -90,18 +94,14 @@ const (
 type V1Service struct {
 	cfg      *config.Config
 	models   *repo.ModelRepository
-	users    *repo.UserRepository
 	events   *repo.EventRepository
 	tokens   *repo.TokenRepository
 	settings *repo.SiteSettingRepository
-	cgroups  *repo.ConcurrencyGroupRepository
+	apiKeys  *APICredentialService
 	adobe    *adobe.Client
 	byteplus *byteplus.Client
 	chatgpt  *chatgpt.Client
 	runway   *runway.Client
-	leonardo *leonardo.Client
-	krea     *krea.Client
-	imagine  *imagine.Client
 	grok     *grok.Client
 	oreate   *oreate.Client
 	custom   *custom.Client
@@ -141,6 +141,10 @@ type V1Service struct {
 	// A short retention window lets polling observe validation/provider failures
 	// that happened before an event row could be created.
 	imageJobs sync.Map
+	// imageRecoveries coalesces post-restart/post-timeout polling of one durable
+	// BytePlus task. The recovery path only resumes an accepted task id; it never
+	// replays create_task.
+	imageRecoveries sync.Map
 
 	// inflight maps an in-progress event ID → the cancel func of its generation
 	// work context, so the maintenance sweep can stop a stuck generation the
@@ -157,7 +161,7 @@ type V1Service struct {
 // acctAcquire takes one per-account upstream slot (capped at max; 0/1 = single),
 // tagged with the generation's eventID (unique per job; a generation only ever
 // holds one slot on a given account at a time, so failover reuses it cleanly).
-func (s *V1Service) acctAcquire(ctx context.Context, accountID, eventID string, max int) bool {
+func (s *V1Service) acctAcquire(ctx context.Context, accountID, eventID string, max int) (bool, error) {
 	if max < 1 {
 		max = 1
 	}
@@ -168,37 +172,17 @@ func (s *V1Service) acctRelease(ctx context.Context, accountID, eventID string) 
 	s.conc.Release(ctx, "conc:a:"+accountID, eventID)
 }
 
-// userAcquire takes one per-user generation slot, capped by the user's
-// concurrency group (0 = unlimited). Returns false when the user is already at
-// their limit. `token` is a unique per-generation tag passed back to userRelease.
-func (s *V1Service) userAcquire(ctx context.Context, user *model.User, token string) bool {
-	if user == nil {
-		return true
+// credentialAcquire takes one per-key generation slot. A zero limit is
+// intentionally unlimited.
+func (s *V1Service) credentialAcquire(ctx context.Context, principal *APIPrincipal, token string) (bool, error) {
+	if principal == nil || principal.Credential == nil {
+		return true, nil
 	}
-	return s.conc.Acquire(ctx, "conc:u:"+user.ID, s.userConcurrencyLimit(ctx, user), token)
+	return s.conc.Acquire(ctx, "conc:k:"+principal.Credential.ID, principal.Credential.ConcurrencyLimit, token)
 }
 
-func (s *V1Service) userRelease(ctx context.Context, userID, token string) {
-	s.conc.Release(ctx, "conc:u:"+userID, token)
-}
-
-// userConcurrencyLimit resolves the user's concurrency-group cap (0 = unlimited),
-// falling back to the default group when unset/missing.
-func (s *V1Service) userConcurrencyLimit(ctx context.Context, user *model.User) int {
-	if s.cgroups == nil || user == nil {
-		return 0
-	}
-	var g *model.ConcurrencyGroup
-	if user.ConcurrencyGroupID != "" {
-		g, _ = s.cgroups.Get(ctx, user.ConcurrencyGroupID)
-	}
-	if g == nil {
-		g, _ = s.cgroups.GetDefault(ctx)
-	}
-	if g == nil {
-		return 0
-	}
-	return g.MaxConcurrency
+func (s *V1Service) credentialRelease(ctx context.Context, credentialID, token string) {
+	s.conc.Release(ctx, "conc:k:"+credentialID, token)
 }
 
 // InflightRegistry tracks the cancel func of every in-progress generation by
@@ -236,8 +220,15 @@ func (r *InflightRegistry) Active(eventID string) bool {
 }
 
 type APIPrincipal struct {
-	User      *model.User
-	TokenType string
+	Credential *model.APICredential
+	TokenType  string
+}
+
+func (p *APIPrincipal) ID() string {
+	if p == nil || p.Credential == nil {
+		return ""
+	}
+	return p.Credential.ID
 }
 
 type V1ImageRequest struct {
@@ -250,6 +241,11 @@ type V1ImageRequest struct {
 	// size/resolution behavior. An explicit internal Resolution always remains
 	// authoritative.
 	Quality string
+	// Background and OutputFormat are part of the GPT Image request surface, but
+	// this multi-provider gateway cannot currently guarantee them. Explicit
+	// values are rejected instead of being silently ignored.
+	Background   string
+	OutputFormat string
 	// ResponseFormat controls the OpenAI-compatible API response. Empty defaults
 	// to url for low-copy relay; b64_json is available when explicitly requested.
 	ResponseFormat  string
@@ -277,13 +273,14 @@ type V1ImageRequest struct {
 const asyncImageJobRetention = 10 * time.Minute
 
 type asyncImageJob struct {
-	done     chan struct{}
-	response map[string]any
-	err      error
+	done        chan struct{}
+	fingerprint string
+	response    map[string]any
+	err         error
 }
 
-func newAsyncImageJob() *asyncImageJob {
-	return &asyncImageJob{done: make(chan struct{})}
+func newAsyncImageJob(fingerprint string) *asyncImageJob {
+	return &asyncImageJob{done: make(chan struct{}), fingerprint: fingerprint}
 }
 
 func (j *asyncImageJob) complete(response map[string]any, err error) {
@@ -357,6 +354,7 @@ func normalizeImageResponseFormat(value string) (string, error) {
 type V1VideoRequest struct {
 	Model           string
 	Prompt          string
+	RequestID       string
 	Duration        string
 	AspectRatio     string
 	Resolution      string
@@ -379,23 +377,19 @@ type MediaReference struct {
 	Filename    string
 }
 
-func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, store *storage.Client) *V1Service {
+func NewV1Service(cfg *config.Config, models *repo.ModelRepository, apiKeys *APICredentialService, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, conc *ConcurrencyService, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, store *storage.Client) *V1Service {
 	service := &V1Service{
 		cfg:      cfg,
 		models:   models,
-		users:    users,
 		events:   events,
 		tokens:   tokens,
 		settings: settings,
-		cgroups:  cgroups,
+		apiKeys:  apiKeys,
 		conc:     conc,
 		adobe:    adobeClient,
 		byteplus: bytePlusClient,
 		chatgpt:  chatGPTClient,
 		runway:   runwayClient,
-		leonardo: leonardoClient,
-		krea:     kreaClient,
-		imagine:  imagineClient,
 		grok:     grokClient,
 		oreate:   oreateClient,
 		custom:   customClient,
@@ -498,12 +492,9 @@ func (s *V1Service) checkBannedPrompt(ctx context.Context, principal *APIPrincip
 			continue
 		}
 		userID, userName := "", ""
-		if principal != nil && principal.User != nil {
-			userID = principal.User.ID
-			userName = principal.User.Name
-			if userName == "" {
-				userName = principal.User.Email
-			}
+		if principal != nil && principal.Credential != nil {
+			userID = principal.Credential.ID
+			userName = principal.Credential.Name
 		}
 		s.banned.RecordHit(ctx, w.ID, w.Word, userID, userName, prompt)
 		return fmt.Errorf("%w: banned word \"%s\"", ErrBannedPrompt, w.Word)
@@ -529,10 +520,9 @@ func (s *V1Service) logRejectedEvent(ctx context.Context, kind, modelID string, 
 	}
 	if m, err := s.models.Get(ctx, event.Model); err == nil {
 		event.Model = m.ID
-		event.Provider = m.Provider
 	}
-	if principal != nil && principal.User != nil {
-		event.UserID = principal.User.ID
+	if principal != nil && principal.Credential != nil {
+		event.APICredentialID = principal.Credential.ID
 	}
 	_ = s.events.Create(ctx, event)
 }
@@ -556,52 +546,114 @@ func (s *V1Service) refreshAdobeToken(ctx context.Context, tokenID string) (mode
 }
 
 func (s *V1Service) Authenticate(ctx context.Context, authHeader string) (*APIPrincipal, error) {
-	token := ParseBearer(authHeader)
-	if token == "" {
+	if ParseBearer(authHeader) == "" {
 		return nil, ErrMissingAPIKey
 	}
-
-	// Only per-user API keys (hashed in the DB) authenticate to /v1. The old
-	// global/shared API_KEY backdoor has been removed.
-	user, err := s.users.GetByAPIKeyHash(ctx, HashAPIKey(token))
+	credential, err := s.apiKeys.AuthenticateBearer(ctx, authHeader)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, ErrInvalidAPICredential) {
 			return nil, ErrInvalidAPIKey
 		}
 		return nil, err
 	}
-	if user.Status != "active" {
-		return nil, ErrInvalidAPIKey
-	}
-	_ = s.users.TouchAPIKeyUsage(ctx, HashAPIKey(token))
 	return &APIPrincipal{
-		User:      user,
-		TokenType: "user",
+		Credential: credential,
+		TokenType:  "user",
 	}, nil
 }
 
 func (s *V1Service) ListModels(ctx context.Context, extended bool) ([]map[string]any, error) {
-	items, err := s.models.List(ctx)
+	items, err := s.models.Routes().ListLogical(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().Unix()
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
-		if !item.Enabled {
+		routes, routeErr := s.models.Routes().ListRoutes(ctx, item.ID, true)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		if len(routes) == 0 {
 			continue
 		}
-		out = append(out, v1ModelEntry(item, now, extended))
+		created := now
+		if !item.CreatedAt.IsZero() {
+			created = item.CreatedAt.Unix()
+		}
+		out = append(out, v1LogicalModelEntry(item, routes, created, extended))
 	}
 	return out, nil
 }
 
+func v1LogicalModelEntry(item model.LogicalModel, routes []model.ModelRoute, created int64, extended bool) map[string]any {
+	entry := map[string]any{"id": item.ID, "object": "model", "created": created, "owned_by": "2api", "shutdown_date": nil}
+	if !extended {
+		return entry
+	}
+	entry["kind"], entry["type"], entry["modality"], entry["name"] = item.Kind, item.Kind, item.Kind, item.Name
+	var ratios, resolutions, durations, operations []string
+	profiles := make([]map[string]any, 0)
+	seenProfiles := map[string]bool{}
+	maxImages, maxVideos, maxAudios, maxMedia, audioOutput := 0, 0, 0, 0, false
+	for _, route := range routes {
+		for _, profile := range model.DecodeCapabilityProfiles(route.Capabilities) {
+			ratios = unionStrings(ratios, profile.Ratios)
+			resolutions = unionStrings(resolutions, profile.Resolutions)
+			durations = unionStrings(durations, profile.Durations)
+			operations = unionStrings(operations, profile.Operations)
+			maxImages, maxVideos = max(maxImages, profile.MaxReferenceImages), max(maxVideos, profile.MaxReferenceVideos)
+			maxAudios, maxMedia = max(maxAudios, profile.MaxReferenceAudios), max(maxMedia, profile.MaxReferenceMedia)
+			audioOutput = audioOutput || profile.SupportsAudioOutput
+			raw, _ := json.Marshal(profile)
+			if !seenProfiles[string(raw)] {
+				seenProfiles[string(raw)] = true
+				var anonymous map[string]any
+				_ = json.Unmarshal(raw, &anonymous)
+				profiles = append(profiles, anonymous)
+			}
+		}
+	}
+	sort.Strings(ratios)
+	sort.Strings(resolutions)
+	sort.Strings(durations)
+	sort.Strings(operations)
+	entry["supported_ratios"], entry["ratios"], entry["aspectRatios"] = ratios, ratios, ratios
+	entry["supported_resolutions"], entry["resolutions"], entry["resolutionTiers"] = resolutions, resolutions, resolutions
+	entry["supported_durations"], entry["durations"], entry["supportedDurations"], entry["durationTiers"] = durations, durations, durations, durations
+	entry["operations"], entry["capability_profiles"] = operations, profiles
+	entry["max_reference_images"], entry["max_reference_videos"] = maxImages, maxVideos
+	entry["max_reference_audios"], entry["max_reference_media"] = maxAudios, maxMedia
+	entry["supports_audio_output"] = audioOutput
+	entry["maxReferenceImages"], entry["maxReferenceVideos"] = maxImages, maxVideos
+	entry["maxReferenceAudios"], entry["maxReferenceMedia"] = maxAudios, maxMedia
+	entry["supportsAudioOutput"] = audioOutput
+	return entry
+}
+
+func unionStrings(dst, src []string) []string {
+	for _, candidate := range src {
+		found := false
+		for _, existing := range dst {
+			if strings.EqualFold(existing, candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, candidate)
+		}
+	}
+	return dst
+}
+
 func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[string]any {
 	entry := map[string]any{
-		"id":       item.EffectiveName(),
-		"object":   "model",
-		"created":  created,
-		"owned_by": item.Provider,
+		"id":            item.EffectiveName(),
+		"object":        "model",
+		"created":       created,
+		"owned_by":      "2api",
+		"shutdown_date": nil,
 	}
 	if !extended {
 		return entry
@@ -625,11 +677,6 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 	entry["resolutionTiers"] = resolutions
 	entry["modality"] = item.Type
 	entry["name"] = item.EffectiveName()
-	upstreamModel := strings.TrimSpace(item.UpstreamModel)
-	if upstreamModel == "" {
-		upstreamModel = item.ID
-	}
-	entry["upstreamModel"] = upstreamModel
 	operations := []string{}
 	switch item.Type {
 	case "image":
@@ -739,234 +786,239 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 	stream, _ := request["stream"].(bool)
 	prompt := chatPrompt(messages)
 
-	modelItem, err := s.models.Get(ctx, modelName)
+	logicalItem, err := s.models.Get(ctx, modelName)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrUnknownModel
 		}
 		return nil, err
 	}
-	if !modelItem.Enabled || modelItem.Type != "text" {
+	if !logicalItem.Enabled || logicalItem.Type != "text" {
 		return nil, ErrUnknownModel
+	}
+	requirements := model.RouteRequirements{Operation: "completion"}
+	routes, err := s.matchingRoutes(ctx, logicalItem.ID, requirements)
+	if err != nil {
+		return nil, err
+	}
+	if len(routes) == 0 {
+		return nil, ErrUnsupportedParams
 	}
 	if err := s.checkBannedPrompt(ctx, principal, prompt); err != nil {
 		s.logRejectedEvent(context.WithoutCancel(ctx), "text", modelName, principal, prompt, source, err.Error())
 		return nil, err
 	}
-	pool := "custom"
-	active, err := s.customActive(ctx, modelItem.ID)
-	if err != nil {
-		return nil, err
-	}
-	if len(active) == 0 && modelItem.Provider == "chatgpt" {
-		pool = "chatgpt"
-		items, listErr := s.tokens.ListByPool(ctx, pool)
-		if listErr != nil {
-			return nil, listErr
-		}
-		for _, item := range items {
-			// ChatGPT's quota status represents image_gen allowance and does not
-			// prevent ordinary text conversations.
-			if (item.Status == "active" || item.Status == "quota") && !item.Dead && strings.TrimSpace(item.Value) != "" {
-				active = append(active, item)
-			}
-		}
-		s.rotateRoundRobin(pool, active)
-	}
-	configuredGrokModel := strings.TrimSpace(modelItem.UpstreamModel)
-	if configuredGrokModel == "" {
-		configuredGrokModel = modelItem.ID
-	}
-	if len(active) == 0 && (modelItem.Provider == "grok" || grok.IsBuildTextModel(configuredGrokModel)) {
-		pool = "grok"
-		items, listErr := s.tokens.ListByPool(ctx, pool)
-		if listErr != nil {
-			return nil, listErr
-		}
-		for _, item := range items {
-			// grok's quota status tracks media generation credits; text chat runs
-			// on a separate rate limit, so quota-paused accounts still chat. The
-			// image/video_limited flags are media-only too.
-			if (item.Status == "active" || item.Status == "quota") && !item.Dead && strings.TrimSpace(item.Value) != "" {
-				active = append(active, item)
-			}
-		}
-		s.rotateRoundRobin(pool, active)
-	}
-	active = pinTestAccount(active, active, accountID)
-	if len(active) == 0 || (pool == "custom" && s.custom == nil) || (pool == "chatgpt" && s.chatgpt == nil) || (pool == "grok" && s.grok == nil) {
-		return nil, ErrNoProviderAccount
-	}
-	s.applyGlobalProxy(ctx)
 
 	bookCtx := context.WithoutCancel(ctx)
 	userSlot := randomUpper(12)
-	if principal != nil && principal.User != nil && !s.userAcquire(bookCtx, principal.User, userSlot) {
-		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, ErrUserConcurrencyFull.Error())
-		return nil, ErrUserConcurrencyFull
+	if principal != nil && principal.Credential != nil {
+		admitted, gateErr := s.credentialAcquire(bookCtx, principal, userSlot)
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		if !admitted {
+			s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, ErrUserConcurrencyFull.Error())
+			return nil, ErrUserConcurrencyFull
+		}
 	}
-	userHeld := principal != nil && principal.User != nil
+	userHeld := principal != nil && principal.Credential != nil
 	releaseUser := func() {
 		if userHeld {
-			s.userRelease(bookCtx, principal.User.ID, userSlot)
+			s.credentialRelease(bookCtx, principal.Credential.ID, userSlot)
 			userHeld = false
 		}
 	}
 
-	price, err := s.chargeForModel(bookCtx, principal, modelItem, "text", "request", "", 0, true)
+	price, err := s.chargeForModel(bookCtx, principal, logicalItem, "text", "request", "", 0, true)
 	if err != nil {
 		releaseUser()
 		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, err.Error())
 		return nil, err
 	}
-	eventID, err := s.logPendingEvent(bookCtx, "text", modelItem, principal, prompt, "", "", "", 0, price, "", source, nil, false, "")
+	eventID, err := s.logPendingEvent(bookCtx, "text", logicalItem, principal, prompt, "", "", "", 0, price, "", source, nil, false, "", "")
 	if err != nil {
 		releaseUser()
-		if principal != nil && principal.User != nil && price > 0 {
-			if updated, adjustErr := s.users.AdjustCredits(bookCtx, principal.User.ID, price); adjustErr == nil {
-				principal.User = updated
-			}
-		}
 		return nil, err
 	}
 	startedAt := time.Now()
-	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
-	if upstreamModel == "" {
-		upstreamModel = modelItem.ID
-	}
-
-	var lastErr error
-	busy := 0
-	for _, token := range active {
-		slots := accountConcurrency(token)
-		if pool == "grok" {
-			slots = grokConcurrencyPerAccount
+	response, routeErr := runTextRouteFailover(routes, func(route model.ModelRoute) (*V1ChatResponse, error) {
+		modelItem, configErr := s.models.Routes().RouteConfig(ctx, route)
+		if configErr != nil {
+			return nil, configErr
 		}
-		if !s.acctAcquire(bookCtx, token.ID, eventID, slots) {
-			busy++
-			continue
-		}
-		_ = s.events.SetAccount(bookCtx, eventID, token.ID, token.AccountEmail)
-		_ = s.tokens.TouchLastUsed(bookCtx, token.ID)
-		var responseHeader http.Header
-		var responseBody io.ReadCloser
-		responseStream := stream
-		var callErr error
+		pool := route.Provider
+		var active []model.TokenAccount
 		switch pool {
 		case "custom":
-			response, err := s.custom.ChatCompletions(ctx, stringValue(token.Meta["base_url"]), token.Value, upstreamModel, payload, stream)
-			callErr = err
-			if response != nil {
-				responseHeader, responseBody, responseStream = response.Header, response.Body, response.Stream
-			}
-		case "grok":
-			var text string
-			var err error
-			if grok.IsBuildTextModel(upstreamModel) {
-				var accessToken string
-				accessToken, err = s.ensureGrokBuildCredential(ctx, token)
-				if err == nil {
-					text, err = s.grok.GenerateBuildText(ctx, accessToken, prompt, upstreamModel)
+			active, configErr = s.customActive(ctx, route.LogicalModelID)
+		case "chatgpt", "grok":
+			var items []model.TokenAccount
+			items, configErr = s.tokens.ListByPool(ctx, pool)
+			if configErr == nil {
+				for _, item := range items {
+					// Media quota states do not disable text chat. Durable route
+					// bindings and text-specific cooldowns are applied below.
+					if (item.Status == "active" || item.Status == "quota") && !item.Dead && strings.TrimSpace(item.Value) != "" {
+						active = append(active, item)
+					}
 				}
-			} else {
-				text, err = s.grok.GenerateText(ctx, token.Value, prompt, grok.ChatModeForModel(upstreamModel))
-			}
-			callErr = err
-			if err == nil {
-				responseHeader, responseBody = openAITextResponse(modelItem.EffectiveName(), text, stream)
+				s.rotateRoundRobin(pool, active)
 			}
 		default:
-			text, err := s.chatgpt.GenerateText(ctx, token.Value, prompt, upstreamModel)
-			callErr = err
-			if err == nil {
-				responseHeader, responseBody = openAITextResponse(modelItem.EffectiveName(), text, stream)
-			}
+			return nil, ErrProviderUnsupported
 		}
-		if callErr != nil {
-			s.acctRelease(bookCtx, token.ID, eventID)
-			lastErr = callErr
-			switch {
-			case errors.Is(callErr, grok.ErrChallenge):
-				// Statsig is process-wide and account-independent. The provider
-				// already refreshed and retried once; rotating the pool would
-				// repeat the same rejected signature against every account.
-				return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, callErr)
-			case errors.Is(callErr, custom.ErrAuth), errors.Is(callErr, chatgpt.ErrAuth), errors.Is(callErr, grok.ErrAuth):
-				s.markTokenFailure(bookCtx, pool, token, "text", true, false)
-				continue
-			case errors.Is(callErr, grok.ErrQuotaExhausted):
-				// grok's chat rate limit is per-mode and short-lived, and is
-				// unrelated to the media credits the "quota" status guards —
-				// don't pause the account, just fail over.
-				s.markTokenFailure(bookCtx, pool, token, "text", false, false)
-				continue
-			case errors.Is(callErr, custom.ErrQuotaExhausted), errors.Is(callErr, chatgpt.ErrQuotaExhausted):
-				s.markTokenFailure(bookCtx, pool, token, "text", false, true)
-				continue
-			case errors.Is(callErr, custom.ErrTemporaryUpstream), errors.Is(callErr, chatgpt.ErrTemporaryUpstream), errors.Is(callErr, grok.ErrTemporaryUpstream):
-				s.markTokenFailure(bookCtx, pool, token, "text", false, false)
-				continue
-			default:
-				return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, callErr)
-			}
+		if configErr != nil {
+			return nil, configErr
 		}
+		routeCtx := withDispatchRoute(ctx, route, defaultRouteCost(route, requirements))
+		active, configErr = s.routeAccounts(routeCtx, route, active)
+		if configErr != nil {
+			return nil, configErr
+		}
+		active = pinTestAccount(active, active, accountID)
+		if len(active) == 0 || pool == "custom" && s.custom == nil || pool == "chatgpt" && s.chatgpt == nil || pool == "grok" && s.grok == nil {
+			return nil, ErrNoProviderAccount
+		}
+		recordBookkeepingError("set chat provider", s.events.SetProvider(bookCtx, eventID, pool))
 
-		body := &chatAccountingBody{inner: responseBody, stream: responseStream}
-		body.finish = func(success bool, reason string, upstreamFailure bool) {
-			defer s.acctRelease(bookCtx, token.ID, eventID)
-			defer releaseUser()
-			elapsed := int(time.Since(startedAt).Milliseconds())
-			if success {
-				_, _ = s.tokens.Update(bookCtx, pool, token.ID, map[string]any{
-					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
-				})
-				_ = s.events.UpdateStatus(bookCtx, eventID, "success", "", elapsed)
-				_ = s.models.IncrementGenerationCount(bookCtx, modelItem.ID)
-				if principal != nil && principal.User != nil {
-					_ = s.users.IncrementGenerationCount(bookCtx, principal.User.ID)
+		upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
+		if upstreamModel == "" {
+			upstreamModel = modelItem.ID
+		}
+		var lastErr error
+		busy := 0
+		for _, token := range active {
+			slots := poolAccountConcurrency(pool, token)
+			admitted, gateErr := s.acctAcquire(bookCtx, token.ID, eventID, slots)
+			if gateErr != nil {
+				return nil, gateErr
+			}
+			if !admitted {
+				busy++
+				continue
+			}
+			recordBookkeepingError("set chat account", s.events.SetAccount(bookCtx, eventID, token.ID, token.AccountEmail))
+			recordBookkeepingError("touch chat account", s.tokens.TouchLastUsed(bookCtx, token.ID))
+			dispatch, dispatchErr := s.models.Dispatch().Start(bookCtx, eventID, route.ID, token.ID)
+			if dispatchErr != nil {
+				s.acctRelease(bookCtx, token.ID, eventID)
+				return nil, dispatchErr
+			}
+			var responseHeader http.Header
+			var responseBody io.ReadCloser
+			responseStream := stream
+			var callErr error
+			switch pool {
+			case "custom":
+				response, upstreamErr := s.custom.ChatCompletions(ctx, stringValue(token.Meta["base_url"]), token.Value, upstreamModel, payload, stream)
+				callErr = upstreamErr
+				if response != nil {
+					responseHeader, responseBody, responseStream = response.Header, response.Body, response.Stream
 				}
-				_ = s.maybeGrantInviteReward(bookCtx, principal)
-				return
+			case "grok":
+				var text string
+				if grok.IsBuildTextModel(upstreamModel) {
+					var accessToken string
+					accessToken, callErr = s.ensureGrokBuildCredential(ctx, token)
+					if callErr == nil {
+						text, callErr = s.grok.GenerateBuildText(ctx, accessToken, prompt, upstreamModel)
+					}
+				} else {
+					text, callErr = s.grok.GenerateText(ctx, token.Value, prompt, grok.ChatModeForModel(upstreamModel))
+				}
+				if callErr == nil {
+					responseHeader, responseBody = openAITextResponse(modelItem.EffectiveName(), text, stream)
+				}
+			case "chatgpt":
+				var text string
+				text, callErr = s.chatgpt.GenerateText(ctx, token.Value, prompt, upstreamModel)
+				if callErr == nil {
+					responseHeader, responseBody = openAITextResponse(modelItem.EffectiveName(), text, stream)
+				}
 			}
-			if upstreamFailure {
-				s.markTokenFailure(bookCtx, pool, token, "text", false, false)
+			if callErr == nil && responseBody == nil {
+				callErr = ErrProviderExecution
 			}
-			_ = s.events.UpdateStatus(bookCtx, eventID, "failed", reason, elapsed)
-			_ = s.refundIfNeeded(bookCtx, principal, eventID, price)
-		}
-		return &V1ChatResponse{Header: responseHeader, Body: body, Stream: responseStream}, nil
-	}
+			// Every real text attempt participates in the same quota refresh
+			// contract. Text-only balances remain independent from media quota.
+			_ = s.refreshDispatchQuota(routeCtx, pool, token, "text")
+			if callErr != nil {
+				s.acctRelease(bookCtx, token.ID, eventID)
+				lastErr = callErr
+				state, failureClass := dispatchFailureClass(callErr)
+				recordBookkeepingError("finish failed chat dispatch", s.models.Dispatch().Finish(bookCtx, dispatch.ID, state, failureClass, "", publicGenerationError(callErr)))
+				recordBookkeepingError("record failed chat route", s.models.Routes().RecordAccountRouteResult(bookCtx, token.ID, route.ID, failureClass, false))
+				switch {
+				case errors.Is(callErr, grok.ErrChallenge):
+					// Statsig is process-wide and account-independent. Rotating a
+					// route would repeat the rejected signature.
+					return nil, callErr
+				case errors.Is(callErr, custom.ErrAuth), errors.Is(callErr, chatgpt.ErrAuth), errors.Is(callErr, grok.ErrAuth):
+					s.markTokenFailure(bookCtx, pool, token, "text", true, false)
+					continue
+				case errors.Is(callErr, grok.ErrQuotaExhausted):
+					// Grok chat throttling is separate from its media credits.
+					s.markTokenFailure(bookCtx, pool, token, "text", false, false)
+					continue
+				case errors.Is(callErr, custom.ErrQuotaExhausted), errors.Is(callErr, chatgpt.ErrQuotaExhausted):
+					s.markTokenFailure(bookCtx, pool, token, "text", false, true)
+					continue
+				case errors.Is(callErr, custom.ErrTemporaryUpstream), errors.Is(callErr, chatgpt.ErrTemporaryUpstream), errors.Is(callErr, grok.ErrTemporaryUpstream):
+					s.markTokenFailure(bookCtx, pool, token, "text", false, false)
+					continue
+				default:
+					return nil, callErr
+				}
+			}
 
-	if lastErr == nil {
-		if busy > 0 {
-			lastErr = ErrConcurrencyFull
-		} else {
-			lastErr = ErrProviderExecution
+			body := &chatAccountingBody{inner: responseBody, stream: responseStream}
+			body.finish = func(success bool, reason string, upstreamFailure bool) {
+				defer s.acctRelease(bookCtx, token.ID, eventID)
+				defer releaseUser()
+				elapsed := int(time.Since(startedAt).Milliseconds())
+				if success {
+					_, updateErr := s.tokens.Update(bookCtx, pool, token.ID, map[string]any{
+						"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
+					})
+					recordBookkeepingError("record chat account success", updateErr)
+					recordBookkeepingError("complete chat event", s.events.UpdateStatus(bookCtx, eventID, "success", "", elapsed))
+					recordBookkeepingError("complete chat dispatch", s.models.Dispatch().Finish(bookCtx, dispatch.ID, "succeeded", "", "", nil))
+					recordBookkeepingError("record chat route success", s.models.Routes().RecordAccountRouteResult(bookCtx, token.ID, route.ID, "", true))
+					recordBookkeepingError("increment chat generation", s.models.IncrementGenerationCount(bookCtx, logicalItem.ID))
+					return
+				}
+				failureClass := "request"
+				if upstreamFailure {
+					s.markTokenFailure(bookCtx, pool, token, "text", false, false)
+					failureClass = "temporary"
+				}
+				recordBookkeepingError("fail chat event", s.events.UpdateStatus(bookCtx, eventID, "failed", safeStoredGenerationError(reason), elapsed))
+				recordBookkeepingError("fail chat dispatch", s.models.Dispatch().Finish(bookCtx, dispatch.ID, "failed", failureClass, "", errors.New(reason)))
+				recordBookkeepingError("record failed chat stream route", s.models.Routes().RecordAccountRouteResult(bookCtx, token.ID, route.ID, failureClass, false))
+				_ = s.refundIfNeeded(bookCtx, principal, eventID, price)
+			}
+			return &V1ChatResponse{Header: responseHeader, Body: body, Stream: responseStream}, nil
 		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		if busy > 0 {
+			return nil, ErrConcurrencyFull
+		}
+		return nil, ErrNoProviderAccount
+	})
+	if routeErr != nil {
+		return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, routeErr)
 	}
-	return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, lastErr)
+	return response, nil
 }
 
 func (s *V1Service) failChatCompletion(ctx context.Context, principal *APIPrincipal, eventID string, price float64, releaseUser func(), cause error) error {
 	releaseUser()
-	_ = s.events.UpdateStatus(ctx, eventID, "failed", cause.Error(), 0)
+	publicErr := publicGenerationError(cause)
+	recordBookkeepingError("update failed chat event", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(cause), 0))
 	_ = s.refundIfNeeded(ctx, principal, eventID, price)
-	switch {
-	case errors.Is(cause, custom.ErrBadRequest):
-		return fmt.Errorf("%w: %v", ErrUnsupportedParams, cause)
-	case errors.Is(cause, chatgpt.ErrContentPolicy):
-		return fmt.Errorf("%w: %v", ErrUnsupportedParams, cause)
-	case errors.Is(cause, custom.ErrAuth), errors.Is(cause, chatgpt.ErrAuth), errors.Is(cause, grok.ErrAuth):
-		return fmt.Errorf("%w: %v", ErrProviderAuth, cause)
-	case errors.Is(cause, custom.ErrQuotaExhausted), errors.Is(cause, chatgpt.ErrQuotaExhausted), errors.Is(cause, grok.ErrQuotaExhausted):
-		return fmt.Errorf("%w: %v", ErrProviderQuota, cause)
-	case errors.Is(cause, custom.ErrTemporaryUpstream), errors.Is(cause, chatgpt.ErrTemporaryUpstream), errors.Is(cause, grok.ErrTemporaryUpstream):
-		return fmt.Errorf("%w: %v", ErrProviderTemporary, cause)
-	case errors.Is(cause, ErrConcurrencyFull):
-		return cause
-	default:
-		return fmt.Errorf("%w: %v", ErrProviderExecution, cause)
-	}
+	return publicErr
 }
 
 func openAITextResponse(modelName, content string, stream bool) (http.Header, io.ReadCloser) {
@@ -1036,7 +1088,69 @@ func chatPrompt(messages []any) string {
 }
 
 func (s *V1Service) PrepareImageRequest(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
-	return s.prepareImageExecution(ctx, principal, in, "v1", true)
+	in.RequestID = strings.TrimSpace(in.RequestID)
+	if in.RequestID == "" {
+		return s.prepareImageExecution(ctx, principal, in, "v1", true)
+	}
+	if principal == nil || principal.Credential == nil {
+		return nil, ErrInvalidAPIKey
+	}
+	if len(in.RequestID) > 191 {
+		return nil, fmt.Errorf("%w: idempotency key is too long", ErrUnsupportedParams)
+	}
+	canonical, fingerprint, err := canonicalImageIdempotencyInput(in)
+	if err != nil {
+		return nil, err
+	}
+	in = canonical
+	if existing, err := s.imageTaskFromEvent(ctx, principal, in.RequestID, fingerprint); err == nil {
+		return s.waitForImageResult(ctx, principal, in.RequestID, fingerprint, existing)
+	} else if !errors.Is(err, ErrImageTaskNotFound) {
+		return nil, err
+	}
+
+	key := imageJobKey(principal.Credential.ID, in.RequestID)
+	candidate := newAsyncImageJob(fingerprint)
+	actual, loaded := s.imageJobs.LoadOrStore(key, candidate)
+	job := actual.(*asyncImageJob)
+	if loaded {
+		if job.fingerprint != fingerprint {
+			return nil, ErrIdempotencyConflict
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w: waiting for idempotent image request: %v", ErrProviderTemporary, ctx.Err())
+		case <-job.done:
+			if noRouteFailover(job.err) {
+				if existing, lookupErr := s.imageTaskFromEvent(ctx, principal, in.RequestID, fingerprint); lookupErr == nil {
+					return s.waitForImageResult(ctx, principal, in.RequestID, fingerprint, existing)
+				}
+			}
+			return job.response, job.err
+		}
+	}
+
+	lockKey := "idem:image:" + key
+	lockToken := randomUpper(24)
+	lockAcquired, lockErr := s.conc.Acquire(ctx, lockKey, 1, lockToken)
+	if lockErr != nil {
+		s.imageJobs.CompareAndDelete(key, candidate)
+		return nil, lockErr
+	}
+	if !lockAcquired {
+		s.imageJobs.CompareAndDelete(key, candidate)
+		return s.waitForImageResult(ctx, principal, in.RequestID, fingerprint, nil)
+	}
+	response, execErr := s.prepareImageExecution(ctx, principal, in, "v1", true, fingerprint)
+	if execErr != nil {
+		if existing, lookupErr := s.imageTaskFromEvent(ctx, principal, in.RequestID, fingerprint); lookupErr == nil {
+			response, execErr = s.waitForImageResult(ctx, principal, in.RequestID, fingerprint, existing)
+		}
+	}
+	candidate.complete(response, execErr)
+	s.conc.Release(context.Background(), lockKey, lockToken)
+	time.AfterFunc(asyncImageJobRetention, func() { s.imageJobs.CompareAndDelete(key, candidate) })
+	return response, execErr
 }
 
 // StartImageRequest starts an opt-in asynchronous OpenAI image request. The
@@ -1045,7 +1159,7 @@ func (s *V1Service) PrepareImageRequest(ctx context.Context, principal *APIPrinc
 // from charging or rendering the same image more than once.
 func (s *V1Service) StartImageRequest(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, bool, error) {
 	in.RequestID = strings.TrimSpace(in.RequestID)
-	if principal == nil || principal.User == nil {
+	if principal == nil || principal.Credential == nil {
 		return nil, false, ErrInvalidAPIKey
 	}
 	if in.RequestID == "" {
@@ -1054,27 +1168,40 @@ func (s *V1Service) StartImageRequest(ctx context.Context, principal *APIPrincip
 	if len(in.RequestID) > 191 {
 		return nil, false, fmt.Errorf("%w: idempotency key is too long", ErrUnsupportedParams)
 	}
+	canonical, fingerprint, err := canonicalImageIdempotencyInput(in)
+	if err != nil {
+		return nil, false, err
+	}
+	in = canonical
 
-	if existing, err := s.imageTaskFromEvent(ctx, principal, in.RequestID); err == nil {
+	if existing, err := s.imageTaskFromEvent(ctx, principal, in.RequestID, fingerprint); err == nil {
 		return existing, false, nil
 	} else if !errors.Is(err, ErrImageTaskNotFound) {
 		return nil, false, err
 	}
 
-	key := imageJobKey(principal.User.ID, in.RequestID)
-	candidate := newAsyncImageJob()
+	key := imageJobKey(principal.Credential.ID, in.RequestID)
+	candidate := newAsyncImageJob(fingerprint)
 	actual, loaded := s.imageJobs.LoadOrStore(key, candidate)
 	job := actual.(*asyncImageJob)
 	if loaded {
+		if job.fingerprint != fingerprint {
+			return nil, false, ErrIdempotencyConflict
+		}
 		response, pending := asyncImageJobResponse(job, in.RequestID, s.imageTaskURL(in.RequestID, in.BaseURL))
 		return response, pending, nil
 	}
 
 	lockKey := "idem:image:" + key
 	lockToken := randomUpper(24)
-	if !s.conc.Acquire(ctx, lockKey, 1, lockToken) {
+	lockAcquired, lockErr := s.conc.Acquire(ctx, lockKey, 1, lockToken)
+	if lockErr != nil {
 		s.imageJobs.CompareAndDelete(key, candidate)
-		if existing, err := s.imageTaskFromEvent(ctx, principal, in.RequestID); err == nil {
+		return nil, false, lockErr
+	}
+	if !lockAcquired {
+		s.imageJobs.CompareAndDelete(key, candidate)
+		if existing, err := s.imageTaskFromEvent(ctx, principal, in.RequestID, fingerprint); err == nil {
 			return existing, false, nil
 		} else if !errors.Is(err, ErrImageTaskNotFound) {
 			return nil, false, err
@@ -1084,7 +1211,7 @@ func (s *V1Service) StartImageRequest(ctx context.Context, principal *APIPrincip
 
 	executionCtx := context.WithoutCancel(ctx)
 	go func() {
-		response, err := s.prepareImageExecution(executionCtx, principal, in, "v1", true)
+		response, err := s.prepareImageExecution(executionCtx, principal, in, "v1", true, fingerprint)
 		candidate.complete(response, err)
 		s.conc.Release(context.Background(), lockKey, lockToken)
 		time.AfterFunc(asyncImageJobRetention, func() {
@@ -1095,8 +1222,86 @@ func (s *V1Service) StartImageRequest(ctx context.Context, principal *APIPrincip
 	return asyncImagePendingResponse(in.RequestID, s.imageTaskURL(in.RequestID, in.BaseURL)), true, nil
 }
 
-func imageJobKey(userID, requestID string) string {
-	return strings.TrimSpace(userID) + ":" + strings.TrimSpace(requestID)
+func (s *V1Service) waitForImageResult(ctx context.Context, principal *APIPrincipal, requestID, fingerprint string, first map[string]any) (map[string]any, error) {
+	deadline := time.NewTimer(12 * time.Minute)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	current := first
+	for {
+		if current == nil {
+			result, err := s.imageTaskFromEvent(ctx, principal, requestID, fingerprint)
+			if err != nil && !errors.Is(err, ErrImageTaskNotFound) {
+				return nil, err
+			}
+			current = result
+		}
+		if current != nil {
+			switch current["status"] {
+			case "completed":
+				return map[string]any{
+					"created": current["created"], "data": current["data"], "model": current["model"], "kind": "image",
+				}, nil
+			case "failed":
+				return nil, fmt.Errorf("%w: previous idempotent image request failed", ErrProviderExecution)
+			case "queued", "in_progress":
+				// The event row is durable and already carries request_id/poll_url.
+				// Do not add another 12-minute synchronous wait after BytePlus has
+				// reported accepted/unknown; reverse proxies commonly time out first
+				// and hide the recovery headers from the caller.
+				return current, ErrGenerationAccepted
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w: waiting for idempotent image request: %v", ErrProviderTemporary, ctx.Err())
+		case <-deadline.C:
+			return nil, fmt.Errorf("%w: waiting for idempotent image request timed out", ErrProviderTemporary)
+		case <-ticker.C:
+			current = nil
+		}
+	}
+}
+
+func imageRequestFingerprint(in V1ImageRequest) string {
+	referenceHashes := make([]string, 0, len(in.ReferenceImages))
+	for _, reference := range in.ReferenceImages {
+		sum := sha256.Sum256([]byte(reference))
+		referenceHashes = append(referenceHashes, hex.EncodeToString(sum[:]))
+	}
+	payload := struct {
+		Model, Prompt, Size, Quality, ResponseFormat, Background, OutputFormat, AspectRatio, Resolution string
+		N                                                                                               int
+		References                                                                                      []string
+		ReferenceGrid, DeAI                                                                             bool
+	}{strings.TrimSpace(in.Model), in.Prompt, strings.TrimSpace(in.Size), strings.TrimSpace(in.Quality),
+		strings.TrimSpace(in.ResponseFormat), strings.TrimSpace(in.Background), strings.TrimSpace(in.OutputFormat), strings.TrimSpace(in.AspectRatio), strings.TrimSpace(in.Resolution), in.N, referenceHashes,
+		in.ReferenceGrid, in.DeAI}
+	raw, _ := json.Marshal(payload)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// canonicalImageIdempotencyInput normalizes only request fields whose omitted
+// and explicit forms execute identically. It intentionally hashes references
+// before reference-grid transformation, then the same fingerprint is carried
+// all the way to the event row. Recomputing after mutation makes an exact retry
+// look like a conflicting request.
+func canonicalImageIdempotencyInput(in V1ImageRequest) (V1ImageRequest, string, error) {
+	in.RequestID = strings.TrimSpace(in.RequestID)
+	if in.N == 0 {
+		in.N = 1
+	}
+	responseFormat, err := normalizeImageResponseFormat(in.ResponseFormat)
+	if err != nil {
+		return in, "", err
+	}
+	in.ResponseFormat = responseFormat
+	return in, imageRequestFingerprint(in), nil
+}
+
+func imageJobKey(credentialID, requestID string) string {
+	return strings.TrimSpace(credentialID) + ":" + strings.TrimSpace(requestID)
 }
 
 func (s *V1Service) imageTaskURL(requestID, requestBaseURL string) string {
@@ -1123,13 +1328,16 @@ func asyncImageJobResponse(job *asyncImageJob, requestID, pollURL string) (map[s
 	select {
 	case <-job.done:
 		if job.err != nil {
+			if noRouteFailover(job.err) {
+				return asyncImagePendingResponse(requestID, pollURL), true
+			}
 			return map[string]any{
 				"id":         requestID,
 				"object":     "image.generation.task",
 				"status":     "failed",
 				"request_id": requestID,
 				"poll_url":   pollURL,
-				"error":      job.err.Error(),
+				"error":      safeGenerationErrorText(job.err),
 				"data":       []any{},
 			}, false
 		}
@@ -1148,15 +1356,7 @@ func asyncImageJobResponse(job *asyncImageJob, requestID, pollURL string) (map[s
 	}
 }
 
-func (s *V1Service) prepareSessionImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
-	return s.prepareImageExecution(ctx, principal, in, "user", true)
-}
-
-func (s *V1Service) prepareAdminTestImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
-	return s.prepareImageExecution(ctx, principal, in, "admin", false)
-}
-
-func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool) (map[string]any, error) {
+func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool, canonicalFingerprint ...string) (map[string]any, error) {
 	s.applyGlobalProxy(ctx)
 	// Detach the whole execution from the request lifecycle. The frontend tracks
 	// progress by polling /jobs/mine, so a client disconnect — or an nginx/CDN
@@ -1173,6 +1373,20 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// generation from running on for minutes and surfacing a late "success" on an
 	// already-abandoned event.
 	ctx = context.WithoutCancel(ctx)
+	eventFingerprint := ""
+	if len(canonicalFingerprint) > 0 {
+		eventFingerprint = strings.TrimSpace(canonicalFingerprint[0])
+	}
+	// Internal callers normally have no idempotency key. If one does, compute
+	// the canonical fingerprint before any reference-grid mutation as a safe
+	// fallback; public API entry points pass the already-computed value.
+	if strings.TrimSpace(in.RequestID) != "" && eventFingerprint == "" {
+		canonical, fingerprint, err := canonicalImageIdempotencyInput(in)
+		if err != nil {
+			return nil, err
+		}
+		in, eventFingerprint = canonical, fingerprint
+	}
 	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
 		gridded, err := applyReferenceFaceSwap(in.ReferenceImages)
 		if err != nil {
@@ -1206,15 +1420,19 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	genCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
 
-	// Per-user concurrency gate (画图台 + API key combined). Admin model-tests are
-	// exempt. Held for the whole generation; released on return.
-	if source != "admin" && principal != nil && principal.User != nil {
+	// Each service credential can define an independent concurrency cap. Admin
+	// model tests are exempt; zero means unlimited.
+	if source != "admin" && principal != nil && principal.Credential != nil {
 		slot := randomUpper(12)
-		if !s.userAcquire(ctx, principal.User, slot) {
+		admitted, gateErr := s.credentialAcquire(ctx, principal, slot)
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		if !admitted {
 			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
 			return nil, ErrUserConcurrencyFull
 		}
-		defer s.userRelease(ctx, principal.User.ID, slot)
+		defer s.credentialRelease(ctx, principal.Credential.ID, slot)
 	}
 
 	modelItem, resolution, aspectRatio, price, err := s.prepareImage(ctx, principal, in, charge)
@@ -1239,16 +1457,8 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// upstreamURL is the provider's original artifact URL. API clients always
 	// receive a gateway URL; the gateway hides provider CORS and auth differences.
 	var upstreamURL string
-	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI, in.RequestID)
+	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI, in.RequestID, in.ResponseFormat, eventFingerprint)
 	if err != nil {
-		// Charging happens before event creation. If persistence fails (including a
-		// distributed idempotency race stopped by the unique index), refund this
-		// attempt directly because there is no event row to claim via Refunded.
-		if price > 0 && principal != nil && principal.User != nil {
-			if updated, refundErr := s.users.AdjustCredits(ctx, principal.User.ID, price); refundErr == nil {
-				principal.User = updated
-			}
-		}
 		return nil, err
 	}
 	if apiRequest && storeOutput {
@@ -1262,174 +1472,29 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	defer s.inflight.Done(eventID)
 	startedAt := time.Now()
 
-	var imageBytes []byte
-	switch s.effectiveProvider(genCtx, modelItem) {
-	case "adobe":
-		b, u, execErr := s.generateAdobeImageWithFallback(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, adobe.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, adobe.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, adobe.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			case errors.Is(execErr, adobe.ErrContentRejected):
-				return nil, execErr
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
+	imageBytes, upstreamURL, execErr := s.dispatchImageRoutes(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
+	if execErr != nil {
+		if noRouteFailover(execErr) {
+			// create_task is non-idempotent. Accepted and submission-unknown
+			// outcomes stay pending so task lookup can resume a known task id or
+			// conservatively await maintenance without ever resubmitting.
+			if errors.Is(execErr, byteplus.ErrTaskAccepted) {
+				if event, lookupErr := s.events.GetByID(ctx, eventID); lookupErr == nil {
+					s.startAcceptedImageRecovery(ctx, event)
+				} else {
+					recordBookkeepingError("load accepted image event", lookupErr)
+				}
+				return nil, errors.Join(ErrProviderTemporary, byteplus.ErrTaskAccepted)
 			}
+			return nil, errors.Join(ErrProviderTemporary, byteplus.ErrTaskSubmissionUnknown)
 		}
-		imageBytes = b
-		upstreamURL = u
-	case "byteplus":
-		b, u, execErr := s.generateBytePlusImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			return nil, mapBytePlusImageError(execErr)
-		}
-		imageBytes = b
-		upstreamURL = u
-	case "chatgpt":
-		b, u, execErr := s.generateChatGPTImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, chatgpt.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, chatgpt.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, chatgpt.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-			}
-		}
-		imageBytes = b
-		upstreamURL = u
-	case "leonardo":
-		b, u, execErr := s.generateLeonardoImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, leonardo.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, leonardo.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, leonardo.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-			}
-		}
-		imageBytes = b
-		upstreamURL = u
-	case "krea":
-		b, u, execErr := s.generateKreaImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, krea.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, krea.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, krea.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-			}
-		}
-		imageBytes = b
-		upstreamURL = u
-	case "imagine":
-		b, u, execErr := s.generateImagineImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, imagine.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, imagine.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, imagine.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-			}
-		}
-		imageBytes = b
-		upstreamURL = u
-	case "runway":
-		b, u, execErr := s.generateRunwayImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, runway.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, runway.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, runway.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-			}
-		}
-		imageBytes = b
-		upstreamURL = u
-	case "grok":
-		// Lite (fast mode) text-to-image — the only media a free grok account can
-		// generate; aspect ratio is mapped to Grok's mediaGenInput format.
-		b, u, execErr := s.generateGrokImage(genCtx, eventID, modelItem, in, aspectRatio, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, grok.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, grok.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, grok.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-			}
-		}
-		imageBytes = b
-		upstreamURL = u
-	case "custom":
-		b, u, execErr := s.generateCustomImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
-		if execErr != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-			switch {
-			case errors.Is(execErr, custom.ErrAuth):
-				return nil, ErrProviderAuth
-			case errors.Is(execErr, custom.ErrQuotaExhausted):
-				return nil, ErrProviderQuota
-			case errors.Is(execErr, custom.ErrTemporaryUpstream):
-				return nil, ErrProviderTemporary
-			default:
-				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-			}
-		}
-		imageBytes = b
-		upstreamURL = u
-	default:
-		_ = s.refundIfNeeded(ctx, principal, eventID, price)
-		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider not implemented", 0)
-		return nil, fmt.Errorf("%w: %s", ErrProviderUnsupported, modelItem.Provider)
+		recordBookkeepingError("update failed image event", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
+		return nil, publicGenerationError(execErr)
 	}
 	if apiRequest && in.ResponseFormat == "b64_json" && len(imageBytes) == 0 {
 		_ = s.refundIfNeeded(ctx, principal, eventID, price)
-		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider returned no image bytes", 0)
-		return nil, fmt.Errorf("%w: provider returned no image bytes", ErrProviderExecution)
+		recordBookkeepingError("update empty image event", s.events.UpdateStatus(ctx, eventID, "failed", ErrProviderExecution.Error(), 0))
+		return nil, ErrProviderExecution
 	}
 	// 去AI特征: post-process before storing/returning. Best-effort — a decode
 	// failure keeps the original bytes rather than failing a paid generation.
@@ -1438,13 +1503,36 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			imageBytes = processed
 		}
 	}
+	imageMimeType := ""
+	imageExtension := ""
+	if len(imageBytes) > 0 {
+		imageMimeType, imageExtension, err = detectImageArtifact(imageBytes)
+		if err != nil {
+			_ = s.refundIfNeeded(ctx, principal, eventID, price)
+			recordBookkeepingError("update invalid image artifact", s.events.UpdateStatus(ctx, eventID, "failed", ErrProviderExecution.Error(), 0))
+			return nil, ErrProviderExecution
+		}
+	}
 	if storeOutput {
+		// The object key and metadata follow payload magic, never a provider URL
+		// suffix or stale Content-Type. This matters for BytePlus, whose resource
+		// endpoint can label JPEG/WebP/AVIF results as PNG.
+		relativePath = replaceMediaExtension(relativePath, imageExtension)
+		if !apiRequest {
+			fileURL = replaceMediaExtension(fileURL, imageExtension)
+		}
+		if err := s.events.SetArtifact(ctx, eventID, relativePath, imageMimeType); err != nil {
+			_ = s.refundIfNeeded(ctx, principal, eventID, price)
+			recordBookkeepingError("update image artifact metadata", err)
+			recordBookkeepingError("update image metadata failure", s.events.UpdateStatus(ctx, eventID, "failed", ErrProviderExecution.Error(), 0))
+			return nil, ErrProviderExecution
+		}
 		// Upload to RustFS. On failure the generation fails and credits are
 		// refunded — we never fall back to local disk.
-		if err := s.store.Put(genCtx, relativePath, imageBytes, "image/png"); err != nil {
+		if err := s.store.Put(genCtx, relativePath, imageBytes, imageMimeType); err != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", "storage upload failed: "+err.Error(), 0)
-			return nil, fmt.Errorf("%w: %v", ErrProviderExecution, err)
+			recordBookkeepingError("update image storage failure", s.events.UpdateStatus(ctx, eventID, "failed", ErrProviderExecution.Error(), 0))
+			return nil, ErrProviderExecution
 		}
 		// Best-effort thumbnail for list views; the image serving route falls
 		// back to the original when the thumb object is missing.
@@ -1457,12 +1545,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		return nil, err
 	}
 	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
-	if principal != nil && principal.User != nil {
-		_ = s.users.IncrementGenerationCount(ctx, principal.User.ID)
-	}
-	if charge {
-		_ = s.maybeGrantInviteReward(ctx, principal)
-	}
 	if apiRequest {
 		if in.ResponseFormat == "b64_json" {
 			b64 := base64.StdEncoding.EncodeToString(imageBytes)
@@ -1470,7 +1552,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				"created":    time.Now().Unix(),
 				"data":       []map[string]any{{"b64_json": b64}},
 				"model":      modelItem.EffectiveName(),
-				"provider":   modelItem.Provider,
 				"kind":       "image",
 				"b64_json":   b64,
 				"elapsed_ms": elapsedMS,
@@ -1484,7 +1565,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				"created":    time.Now().Unix(),
 				"data":       []map[string]any{{"url": fileURL}},
 				"model":      modelItem.EffectiveName(),
-				"provider":   modelItem.Provider,
 				"kind":       "image",
 				"url":        fileURL,
 				"elapsed_ms": elapsedMS,
@@ -1502,7 +1582,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				"created":    time.Now().Unix(),
 				"data":       []map[string]any{{"url": outURL}},
 				"model":      modelItem.EffectiveName(),
-				"provider":   modelItem.Provider,
 				"kind":       "image",
 				"url":        outURL,
 				"elapsed_ms": elapsedMS,
@@ -1517,7 +1596,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			"created":    time.Now().Unix(),
 			"data":       []map[string]any{{"b64_json": b64}},
 			"model":      modelItem.EffectiveName(),
-			"provider":   modelItem.Provider,
 			"kind":       "image",
 			"b64_json":   b64,
 			"elapsed_ms": elapsedMS,
@@ -1529,7 +1607,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		"created":    time.Now().Unix(),
 		"data":       []map[string]any{{"url": fileURL, "b64_json": nil}},
 		"model":      modelItem.EffectiveName(),
-		"provider":   modelItem.Provider,
 		"kind":       "image",
 		"url":        fileURL,
 		"elapsed_ms": elapsedMS,
@@ -1542,23 +1619,40 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 // scoped to the authenticated API-key owner and returned in OpenAI image shape.
 func (s *V1Service) ImageTask(ctx context.Context, principal *APIPrincipal, requestID string) (map[string]any, error) {
 	requestID = strings.TrimSpace(requestID)
-	if principal == nil || principal.User == nil || requestID == "" {
+	if principal == nil || principal.Credential == nil || requestID == "" {
 		return nil, ErrImageTaskNotFound
 	}
-	if value, ok := s.imageJobs.Load(imageJobKey(principal.User.ID, requestID)); ok {
-		response, _ := asyncImageJobResponse(value.(*asyncImageJob), requestID, s.imageTaskURL(requestID, ""))
-		return response, nil
+	if value, ok := s.imageJobs.Load(imageJobKey(principal.Credential.ID, requestID)); ok {
+		job := value.(*asyncImageJob)
+		response, pending := asyncImageJobResponse(job, requestID, s.imageTaskURL(requestID, ""))
+		if !pending {
+			return response, nil
+		}
+		select {
+		case <-job.done:
+			if job.err == nil || !noRouteFailover(job.err) {
+				return response, nil
+			}
+		default:
+			return response, nil
+		}
+		// A completed local goroutine can still represent a durable accepted task.
+		// Fall through to the event-backed recovery instead of pinning polling to
+		// the local temporary error until imageJobs retention expires.
 	}
 	return s.imageTaskFromEvent(ctx, principal, requestID)
 }
 
-func (s *V1Service) imageTaskFromEvent(ctx context.Context, principal *APIPrincipal, requestID string) (map[string]any, error) {
-	event, err := s.events.GetImageByRequestID(ctx, principal.User.ID, requestID)
+func (s *V1Service) imageTaskFromEvent(ctx context.Context, principal *APIPrincipal, requestID string, expectedFingerprint ...string) (map[string]any, error) {
+	event, err := s.events.GetImageByRequestID(ctx, principal.Credential.ID, requestID)
 	if err != nil {
 		return nil, err
 	}
 	if event == nil {
 		return nil, ErrImageTaskNotFound
+	}
+	if len(expectedFingerprint) > 0 && strings.TrimSpace(event.RequestFingerprint) != "" && event.RequestFingerprint != expectedFingerprint[0] {
+		return nil, ErrIdempotencyConflict
 	}
 	result := map[string]any{
 		"id":         requestID,
@@ -1567,12 +1661,23 @@ func (s *V1Service) imageTaskFromEvent(ctx context.Context, principal *APIPrinci
 		"poll_url":   s.imageTaskURL(requestID, ""),
 		"event_id":   event.ID,
 		"created":    event.TS.Unix(),
+		"model":      event.Model,
 		"data":       []any{},
 	}
 	switch event.Status {
 	case "success":
 		if strings.TrimSpace(event.File) == "" {
 			return nil, fmt.Errorf("%w: recovered image file is missing", ErrProviderTemporary)
+		}
+		result["status"] = "completed"
+		if strings.TrimSpace(event.MimeType) != "" {
+			result["mime_type"] = event.MimeType
+		}
+		if storedImageResponseFormat(event.ResponseFormat) == "url" {
+			contentURL := publicImageContentURL(s.outputBaseURL(""), event.ID)
+			result["data"] = []map[string]any{{"url": contentURL}}
+			result["url"] = contentURL
+			break
 		}
 		response, err := s.store.Get(ctx, event.File, "")
 		if err != nil {
@@ -1582,209 +1687,127 @@ func (s *V1Service) imageTaskFromEvent(ctx context.Context, principal *APIPrinci
 		if response.StatusCode >= http.StatusBadRequest {
 			return nil, fmt.Errorf("%w: recovered image is unavailable", ErrProviderTemporary)
 		}
-		body, err := io.ReadAll(io.LimitReader(response.Body, 32<<20+1))
-		if err != nil || len(body) == 0 || len(body) > 32<<20 {
+		body, err := io.ReadAll(io.LimitReader(response.Body, netguard.MaxImageBytes+1))
+		if err != nil || len(body) == 0 || int64(len(body)) > netguard.MaxImageBytes {
 			return nil, fmt.Errorf("%w: recovered image is invalid", ErrProviderTemporary)
 		}
-		result["status"] = "completed"
-		result["data"] = []map[string]any{{"b64_json": base64.StdEncoding.EncodeToString(body)}}
+		mimeType, _, detectErr := detectImageArtifact(body)
+		if detectErr != nil {
+			return nil, fmt.Errorf("%w: recovered image is invalid", ErrProviderTemporary)
+		}
+		if mimeType != event.MimeType {
+			recordBookkeepingError("repair recovered image MIME", s.events.SetMimeType(ctx, event.ID, mimeType))
+			result["mime_type"] = mimeType
+		}
+		encoded := base64.StdEncoding.EncodeToString(body)
+		result["data"] = []map[string]any{{"b64_json": encoded}}
+		result["b64_json"] = encoded
 	case "failed":
 		result["status"] = "failed"
-		result["error"] = strings.TrimSpace(event.Error)
+		result["error"] = safeStoredGenerationError(event.Error)
 	default:
 		result["status"] = "in_progress"
+		s.startAcceptedImageRecovery(ctx, event)
 	}
 	return result, nil
 }
 
-func (s *V1Service) prepareSessionVideo(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
-	return s.prepareVideoExecution(ctx, principal, in, "user", true)
+func storedImageResponseFormat(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "b64_json") {
+		return "b64_json"
+	}
+	// URL is the OpenAI-compatible default. It is also the safest fallback for
+	// legacy rows created before response_format was persisted because it avoids
+	// loading and base64-expanding a large object inside every task poll.
+	return "url"
 }
 
-func (s *V1Service) prepareAdminTestVideo(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
-	return s.prepareVideoExecution(ctx, principal, in, "admin", false)
+// startAcceptedImageRecovery launches one background resume for a durable
+// BytePlus parent task. Unknown submissions have no task id and deliberately do
+// nothing here: replaying create_task could double-charge the account.
+func (s *V1Service) startAcceptedImageRecovery(parent context.Context, event *model.EventLog) {
+	if event == nil || event.Status != "pending" || event.Provider != "byteplus" || s.byteplus == nil || s.store == nil {
+		return
+	}
+	attempt, err := s.models.Dispatch().LatestAcceptedForEvent(parent, event.ID)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			recordBookkeepingError("load accepted image dispatch", err)
+		}
+		return
+	}
+	if strings.TrimSpace(attempt.UpstreamTaskID) == "" {
+		return
+	}
+	if _, loaded := s.imageRecoveries.LoadOrStore(attempt.ID, struct{}{}); loaded {
+		return
+	}
+	go func(event model.EventLog, attempt model.DispatchAttempt) {
+		defer s.imageRecoveries.Delete(attempt.ID)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 12*time.Minute)
+		defer cancel()
+		s.inflight.Add(event.ID, cancel)
+		defer s.inflight.Done(event.ID)
+
+		account, accountErr := s.tokens.Get(ctx, "byteplus", attempt.AccountID)
+		if accountErr != nil || account == nil || strings.TrimSpace(account.Value) == "" {
+			recordBookkeepingError("load accepted image account", accountErr)
+			return
+		}
+		data, _, resumeErr := s.byteplus.ResumeImageTask(ctx, account.Value, attempt.UpstreamTaskID, true)
+		if resumeErr != nil {
+			// A transient poll/download failure keeps the accepted task recoverable.
+			// Explicit terminal provider outcomes can safely close the event.
+			if errors.Is(resumeErr, byteplus.ErrQuotaExhausted) || errors.Is(resumeErr, byteplus.ErrRiskControl) || errors.Is(resumeErr, byteplus.ErrInvalidParams) {
+				publicErr := publicGenerationError(resumeErr)
+				recordBookkeepingError("finish accepted image event", s.events.UpdateStatus(ctx, event.ID, "failed", publicErr.Error(), 0))
+				recordBookkeepingError("finish accepted image dispatch", s.models.Dispatch().Finish(ctx, attempt.ID, "failed", dispatchFailureClassName(resumeErr), attempt.UpstreamTaskID, publicErr))
+			}
+			return
+		}
+		if len(data) == 0 {
+			return
+		}
+		objectKey, mimeType, detectErr := recoveredImageArtifact(event.File, event.ID, data)
+		if detectErr != nil {
+			recordBookkeepingError("reject accepted image artifact", detectErr)
+			return
+		}
+		if metadataErr := s.events.SetArtifact(ctx, event.ID, objectKey, mimeType); metadataErr != nil {
+			recordBookkeepingError("update accepted image artifact metadata", metadataErr)
+			return
+		}
+		if putErr := s.store.Put(ctx, objectKey, data, mimeType); putErr != nil {
+			recordBookkeepingError("store accepted image", putErr)
+			return
+		}
+		elapsed := int(time.Since(event.TS).Milliseconds())
+		if updateErr := s.events.UpdateStatus(ctx, event.ID, "success", "", elapsed); updateErr != nil {
+			recordBookkeepingError("complete accepted image event", updateErr)
+			return
+		}
+		recordBookkeepingError("complete accepted image dispatch", s.models.Dispatch().Finish(ctx, attempt.ID, "succeeded", "", attempt.UpstreamTaskID, nil))
+		recordBookkeepingError("complete accepted image route", s.models.Routes().RecordAccountRouteResult(ctx, attempt.AccountID, attempt.ModelRouteID, "", true))
+		_, updateErr := s.tokens.Update(ctx, "byteplus", account.ID, map[string]any{
+			"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
+		})
+		recordBookkeepingError("complete accepted image account", updateErr)
+		_ = s.refreshDispatchQuota(withDispatchRoute(ctx, mustDispatchRoute(ctx, s.models, attempt.ModelRouteID), 0), "byteplus", *account, "image")
+		recordBookkeepingError("increment accepted image generation", s.models.IncrementGenerationCount(ctx, event.Model))
+	}(*event, *attempt)
 }
 
-func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, source string, charge bool) (map[string]any, error) {
-	s.applyGlobalProxy(ctx)
-	// Detach from the request lifecycle — see prepareImageExecution. `ctx`
-	// (WithoutCancel) carries all bookkeeping; `genCtx` is the cancellable work
-	// context (12-min backstop — video polls up to 10 min — and registered so the
-	// maintenance sweep can cancel a stuck render when it abandons the row).
-	ctx = context.WithoutCancel(ctx)
-	if source == "v1" {
-		in.BaseURL = s.outputBaseURL(in.BaseURL)
-	}
-	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
-		gridded, err := applyReferenceFaceSwap(in.ReferenceImages)
-		if err != nil {
-			return nil, err
-		}
-		in.ReferenceImages = gridded
-	}
-	if source != "admin" {
-		if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
-			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
-			return nil, err
-		}
-	}
-	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
-	defer cancel()
+func dispatchFailureClassName(err error) string {
+	_, class := dispatchFailureClass(err)
+	return class
+}
 
-	// Per-user concurrency gate (画图台 + API key combined); admin tests exempt.
-	if source != "admin" && principal != nil && principal.User != nil {
-		slot := randomUpper(12)
-		if !s.userAcquire(ctx, principal.User, slot) {
-			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
-			return nil, ErrUserConcurrencyFull
-		}
-		defer s.userRelease(ctx, principal.User.ID, slot)
+func mustDispatchRoute(ctx context.Context, models *repo.ModelRepository, routeID string) model.ModelRoute {
+	route, err := models.Routes().GetRoute(ctx, routeID)
+	if err != nil || route == nil {
+		return model.ModelRoute{ID: routeID, QuotaBucketKey: "byteplus.computing_points"}
 	}
-
-	modelItem, resolution, aspectRatio, duration, price, err := s.prepareVideo(ctx, principal, in, charge)
-	if err != nil {
-		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
-		return nil, err
-	}
-	refCount := len(in.ReferenceImages) + len(in.ReferenceVideos) + len(in.ReferenceAudios)
-	// API-key (source "v1") requests return base64 inline and never persist a
-	// file — see prepareImageExecution for the rationale.
-	noStore := source == "v1"
-	var fileURL, relativePath string
-	if !noStore {
-		fileURL, relativePath = s.allocateOutput(principal, "mp4", in.BaseURL)
-	}
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, refCount, price, relativePath, source, nil, false, "")
-	if err != nil {
-		return nil, err
-	}
-	// Register so the maintenance sweep can cancel this render if it abandons the
-	// row; deregister on return.
-	s.inflight.Add(eventID, cancel)
-	defer s.inflight.Done(eventID)
-	startedAt := time.Now()
-
-	// API-key (noStore) requests return the upstream video URL directly.
-	// downloadResult=false skips the download. grok asset URLs are auth-gated
-	// (a plain GET 403s) → gatedVideoURL routes them through the /content proxy.
-	prov := s.effectiveProvider(genCtx, modelItem)
-	urlOnly := noStore
-	gatedVideoURL := prov == "grok"
-	var videoBytes []byte
-	var videoURL string
-	var execErr error
-	switch prov {
-	case "adobe":
-		videoBytes, videoURL, execErr = s.generateAdobeVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
-	case "runway":
-		videoBytes, videoURL, execErr = s.generateRunwayVideo(genCtx, eventID, modelItem, in, aspectRatio, parseDurationSeconds(duration), !urlOnly)
-	case "leonardo":
-		videoBytes, videoURL, execErr = s.generateLeonardoVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
-	case "grok":
-		videoBytes, videoURL, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
-	case "oreate":
-		videoBytes, videoURL, execErr = s.generateOreateVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
-	case "custom":
-		videoBytes, videoURL, execErr = s.generateCustomVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
-	default:
-		_ = s.refundIfNeeded(ctx, principal, eventID, price)
-		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider not implemented", 0)
-		return nil, fmt.Errorf("%w: %s", ErrProviderUnsupported, modelItem.Provider)
-	}
-	if execErr != nil {
-		_ = s.refundIfNeeded(ctx, principal, eventID, price)
-		_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
-		switch {
-		case errors.Is(execErr, ErrNoProviderAccount):
-			return nil, ErrNoProviderAccount
-		case errors.Is(execErr, adobe.ErrAuth), errors.Is(execErr, runway.ErrAuth), errors.Is(execErr, grok.ErrAuth), errors.Is(execErr, oreate.ErrAuth), errors.Is(execErr, custom.ErrAuth):
-			return nil, ErrProviderAuth
-		case errors.Is(execErr, adobe.ErrQuotaExhausted), errors.Is(execErr, runway.ErrQuotaExhausted), errors.Is(execErr, grok.ErrQuotaExhausted), errors.Is(execErr, oreate.ErrQuotaExhausted), errors.Is(execErr, custom.ErrQuotaExhausted):
-			return nil, ErrProviderQuota
-		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, oreate.ErrTemporaryUpstream), errors.Is(execErr, oreate.ErrRiskControl), errors.Is(execErr, custom.ErrTemporaryUpstream):
-			return nil, ErrProviderTemporary
-		case errors.Is(execErr, adobe.ErrContentRejected), errors.Is(execErr, oreate.ErrContentRejected):
-			return nil, execErr
-		default:
-			return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
-		}
-	}
-	if !noStore {
-		if err := s.store.Put(genCtx, relativePath, videoBytes, "video/mp4"); err != nil {
-			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", "storage upload failed: "+err.Error(), 0)
-			return nil, fmt.Errorf("%w: %v", ErrProviderExecution, err)
-		}
-		// Best-effort stills: first frame (downscaled) for list thumbnails and
-		// the full-res last frame for 首尾帧 continuation. Missing objects fall
-		// back to the video itself at serve time.
-		if thumb, last, terr := extractVideoFrames(genCtx, videoBytes); terr == nil {
-			if len(thumb) > 0 {
-				_ = s.store.Put(genCtx, ThumbKey(relativePath), thumb, "image/jpeg")
-			}
-			if len(last) > 0 {
-				_ = s.store.Put(genCtx, LastFrameKey(relativePath), last, "image/jpeg")
-			}
-		}
-	}
-	elapsedMS := int(time.Since(startedAt).Milliseconds())
-	if err := s.events.UpdateStatus(ctx, eventID, "success", "", elapsedMS); err != nil {
-		return nil, err
-	}
-	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
-	if principal != nil && principal.User != nil {
-		_ = s.users.IncrementGenerationCount(ctx, principal.User.ID)
-	}
-	if charge {
-		_ = s.maybeGrantInviteReward(ctx, principal)
-	}
-	if noStore && strings.TrimSpace(videoURL) != "" {
-		// Return the upstream video URL. grok URLs are auth-gated → store on the
-		// event and hand back the /content proxy (re-fetches with the account token).
-		outURL := videoURL
-		if gatedVideoURL {
-			_ = s.events.SetFile(ctx, eventID, videoURL)
-			if base := strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"); base != "" {
-				outURL = base + "/v1/videos/" + eventID + "/content"
-			}
-		}
-		return map[string]any{
-			"created":    time.Now().Unix(),
-			"data":       []map[string]any{{"url": outURL}},
-			"model":      modelItem.EffectiveName(),
-			"provider":   modelItem.Provider,
-			"kind":       "video",
-			"url":        outURL,
-			"elapsed_ms": elapsedMS,
-			"charged":    price,
-			"credits":    principalCredits(principal),
-		}, nil
-	}
-	if noStore {
-		b64 := base64.StdEncoding.EncodeToString(videoBytes)
-		return map[string]any{
-			"created":    time.Now().Unix(),
-			"data":       []map[string]any{{"b64_json": b64}},
-			"model":      modelItem.EffectiveName(),
-			"provider":   modelItem.Provider,
-			"kind":       "video",
-			"b64_json":   b64,
-			"elapsed_ms": elapsedMS,
-			"charged":    price,
-			"credits":    principalCredits(principal),
-		}, nil
-	}
-	return map[string]any{
-		"created":    time.Now().Unix(),
-		"data":       []map[string]any{{"url": fileURL}},
-		"model":      modelItem.EffectiveName(),
-		"provider":   modelItem.Provider,
-		"kind":       "video",
-		"url":        fileURL,
-		"elapsed_ms": elapsedMS,
-		"charged":    price,
-		"credits":    principalCredits(principal),
-	}, nil
+	return *route
 }
 
 // ===== /v1/videos — OpenAI Sora-style async jobs =====
@@ -1795,6 +1818,25 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 // StartVideoJob validates+charges, creates the job event, kicks the render off in
 // the background, and returns the OpenAI video object (status "queued").
 func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
+	if principal == nil || principal.Credential == nil {
+		return nil, ErrInvalidAPIKey
+	}
+	in.RequestID = strings.TrimSpace(in.RequestID)
+	if in.RequestID == "" {
+		return nil, fmt.Errorf("%w: idempotency key is required for video requests", ErrUnsupportedParams)
+	}
+	if len(in.RequestID) > 191 {
+		return nil, fmt.Errorf("%w: idempotency key is too long", ErrUnsupportedParams)
+	}
+	fingerprint := videoRequestFingerprint(in)
+	if existing, lookupErr := s.events.GetByRequestID(ctx, principal.Credential.ID, "video", in.RequestID); lookupErr != nil {
+		return nil, lookupErr
+	} else if existing != nil {
+		if strings.TrimSpace(existing.RequestFingerprint) != "" && existing.RequestFingerprint != fingerprint {
+			return nil, ErrIdempotencyConflict
+		}
+		return s.videoJobFromEvent(existing), nil
+	}
 	ctx = context.WithoutCancel(ctx)
 	if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
 		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
@@ -1807,18 +1849,82 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 	}
 	// Source "v1": no output file is allocated — the result is the upstream URL,
 	// stored on the event when the render completes.
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages)+len(in.ReferenceVideos)+len(in.ReferenceAudios), price, "", "v1", nil, false, "")
+	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages)+len(in.ReferenceVideos)+len(in.ReferenceAudios), price, "", "v1", nil, false, in.RequestID, "", fingerprint)
 	if err != nil {
+		// The database uniqueness boundary is authoritative across processes. A
+		// concurrent winner may have inserted after our initial read; re-read and
+		// return that job instead of surfacing a transient duplicate-key error.
+		if existing, lookupErr := s.events.GetByRequestID(ctx, principal.Credential.ID, "video", in.RequestID); lookupErr == nil && existing != nil {
+			if strings.TrimSpace(existing.RequestFingerprint) != "" && existing.RequestFingerprint != fingerprint {
+				return nil, ErrIdempotencyConflict
+			}
+			return s.videoJobFromEvent(existing), nil
+		}
 		return nil, err
 	}
 	go s.runVideoJob(ctx, principal, in, modelItem, eventID, aspectRatio, resolution, duration, price)
 	return videoJobObject(eventID, modelItem.EffectiveName(), "queued", 0, duration, sizeFromRatioRes(aspectRatio, resolution), time.Now().Unix(), 0, ""), nil
 }
 
+func videoRequestFingerprint(in V1VideoRequest) string {
+	referenceImages := make([]string, 0, len(in.ReferenceImages))
+	for _, reference := range in.ReferenceImages {
+		sum := sha256.Sum256([]byte(reference))
+		referenceImages = append(referenceImages, hex.EncodeToString(sum[:]))
+	}
+	hashMedia := func(items []MediaReference) []string {
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			sum := sha256.Sum256(item.Data)
+			out = append(out, strings.ToLower(strings.TrimSpace(item.ContentType))+":"+hex.EncodeToString(sum[:]))
+		}
+		return out
+	}
+	payload := struct {
+		Model, Prompt, Duration, AspectRatio, Resolution string
+		ReferenceImages                                  []string
+		ReferenceVideos                                  []string
+		ReferenceAudios                                  []string
+		GenerateAudio, ReferenceGrid                     bool
+	}{
+		strings.TrimSpace(in.Model), in.Prompt, strings.TrimSpace(in.Duration), strings.TrimSpace(in.AspectRatio), strings.TrimSpace(in.Resolution),
+		referenceImages, hashMedia(in.ReferenceVideos), hashMedia(in.ReferenceAudios), in.GenerateAudio, in.ReferenceGrid,
+	}
+	raw, _ := json.Marshal(payload)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *V1Service) videoJobFromEvent(ev *model.EventLog) map[string]any {
+	status, progress := videoJobStatus(ev)
+	completedAt := int64(0)
+	if ev.Status == "success" || ev.Status == "failed" {
+		completedAt = ev.UpdatedAt.Unix()
+	}
+	errMsg := ""
+	if ev.Status == "failed" {
+		errMsg = safeStoredGenerationError(ev.Error)
+	}
+	return videoJobObject(ev.ID, ev.Model, status, progress, ev.Duration, sizeFromRatioRes(ev.Ratio, ev.Resolution), ev.TS.Unix(), completedAt, errMsg)
+}
+
 // runVideoJob renders the clip in the background, capturing the upstream URL
 // (downloadResult=false → no bytes, no RustFS) and storing it on the event.
 func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, modelItem *model.ModelConfig, eventID, aspectRatio, resolution, duration string, price float64) {
 	s.applyGlobalProxy(ctx)
+	if principal != nil && principal.Credential != nil {
+		slot := "video:" + eventID
+		admitted, gateErr := s.credentialAcquire(ctx, principal, slot)
+		if gateErr != nil {
+			recordBookkeepingError("update video concurrency failure", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(gateErr), 0))
+			return
+		}
+		if !admitted {
+			_ = s.events.UpdateStatus(ctx, eventID, "failed", ErrUserConcurrencyFull.Error(), 0)
+			return
+		}
+		defer s.credentialRelease(context.WithoutCancel(ctx), principal.Credential.ID, slot)
+	}
 	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
 	defer cancel()
 	s.inflight.Add(eventID, cancel)
@@ -1831,7 +1937,7 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		gridded, gridErr := applyReferenceFaceSwap(in.ReferenceImages)
 		if gridErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
-			_ = s.events.UpdateStatus(ctx, eventID, "failed", gridErr.Error(), 0)
+			recordBookkeepingError("update video reference failure", s.events.UpdateStatus(ctx, eventID, "failed", ErrUnsupportedParams.Error(), 0))
 			return
 		}
 		in.ReferenceImages = gridded
@@ -1839,34 +1945,15 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 
 	// No-store: capture only the UPSTREAM video URL. /content streams it on demand
 	// (grok URLs are auth-gated → fetched with the generating account's token).
-	var videoURL string
-	var execErr error
-	switch s.effectiveProvider(genCtx, modelItem) {
-	case "adobe":
-		_, videoURL, execErr = s.generateAdobeVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
-	case "runway":
-		_, videoURL, execErr = s.generateRunwayVideo(genCtx, eventID, modelItem, in, aspectRatio, parseDurationSeconds(duration), false)
-	case "leonardo":
-		_, videoURL, execErr = s.generateLeonardoVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
-	case "grok":
-		_, videoURL, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
-	case "oreate":
-		_, videoURL, execErr = s.generateOreateVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
-	case "custom":
-		_, videoURL, execErr = s.generateCustomVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
-	default:
-		_ = s.refundIfNeeded(ctx, principal, eventID, price)
-		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider not implemented", 0)
-		return
-	}
+	_, videoURL, execErr := s.dispatchVideoRoutes(genCtx, eventID, modelItem, in, aspectRatio, resolution, duration, false)
 	if execErr != nil {
 		_ = s.refundIfNeeded(ctx, principal, eventID, price)
-		_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
+		recordBookkeepingError("update async video failure", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
 		return
 	}
 	if strings.TrimSpace(videoURL) == "" {
 		_ = s.refundIfNeeded(ctx, principal, eventID, price)
-		_ = s.events.UpdateStatus(ctx, eventID, "failed", "upstream returned no video url", 0)
+		recordBookkeepingError("update empty video event", s.events.UpdateStatus(ctx, eventID, "failed", ErrProviderExecution.Error(), 0))
 		return
 	}
 	// Store the upstream URL as the event's "file"; /content fetches it on demand.
@@ -1874,10 +1961,6 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		return
 	}
 	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
-	if principal != nil && principal.User != nil {
-		_ = s.users.IncrementGenerationCount(ctx, principal.User.ID)
-	}
-	_ = s.maybeGrantInviteReward(ctx, principal)
 }
 
 // VideoJob returns the OpenAI video object for a job, scoped to the caller.
@@ -1893,7 +1976,7 @@ func (s *V1Service) VideoJob(ctx context.Context, principal *APIPrincipal, id st
 	}
 	errMsg := ""
 	if ev.Status == "failed" {
-		errMsg = ev.Error
+		errMsg = safeStoredGenerationError(ev.Error)
 	}
 	modelName := ev.Model
 	if nameByID, nerr := s.models.NameMap(ctx); nerr == nil {
@@ -1930,14 +2013,26 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 		}
 		return s.grok.OpenAsset(ctx, acct.Value, ev.File)
 	}
-	// Other providers return publicly-fetchable URLs. Artifact bytes are the data
-	// plane and always use direct local egress to preserve the proxy allowance.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ev.File, nil)
+	// Other providers return publicly-fetchable URLs. Validate the initial URL and
+	// every redirect before direct local egress so an upstream-provided URL cannot
+	// turn this API into an internal-network proxy.
+	allowedHosts, err := s.assetAllowedHosts(ctx, ev)
+	if err != nil {
+		return nil, "", err
+	}
+	assetURL, err := netguard.ValidateAssetURL(ctx, ev.File, allowedHosts)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: rejected upstream video URL", ErrProviderTemporary)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL.String(), nil)
 	if err != nil {
 		return nil, "", err
 	}
 	client, err := globalProxyHTTPClient("", 5*time.Minute)
 	if err != nil {
+		return nil, "", err
+	}
+	if err := netguard.HardenHTTPClient(client, allowedHosts); err != nil {
 		return nil, "", err
 	}
 	resp, err := client.Do(req)
@@ -1948,27 +2043,28 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 		resp.Body.Close()
 		return nil, "", fmt.Errorf("%w: upstream video status %d", ErrProviderTemporary, resp.StatusCode)
 	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		ct = "video/mp4"
+	body, ct, guardErr := netguard.GuardResponse(resp, netguard.MediaVideo, netguard.MaxVideoBytes)
+	if guardErr != nil {
+		return nil, "", fmt.Errorf("%w: invalid upstream video", ErrProviderTemporary)
 	}
-	return resp.Body, ct, nil
+	return body, ct, nil
 }
 
 // OpenImageContent streams a no-store image by proxying the stored upstream URL.
 // chatgpt URLs are auth-gated (files.oaiusercontent.com — a plain GET 403s), so
 // they're fetched through the generating account's token; other providers'
-// URLs are public and proxied directly. The caller intentionally does not need
-// an API key or web session: this is the directly-downloadable URL returned by
-// the image API, and the event ID is a random opaque identifier.
+// URLs are public and proxied directly. Access is always scoped to the bearer
+// credential that created the event; the opaque event id is not authorization.
 func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
 	_ = s.applyGlobalProxy(ctx)
 	ev, err := s.events.GetByID(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return nil, "", err
 	}
-	if ev == nil || ev.Kind != "image" {
-		return nil, "", ErrVideoJobNotFound
+	if !eventOwnedByPrincipal(ev, principal, "image") {
+		// Deliberately collapse ownership mismatches into not-found so event ids
+		// cannot be used to enumerate another API credential's artifacts.
+		return nil, "", ErrImageTaskNotFound
 	}
 	file := strings.TrimSpace(ev.File)
 	if ev.Status != "success" || file == "" {
@@ -1987,9 +2083,16 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		}
 		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
 		if contentType == "" {
+			contentType = strings.TrimSpace(ev.MimeType)
+		}
+		if contentType == "" {
 			contentType = contentTypeForExt(filepath.Ext(file))
 		}
-		return resp.Body, contentType, nil
+		body, guardedType, guardErr := guardMediaStream(resp.Body, contentType, netguard.MediaImage, netguard.MaxImageBytes)
+		if guardErr != nil {
+			return nil, "", fmt.Errorf("%w: invalid stored image", ErrProviderTemporary)
+		}
+		return body, guardedType, nil
 	}
 	if ev.Provider == "chatgpt" && s.chatgpt != nil {
 		// Lazy cache: the first /content hit downloads through the residential
@@ -2028,7 +2131,11 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		if acct == nil || strings.TrimSpace(acct.Value) == "" {
 			return nil, "", fmt.Errorf("%w: grok account no longer available for this image", ErrProviderTemporary)
 		}
-		return s.grok.OpenAsset(ctx, acct.Value, ev.File)
+		body, ct, openErr := s.grok.OpenAsset(ctx, acct.Value, ev.File)
+		if openErr != nil {
+			return nil, "", openErr
+		}
+		return guardMediaStream(body, ct, netguard.MediaImage, netguard.MaxImageBytes)
 	}
 	// Lumina resource-utils URLs are session-bound and short-lived. Fetch them
 	// with the exact Cookie account that created the task, then expose the bytes
@@ -2046,14 +2153,28 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		if openErr != nil {
 			return nil, "", openErr
 		}
+		if ct != ev.MimeType {
+			recordBookkeepingError("persist BytePlus image MIME", s.events.SetMimeType(ctx, ev.ID, ct))
+		}
 		return s.cacheImageStream(ctx, cacheKey, io.NopCloser(bytes.NewReader(data)), ct)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ev.File, nil)
+	allowedHosts, err := s.assetAllowedHosts(ctx, ev)
+	if err != nil {
+		return nil, "", err
+	}
+	assetURL, err := netguard.ValidateAssetURL(ctx, ev.File, allowedHosts)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: rejected upstream image URL", ErrProviderTemporary)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL.String(), nil)
 	if err != nil {
 		return nil, "", err
 	}
 	client, err := globalProxyHTTPClient("", 5*time.Minute)
 	if err != nil {
+		return nil, "", err
+	}
+	if err := netguard.HardenHTTPClient(client, allowedHosts); err != nil {
 		return nil, "", err
 	}
 	resp, err := client.Do(req)
@@ -2064,11 +2185,111 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		resp.Body.Close()
 		return nil, "", fmt.Errorf("%w: upstream image status %d", ErrProviderTemporary, resp.StatusCode)
 	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		ct = "image/png"
+	body, ct, guardErr := netguard.GuardResponse(resp, netguard.MediaImage, netguard.MaxImageBytes)
+	if guardErr != nil {
+		return nil, "", fmt.Errorf("%w: invalid upstream image", ErrProviderTemporary)
 	}
-	return resp.Body, ct, nil
+	return body, ct, nil
+}
+
+func (s *V1Service) assetAllowedHosts(ctx context.Context, ev *model.EventLog) ([]string, error) {
+	if ev == nil {
+		return nil, ErrProviderTemporary
+	}
+	switch strings.ToLower(strings.TrimSpace(ev.Provider)) {
+	case "adobe":
+		return staticAssetHosts("adobe"), nil
+	case "runway":
+		return staticAssetHosts("runway"), nil
+	case "oreate":
+		return staticAssetHosts("oreate"), nil
+	case "custom":
+		account, err := s.tokens.Get(ctx, "custom", ev.AccountID)
+		if err != nil || account == nil {
+			return nil, fmt.Errorf("%w: custom account unavailable", ErrProviderTemporary)
+		}
+		base, parseErr := url.Parse(strings.TrimSpace(stringValue(account.Meta["base_url"])))
+		if parseErr != nil || base == nil || !strings.EqualFold(base.Scheme, "https") || base.Hostname() == "" {
+			return nil, fmt.Errorf("%w: custom account has unsafe base URL", ErrProviderTemporary)
+		}
+		return []string{base.Hostname()}, nil
+	default:
+		return nil, fmt.Errorf("%w: provider has no artifact host policy", ErrProviderTemporary)
+	}
+}
+
+func staticAssetHosts(provider string) []string {
+	switch provider {
+	case "adobe":
+		return []string{"adobe.com", "adobe.io", "amazonaws.com", "cloudfront.net"}
+	case "runway":
+		return []string{"runwayml.com", "runwayml.cloud", "amazonaws.com", "cloudfront.net"}
+	case "oreate":
+		return []string{"oreateai.com"}
+	default:
+		return nil
+	}
+}
+
+func downloadPublicArtifact(ctx context.Context, rawURL string, allowedHosts []string, bearer string, kind netguard.MediaKind, maxBytes int64) ([]byte, string, error) {
+	assetURL, err := netguard.ValidateAssetURL(ctx, rawURL, allowedHosts)
+	if err != nil {
+		return nil, "", err
+	}
+	client, err := globalProxyHTTPClient("", 5*time.Minute)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := netguard.HardenHTTPClient(client, allowedHosts); err != nil {
+		return nil, "", err
+	}
+	originalHost := strings.ToLower(assetURL.Hostname())
+	baseRedirectCheck := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := baseRedirectCheck(req, via); err != nil {
+			return err
+		}
+		req.Header.Del("Authorization")
+		if bearer != "" && strings.EqualFold(req.URL.Hostname(), originalHost) {
+			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(bearer))
+		}
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL.String(), nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(bearer))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("artifact status %d", resp.StatusCode)
+	}
+	body, contentType, err := netguard.GuardResponse(resp, kind, maxBytes)
+	if err != nil {
+		return nil, "", err
+	}
+	data, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		return nil, "", err
+	}
+	return data, contentType, nil
+}
+
+func readProviderArtifact(body io.ReadCloser, contentType string, kind netguard.MediaKind, maxBytes int64) ([]byte, error) {
+	guarded, _, err := guardMediaStream(body, contentType, kind, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(guarded)
+	_ = guarded.Close()
+	return data, err
 }
 
 // imageCacheKey maps an event ID to the RustFS object key holding a cached copy
@@ -2097,26 +2318,34 @@ func (s *V1Service) openCachedImage(ctx context.Context, key string) (io.ReadClo
 	if ct == "" {
 		ct = "image/png"
 	}
-	return resp.Body, ct, true
+	body, guardedType, guardErr := guardMediaStream(resp.Body, ct, netguard.MediaImage, netguard.MaxImageBytes)
+	if guardErr != nil {
+		return nil, "", false
+	}
+	return body, guardedType, true
 }
 
 // cacheImageStream reads a freshly downloaded image fully, stores a best-effort
 // copy under key, and returns the same bytes as a stream so the caller's
 // streaming contract is unchanged. A cache write failure never fails the fetch.
 func (s *V1Service) cacheImageStream(ctx context.Context, key string, body io.ReadCloser, ct string) (io.ReadCloser, string, error) {
-	data, err := io.ReadAll(body)
-	_ = body.Close()
+	guarded, guardedType, err := guardMediaStream(body, ct, netguard.MediaImage, netguard.MaxImageBytes)
+	if err != nil {
+		return nil, "", err
+	}
+	data, err := io.ReadAll(guarded)
+	_ = guarded.Close()
 	if err != nil {
 		return nil, "", err
 	}
 	if s.store != nil && s.store.Configured() && len(data) > 0 {
-		cct := strings.TrimSpace(ct)
-		if cct == "" {
-			cct = "image/png"
-		}
-		_ = s.store.Put(ctx, key, data, cct)
+		_ = s.store.Put(ctx, key, data, guardedType)
 	}
-	return io.NopCloser(bytes.NewReader(data)), ct, nil
+	return io.NopCloser(bytes.NewReader(data)), guardedType, nil
+}
+
+func guardMediaStream(body io.ReadCloser, contentType string, kind netguard.MediaKind, maxBytes int64) (io.ReadCloser, string, error) {
+	return netguard.GuardStream(body, contentType, -1, kind, maxBytes)
 }
 
 func publicImageContentURL(baseURL, eventID string) string {
@@ -2128,6 +2357,13 @@ func publicImageContentURL(baseURL, eventID string) string {
 }
 
 func (s *V1Service) outputBaseURL(requestBaseURL string) string {
+	if s != nil && s.settings != nil {
+		if value, err := s.settings.GetValue(context.Background(), "public.base_url"); err == nil {
+			if configured := strings.TrimRight(strings.TrimSpace(value), "/"); configured != "" {
+				return configured
+			}
+		}
+	}
 	if s != nil && s.cfg != nil {
 		if configured := strings.TrimRight(strings.TrimSpace(s.cfg.PublicBaseURL), "/"); configured != "" {
 			return configured
@@ -2141,13 +2377,15 @@ func (s *V1Service) videoEventForUser(ctx context.Context, principal *APIPrincip
 	if err != nil {
 		return nil, err
 	}
-	if ev == nil || ev.Kind != "video" {
-		return nil, ErrVideoJobNotFound
-	}
-	if principal != nil && principal.User != nil && ev.UserID != principal.User.ID {
+	if !eventOwnedByPrincipal(ev, principal, "video") {
 		return nil, ErrVideoJobNotFound
 	}
 	return ev, nil
+}
+
+func eventOwnedByPrincipal(ev *model.EventLog, principal *APIPrincipal, kind string) bool {
+	return ev != nil && ev.Kind == kind && principal != nil && principal.Credential != nil &&
+		strings.TrimSpace(ev.APICredentialID) != "" && ev.APICredentialID == principal.Credential.ID
 }
 
 // videoJobStatus maps our event status → OpenAI's (queued|in_progress|completed|
@@ -2219,40 +2457,24 @@ func sizeFromRatioRes(ratio, resolution string) string {
 	return fmt.Sprintf("%dx%d", w, h)
 }
 
-// hasActiveProviderToken reports whether the provider pool holds at least one
-// usable token for this kind of generation — mirrors the selection filter in
-// the generate* paths. Used to fail fast (before charging / creating a job)
-// with a clear "no account" error instead of dialing upstream with no token.
-func (s *V1Service) hasActiveProviderToken(ctx context.Context, provider, kind string) (bool, error) {
-	items, err := s.tokens.ListByPool(ctx, provider)
-	if err != nil {
-		return false, err
-	}
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		// Adobe tracks the two quotas separately. Grok's subscription tier is not
-		// an entitlement signal for media anymore; video/image availability is
-		// decided by the upstream generation response and cached credit balance.
-		if provider == "adobe" || provider == "grok" {
-			if kind == "video" && item.VideoLimited {
-				continue
-			}
-			if kind == "image" && item.ImageLimited {
-				continue
-			}
-		}
-		return true, nil
-	}
-	return false, nil
-}
-
 func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, charge bool) (*model.ModelConfig, string, string, float64, error) {
 	modelID := strings.TrimSpace(in.Model)
 	prompt := strings.TrimSpace(in.Prompt)
 	if modelID == "" || prompt == "" {
-		return nil, "", "", 0, errors.New("model and prompt required")
+		return nil, "", "", 0, fmt.Errorf("%w: model and prompt are required", ErrUnsupportedParams)
+	}
+	n := in.N
+	if n == 0 {
+		n = 1
+	}
+	if n != 1 {
+		return nil, "", "", 0, fmt.Errorf("%w: n must be 1", ErrUnsupportedParams)
+	}
+	if strings.TrimSpace(in.Background) != "" {
+		return nil, "", "", 0, fmt.Errorf("%w: background is not supported", ErrUnsupportedParams)
+	}
+	if strings.TrimSpace(in.OutputFormat) != "" {
+		return nil, "", "", 0, fmt.Errorf("%w: output_format is not supported", ErrUnsupportedParams)
 	}
 	modelItem, err := s.models.Get(ctx, modelID)
 	if err != nil {
@@ -2264,58 +2486,30 @@ func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, i
 	if !modelItem.Enabled || modelItem.Type != "image" {
 		return nil, "", "", 0, ErrUnknownModel
 	}
-	// Fail fast before charging if the provider has no usable account. Use the
-	// effective provider: a custom upstream serving this model id routes to
-	// "custom" (effectiveProvider only returns it when such an account exists, so
-	// the precheck is satisfied); otherwise check the native provider pool.
-	effectiveProvider := s.effectiveProvider(ctx, modelItem)
-	if effectiveProvider != "custom" {
-		if ok, err := s.hasActiveProviderToken(ctx, effectiveProvider, "image"); err != nil {
-			return nil, "", "", 0, err
-		} else if !ok {
-			return nil, "", "", 0, ErrNoProviderAccount
-		}
-	}
-	refLimit := 0
-	if modelItem.ImageToImage {
-		refLimit = modelItem.MaxReferenceImages
-		if refLimit <= 0 {
-			refLimit = 1
-		}
-	}
-	if len(in.ReferenceImages) > refLimit {
-		return nil, "", "", 0, errors.New("too many reference images")
-	}
-	// Reject oversized reference images before charging (all providers, all paths).
+	// Reject oversized reference images before any provider/account is selected.
 	if err := ensureReferenceSizes(in.ReferenceImages); err != nil {
 		return nil, "", "", 0, err
 	}
-	// Native providers use their own resolution parameter, derived from `size` on
-	// /v1 requests or supplied directly by the web UI. Only the GPT Image 2 family
-	// interprets `quality` as a resolution tier adapter.
 	aspectRatio, resolution := resolveImageSize(modelItem, in)
-	// Snap to the nearest ratio the model actually supports — a `size`-derived
-	// ratio (e.g. 1:3) must never be passed through to an upstream that rejects
-	// it (Runway 400s on ratios outside its list).
-	aspectRatio = snapRatio(aspectRatio, repo.JSONStrings(modelItem.Ratios))
-	// parseImageSize defaults a blank resolution to "2K" (OpenAI-size parity).
-	// For a model that doesn't price that tier — e.g. gpt-image-2 is 1K-only —
-	// fall back to its first supported tier so a missing/stale resolution from
-	// the client doesn't get rejected as "unsupported or unpriced".
-	if _, ok := modelPrice(modelItem, "image", resolution, "", false); !ok {
-		if fb := firstPricedResolution(modelItem); fb != "" {
-			resolution = fb
+	if strings.TrimSpace(in.Resolution) == "" && strings.TrimSpace(in.Quality) != "" {
+		switch strings.ToLower(strings.TrimSpace(in.Quality)) {
+		case "low":
+			resolution = "1K"
+		case "medium":
+			resolution = "2K"
+		case "high":
+			resolution = "4K"
 		}
 	}
-	var surcharge float64
-	if in.DeAI {
-		surcharge = s.deaiSurcharge(ctx, resolution)
+	operation := "generation"
+	if len(in.ReferenceImages) > 0 {
+		operation = "edit"
 	}
-	price, err := s.chargeForModel(ctx, principal, modelItem, "image", resolution, "", surcharge, charge)
-	if err != nil {
+	if _, err := s.firstAvailableRoute(ctx, modelItem.ID, "image", model.RouteRequirements{Operation: operation,
+		Ratio: aspectRatio, Resolution: resolution, ReferenceImages: len(in.ReferenceImages)}); err != nil {
 		return nil, "", "", 0, err
 	}
-	return modelItem, resolution, aspectRatio, price, nil
+	return modelItem, resolution, aspectRatio, 0, nil
 }
 
 func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, charge bool) (*model.ModelConfig, string, string, string, float64, error) {
@@ -2323,10 +2517,10 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 	prompt := strings.TrimSpace(in.Prompt)
 	duration := strings.TrimSpace(in.Duration)
 	if modelID == "" || prompt == "" {
-		return nil, "", "", "", 0, errors.New("model and prompt required")
+		return nil, "", "", "", 0, fmt.Errorf("%w: model and prompt are required", ErrUnsupportedParams)
 	}
 	if duration == "" {
-		return nil, "", "", "", 0, errors.New("duration required")
+		return nil, "", "", "", 0, fmt.Errorf("%w: duration is required", ErrUnsupportedParams)
 	}
 	modelItem, err := s.models.Get(ctx, modelID)
 	if err != nil {
@@ -2338,19 +2532,8 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 	if !modelItem.Enabled || modelItem.Type != "video" {
 		return nil, "", "", "", 0, ErrUnknownModel
 	}
-	// Fail fast before charging — effective provider (custom upstream by id, else native).
-	effectiveProvider := s.effectiveProvider(ctx, modelItem)
-	if effectiveProvider == "custom" {
-		// custom serves this id (effectiveProvider guaranteed it) — precheck ok
-	} else if ok, err := s.hasActiveProviderToken(ctx, effectiveProvider, "video"); err != nil {
-		return nil, "", "", "", 0, err
-	} else if !ok {
-		return nil, "", "", "", 0, ErrNoProviderAccount
-	}
-	if err := validateVideoReferenceLimits(modelItem, in); err != nil {
-		return nil, "", "", "", 0, err
-	}
-	// Reject oversized reference images before charging (all providers, all paths).
+	// Validate bytes before account selection; route-specific count constraints
+	// are matched as one capability profile below.
 	if err := ensureReferenceSizes(in.ReferenceImages); err != nil {
 		return nil, "", "", "", 0, err
 	}
@@ -2360,22 +2543,8 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 	if err := validateMediaReferences(in.ReferenceAudios, "audio"); err != nil {
 		return nil, "", "", "", 0, err
 	}
-	if len(in.ReferenceVideos) > 0 && (modelItem.ID == "firefly-kling-3" || modelItem.ID == "firefly-kling-o3") && parseDurationSeconds(duration) > 10 {
+	if len(in.ReferenceVideos) > 0 && (modelItem.ID == "kling-3" || modelItem.ID == "kling-o3") && parseDurationSeconds(duration) > 10 {
 		return nil, "", "", "", 0, fmt.Errorf("%w: Kling video modification supports 3s to 10s", ErrUnsupportedParams)
-	}
-	// Runway i2v strictly requires exactly one first-frame image. Enforce it here,
-	// BEFORE charging, so a missing/extra frame fails fast instead of charge →
-	// upstream reject → refund. generateRunwayVideo keeps its own guard too.
-	if modelItem.Provider == "runway" {
-		n := 0
-		for _, r := range in.ReferenceImages {
-			if strings.TrimSpace(r) != "" {
-				n++
-			}
-		}
-		if n != 1 {
-			return nil, "", "", "", 0, errors.New("runway 图生视频需要且仅需 1 张首帧图")
-		}
 	}
 	aspectRatio := strings.TrimSpace(strings.ReplaceAll(in.AspectRatio, "x", ":"))
 	if aspectRatio == "" {
@@ -2385,67 +2554,25 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 	if resolution == "" {
 		resolution = "720p"
 	}
-	if effectiveProvider == "adobe" {
-		engine, _ := resolveAdobeVideoEngine(modelItem.ID)
-		if !adobe.SupportsVideoDuration(engine, parseDurationSeconds(duration)) || !adobe.SupportsVideoResolution(engine, resolution) {
-			return nil, "", "", "", 0, ErrUnsupportedParams
-		}
-	}
-	price, err := s.chargeForModel(ctx, principal, modelItem, "video", resolution, duration, 0, charge)
-	if err != nil {
+	if _, err := s.firstAvailableRoute(ctx, modelItem.ID, "video", model.RouteRequirements{Operation: "generation",
+		Ratio: aspectRatio, Resolution: resolution, Duration: duration, ReferenceImages: len(in.ReferenceImages),
+		ReferenceVideos: len(in.ReferenceVideos), ReferenceAudios: len(in.ReferenceAudios), GenerateAudio: in.GenerateAudio}); err != nil {
 		return nil, "", "", "", 0, err
 	}
-	return modelItem, resolution, aspectRatio, duration, price, nil
+	return modelItem, resolution, aspectRatio, duration, 0, nil
 }
 
 func (s *V1Service) chargeForModel(ctx context.Context, principal *APIPrincipal, modelItem *model.ModelConfig, kind, resolution, duration string, surcharge float64, charge bool) (float64, error) {
-	// 代理用户走代理价(某档未设代理价则回退普通价)。principal.User 即将被扣费的
-	// 用户,无论画图台还是 key 调用都从这里取,所以一处即覆盖所有路径。
-	agent := principal != nil && principal.User != nil && principal.User.Role == "agent"
-	price, ok := modelPrice(modelItem, kind, resolution, duration, agent)
-	if !ok {
-		return 0, ErrUnsupportedParams
-	}
-	price += surcharge
-	if !charge || principal == nil || principal.User == nil {
-		return 0, nil
-	}
-	updated, debited, err := s.users.TryDebitCredits(ctx, principal.User.ID, price)
-	if err != nil {
-		return 0, err
-	}
-	if !debited {
-		if updated != nil {
-			principal.User = updated
-		}
-		return 0, ErrInsufficientFunds
-	}
-	principal.User = updated
-	return price, nil
+	// 2API does not meter or debit downstream credits. Provider quota is reserved
+	// independently by the account dispatcher.
+	return 0, nil
 }
 
 func (s *V1Service) userDir(principal *APIPrincipal) string {
-	if principal == nil {
+	if principal == nil || principal.Credential == nil {
 		return "anon"
 	}
-	return OwnerDir(principal.User)
-}
-
-// OwnerDir is the storage directory (= /images/<owner>/ segment) a user's outputs
-// live under: sanitized name → sanitized email-local → id → "anon".
-func OwnerDir(user *model.User) string {
-	if user != nil {
-		if d := sanitizeOwnerName(user.Name); d != "" {
-			return d
-		}
-		if d := sanitizeOwnerName(strings.Split(user.Email, "@")[0]); d != "" {
-			return d
-		}
-		if user.ID != "" {
-			return user.ID
-		}
-	}
-	return "anon"
+	return "api-" + sanitizeOwnerName(principal.Credential.ID)
 }
 
 // contentTypeForExt maps a file extension to a MIME type for storage uploads.
@@ -2457,6 +2584,10 @@ func contentTypeForExt(ext string) string {
 		return "image/jpeg"
 	case "webp":
 		return "image/webp"
+	case "avif":
+		return "image/avif"
+	case "heic", "heif":
+		return "image/heic"
 	case "gif":
 		return "image/gif"
 	case "mp4":
@@ -2468,6 +2599,46 @@ func contentTypeForExt(ext string) string {
 	default:
 		return "application/octet-stream"
 	}
+}
+
+func detectImageArtifact(raw []byte) (string, string, error) {
+	contentType := netguard.DetectMediaType(raw)
+	if !strings.HasPrefix(contentType, "image/") || contentType == "image/svg+xml" {
+		return "", "", netguard.ErrInvalidMedia
+	}
+	extension, ok := netguard.MediaExtension(contentType)
+	if !ok {
+		return "", "", netguard.ErrInvalidMedia
+	}
+	return contentType, extension, nil
+}
+
+func replaceMediaExtension(value, extension string) string {
+	value = strings.TrimSpace(value)
+	extension = strings.TrimSpace(extension)
+	if value == "" || extension == "" {
+		return value
+	}
+	if !strings.HasPrefix(extension, ".") {
+		extension = "." + extension
+	}
+	oldExtension := filepath.Ext(value)
+	if oldExtension == "" {
+		return value + extension
+	}
+	return strings.TrimSuffix(value, oldExtension) + extension
+}
+
+func recoveredImageArtifact(existingKey, eventID string, raw []byte) (string, string, error) {
+	contentType, extension, err := detectImageArtifact(raw)
+	if err != nil {
+		return "", "", err
+	}
+	objectKey := replaceMediaExtension(existingKey, extension)
+	if objectKey == "" {
+		objectKey = imageCacheKey(eventID) + extension
+	}
+	return objectKey, contentType, nil
 }
 
 // allocateOutput builds the object key (= relative path, user-scoped) and the
@@ -2486,32 +2657,35 @@ func (s *V1Service) allocateOutput(principal *APIPrincipal, ext, baseURL string)
 	return "/images/" + relativePath, relativePath
 }
 
-func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source string, refFiles []string, deai bool, requestID string) (string, error) {
+func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source string, refFiles []string, deai bool, requestID, responseFormat string, requestFingerprint ...string) (string, error) {
 	event := &model.EventLog{
-		ID:         "evt-" + randomUpper(24),
-		RequestID:  requestID,
-		TS:         time.Now(),
-		Kind:       kind,
-		Status:     "pending",
-		Model:      modelItem.ID,
-		Provider:   modelItem.Provider,
-		Prompt:     prompt,
-		Ratio:      ratio,
-		Resolution: resolution,
-		Duration:   duration,
-		Refs:       refs,
-		DeAI:       deai,
-		Source:     source,
-		Cost:       cost,
-		File:       file,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		ID:             "evt-" + randomUpper(24),
+		RequestID:      requestID,
+		ResponseFormat: strings.ToLower(strings.TrimSpace(responseFormat)),
+		TS:             time.Now(),
+		Kind:           kind,
+		Status:         "pending",
+		Model:          modelItem.EffectiveName(),
+		Prompt:         prompt,
+		Ratio:          ratio,
+		Resolution:     resolution,
+		Duration:       duration,
+		Refs:           refs,
+		DeAI:           deai,
+		Source:         source,
+		Cost:           cost,
+		File:           file,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if len(requestFingerprint) > 0 {
+		event.RequestFingerprint = requestFingerprint[0]
 	}
 	if len(refFiles) > 0 {
 		event.RefFiles = jsonArray(refFiles)
 	}
-	if principal != nil && principal.User != nil {
-		event.UserID = principal.User.ID
+	if principal != nil && principal.Credential != nil {
+		event.APICredentialID = principal.Credential.ID
 	}
 	if err := s.events.Create(ctx, event); err != nil {
 		return "", err
@@ -2600,6 +2774,16 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 	tempFailover bool,
 	retryTemporary bool,
 ) ([]byte, error) {
+	if plan, ok := dispatchPlanFromContext(ctx); ok {
+		var routeErr error
+		active, routeErr = s.routeAccounts(ctx, plan.Route, active)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		if len(active) == 0 {
+			return nil, ErrNoProviderAccount
+		}
+	}
 	tempDeadCount := 0
 	queueDeadline := time.Now().Add(providerAccountQueueWait)
 	tempRetryDeadline := time.Now().Add(tempRetryWindow)
@@ -2632,7 +2816,11 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 		busy := 0
 		for _, token := range active {
 			slots := poolAccountConcurrency(pool, token)
-			if !s.acctAcquire(ctx, token.ID, eventID, slots) {
+			admitted, gateErr := s.acctAcquire(ctx, token.ID, eventID, slots)
+			if gateErr != nil {
+				return nil, gateErr
+			}
+			if !admitted {
 				busy++
 				continue
 			}
@@ -2711,18 +2899,91 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
 	tempFailover bool,
 ) ([]byte, bool, bool, error) {
-	_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-	_ = s.tokens.TouchLastUsed(ctx, token.ID)
+	routeID := dispatchRouteFromContext(ctx)
+	if routeID != "" {
+		allowed, routeErr := s.models.Routes().AccountAllowsRouteInFlight(ctx, token.ID, routeID)
+		if routeErr != nil {
+			return nil, false, false, routeErr
+		}
+		if !allowed {
+			return nil, true, false, ErrProviderUnsupported
+		}
+	}
+	recordBookkeepingError("set generation account", s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail))
+	recordBookkeepingError("touch generation account", s.tokens.TouchLastUsed(ctx, token.ID))
 	authRefreshed := false
 	for {
+		var dispatchID string
+		var reservation *model.QuotaReservation
+		if routeID != "" {
+			attemptRow, startErr := s.models.Dispatch().Start(context.WithoutCancel(ctx), eventID, routeID, token.ID)
+			if startErr != nil {
+				return nil, false, false, startErr
+			}
+			dispatchID = attemptRow.ID
+			plan, _ := dispatchPlanFromContext(ctx)
+			bucketKey := strings.TrimSpace(plan.Route.QuotaBucketKey)
+			if binding, bindingErr := s.models.Routes().AccountRoute(ctx, token.ID, routeID); bindingErr == nil && strings.TrimSpace(binding.QuotaBucketKey) != "" {
+				bucketKey = strings.TrimSpace(binding.QuotaBucketKey)
+			}
+			if bucketKey != "" && plan.Cost > 0 {
+				unit := "credits"
+				if policy, ok := model.DecodeQuotaCostPolicy(plan.Route.QuotaCosts); ok && strings.TrimSpace(policy.Unit) != "" {
+					unit = strings.TrimSpace(policy.Unit)
+				}
+				reservation, startErr = s.models.Quotas().ReserveWithUnit(context.WithoutCancel(ctx), eventID, dispatchID, token.ID, bucketKey, unit, plan.Cost)
+				if startErr != nil {
+					quotaErr := providerQuotaError(pool, startErr)
+					recordBookkeepingError("finish rejected quota dispatch", s.models.Dispatch().Finish(context.WithoutCancel(ctx), dispatchID, "failed", "quota", "", publicGenerationError(quotaErr)))
+					return nil, true, false, quotaErr
+				}
+			}
+		}
 		data, err := attempt(token)
+		state, failureClass := dispatchFailureClass(err)
+		var upstreamRemaining *float64
+		if routeID != "" {
+			upstreamRemaining = s.refreshDispatchQuota(ctx, pool, token, kind)
+		}
+		if reservation != nil {
+			quotaCtx := context.WithoutCancel(ctx)
+			switch state {
+			case "succeeded", "accepted":
+				recordBookkeepingError("settle dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
+			case "unknown":
+				recordBookkeepingError("mark dispatch quota uncertain", s.models.Quotas().MarkUncertain(quotaCtx, reservation.ID))
+			default:
+				if failureClass == "quota" {
+					// An explicit provider quota verdict is authoritative. Releasing the
+					// hold after a refreshed zero would add the request cost back and make
+					// the exhausted bucket immediately schedulable again.
+					if upstreamRemaining == nil {
+						zero := 0.0
+						upstreamRemaining = &zero
+					}
+					recordBookkeepingError("settle exhausted dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
+				} else {
+					recordBookkeepingError("release dispatch quota", s.models.Quotas().Release(quotaCtx, reservation.ID))
+				}
+			}
+		}
+		if dispatchID != "" {
+			recordBookkeepingError("finish dispatch attempt", s.models.Dispatch().Finish(context.WithoutCancel(ctx), dispatchID, state, failureClass, dispatchUpstreamTaskID(err), publicGenerationError(err)))
+			recordBookkeepingError("record account route result", s.models.Routes().RecordAccountRouteResult(context.WithoutCancel(ctx), token.ID, routeID, failureClass, err == nil))
+		}
 		if err == nil {
-			_, _ = s.tokens.Update(ctx, pool, token.ID, map[string]any{
+			_, updateErr := s.tokens.Update(ctx, pool, token.ID, map[string]any{
 				"last_used_at":  time.Now(),
 				"success_total": gorm.Expr("success_total + 1"),
 				"fails":         0,
 			})
+			recordBookkeepingError("record account success", updateErr)
 			return data, false, false, nil
+		}
+		if failureClass == "entitlement" {
+			// Entitlement is scoped to this account+route. The durable binding was
+			// disabled above; the credential remains healthy for every other route.
+			return nil, true, false, err
 		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
 		if isQuota {
@@ -2774,108 +3035,125 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 	}
 }
 
+func dispatchUpstreamTaskID(err error) string {
+	if err == nil {
+		return ""
+	}
+	return byteplus.AcceptedTaskID(err)
+}
+
+func providerQuotaError(pool string, cause error) error {
+	switch pool {
+	case "adobe":
+		return fmt.Errorf("%w: %w", adobe.ErrQuotaExhausted, cause)
+	case "byteplus":
+		return fmt.Errorf("%w: %w", byteplus.ErrQuotaExhausted, cause)
+	case "chatgpt":
+		return fmt.Errorf("%w: %w", chatgpt.ErrQuotaExhausted, cause)
+	case "runway":
+		return fmt.Errorf("%w: %w", runway.ErrQuotaExhausted, cause)
+	case "grok":
+		return fmt.Errorf("%w: %w", grok.ErrQuotaExhausted, cause)
+	case "oreate":
+		return fmt.Errorf("%w: %w", oreate.ErrQuotaExhausted, cause)
+	case "custom":
+		return fmt.Errorf("%w: %w", custom.ErrQuotaExhausted, cause)
+	default:
+		return fmt.Errorf("%w: %v", ErrProviderQuota, cause)
+	}
+}
+
+// refreshDispatchQuota is deliberately called after every real provider
+// attempt, regardless of outcome. The snapshot is written while this attempt's
+// reservation is still held, so concurrent completions cannot erase one
+// another's allowance.
+func (s *V1Service) refreshDispatchQuota(parent context.Context, pool string, token model.TokenAccount, kind string) *float64 {
+	plan, ok := dispatchPlanFromContext(parent)
+	if !ok || strings.TrimSpace(plan.Route.QuotaBucketKey) == "" || pool == "custom" {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+	defer cancel()
+	var data map[string]any
+	var err error
+	switch pool {
+	case "adobe":
+		if s.adobe != nil {
+			data, err = s.adobe.FetchCreditsBalance(probeCtx, token.Value)
+		}
+	case "byteplus":
+		if s.byteplus != nil {
+			data, err = s.byteplus.FetchCreditsBalance(probeCtx, token.Value)
+		}
+	case "chatgpt":
+		if s.chatgpt != nil && kind == "image" {
+			data, err = s.chatgpt.FetchImageQuota(probeCtx, token.Value)
+		}
+	case "runway":
+		if s.runway != nil {
+			data, err = s.runway.FetchCreditsBalance(probeCtx, token.Value)
+		}
+	case "grok":
+		if s.grok != nil && kind != "text" {
+			data, err = s.grok.FetchCreditsBalance(probeCtx, token.Value)
+		}
+	case "oreate":
+		if s.oreate != nil {
+			data, err = s.oreate.FetchCreditsBalance(probeCtx, oreateAccountFromToken(token))
+		}
+	}
+	if err != nil || data == nil || boolValueWithDefault(data["unknown"], false) || boolValueWithDefault(data["auth_failed"], false) {
+		return nil
+	}
+	remaining, hasRemaining := anyFloat(data["remaining"])
+	if !hasRemaining {
+		return nil
+	}
+	var total *float64
+	if value, exists := anyFloat(data["total"]); exists {
+		total = &value
+	}
+	bucketKey := strings.TrimSpace(plan.Route.QuotaBucketKey)
+	if binding, bindingErr := s.models.Routes().AccountRoute(probeCtx, token.ID, plan.Route.ID); bindingErr == nil && strings.TrimSpace(binding.QuotaBucketKey) != "" {
+		bucketKey = strings.TrimSpace(binding.QuotaBucketKey)
+	}
+	resetAt := parseResetTime(data["reset_after"])
+	if resetAt == nil {
+		resetAt = parseResetTime(data["available_until"])
+	}
+	unit := "credits"
+	if policy, ok := model.DecodeQuotaCostPolicy(plan.Route.QuotaCosts); ok && strings.TrimSpace(policy.Unit) != "" {
+		unit = strings.TrimSpace(policy.Unit)
+	}
+	_, snapshotErr := s.models.Quotas().UpsertSnapshot(context.WithoutCancel(parent), token.ID, bucketKey, unit, total, &remaining, resetAt)
+	recordBookkeepingError("refresh quota snapshot", snapshotErr)
+	metaPatch := map[string]any{
+		"cached_quota_remaining": canonicalQuotaNumber(remaining),
+		"cached_quota_at":        int(time.Now().Unix()),
+	}
+	if total != nil {
+		metaPatch["cached_quota_total"] = canonicalQuotaNumber(*total)
+	}
+	if used, exists := anyFloat(data["used"]); exists {
+		metaPatch["cached_quota_used"] = canonicalQuotaNumber(used)
+	}
+	patch := map[string]any{}
+	if rawReset := strings.TrimSpace(stringValue(data["reset_after"])); rawReset != "" {
+		patch["cached_quota_reset_after"] = rawReset
+	} else if rawReset := strings.TrimSpace(stringValue(data["available_until"])); rawReset != "" {
+		patch["cached_quota_reset_after"] = rawReset
+	}
+	tokenErr := s.tokens.UpdateMergingMeta(context.WithoutCancel(parent), pool, token.ID, metaPatch, patch)
+	recordBookkeepingError("refresh quota account metadata", tokenErr)
+	return &remaining
+}
+
 func shouldMarkAccountQuota(err error) bool {
 	return !errors.Is(err, errAccountTaskQuota)
 }
 
 func adobeErrClass(e error) (bool, bool, bool, bool) {
 	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream), errors.Is(e, adobe.ErrDeadUpstream)
-}
-
-type adobeImageFallbackTarget struct {
-	provider string
-	modelID  string
-}
-
-type adobeImageGenerator func(*model.ModelConfig, V1ImageRequest) ([]byte, string, error)
-
-// adobeImageFallbacks maps only Adobe's third-party image catalog to ordered
-// provider candidates. Native Firefly models intentionally stay on Adobe:
-// silently changing those would alter the requested model semantics. Grok is
-// appended only for text-to-image because its image path cannot accept refs.
-func adobeImageFallbacks(modelID string, hasReferences bool) []adobeImageFallbackTarget {
-	var targets []adobeImageFallbackTarget
-	switch strings.ToLower(strings.TrimSpace(modelID)) {
-	case "firefly-gpt-image", "firefly-gpt-image-1.5", "firefly-gpt-image-2":
-		targets = append(targets, adobeImageFallbackTarget{provider: "chatgpt", modelID: "gpt-image-2"})
-	case "firefly-nano-banana-2":
-		targets = append(targets,
-			adobeImageFallbackTarget{provider: "runway", modelID: "nano-banana-2"},
-			adobeImageFallbackTarget{provider: "chatgpt", modelID: "gpt-image-2"},
-		)
-	case "firefly-nano-banana", "firefly-nano-banana-pro", "flux-kontext-max":
-		// Runway's Pro workflow accepts the same prompt, resolution tiers and
-		// reference images, so edits are not degraded into a text-only fallback.
-		targets = append(targets,
-			adobeImageFallbackTarget{provider: "runway", modelID: "nano-banana-pro"},
-			adobeImageFallbackTarget{provider: "chatgpt", modelID: "gpt-image-2"},
-		)
-	default:
-		return nil
-	}
-	if !hasReferences {
-		targets = append(targets, adobeImageFallbackTarget{provider: "grok", modelID: "grok-imagine-image"})
-	}
-	return targets
-}
-
-func adobeImageRetryTemporary(modelID string, hasReferences bool) bool {
-	return len(adobeImageFallbacks(modelID, hasReferences)) == 0
-}
-
-// runAdobeImageFallback owns the cross-provider decision while keeping the
-// provider implementations and billing path separate. The fallback receives
-// the original request unchanged (including references); only a cloned internal
-// model config is remapped. Any fallback failure remains classified as the
-// original Adobe temporary failure so account/auth errors from an optional
-// backup pool cannot change the public contract or poison the Adobe pool.
-func runAdobeImageFallback(modelItem *model.ModelConfig, in V1ImageRequest, primary, fallback adobeImageGenerator) ([]byte, string, error) {
-	data, imageURL, primaryErr := primary(modelItem, in)
-	if primaryErr == nil || !errors.Is(primaryErr, adobe.ErrTemporaryUpstream) || strings.TrimSpace(in.AccountID) != "" {
-		return data, imageURL, primaryErr
-	}
-	targets := adobeImageFallbacks(modelItem.ID, len(in.ReferenceImages) > 0)
-	if len(targets) == 0 {
-		return data, imageURL, primaryErr
-	}
-
-	var lastFallbackErr error
-	for _, target := range targets {
-		fallbackModel := *modelItem
-		fallbackModel.ID = target.modelID
-		fallbackModel.Provider = target.provider
-		fallbackModel.UpstreamModel = ""
-		data, imageURL, lastFallbackErr = fallback(&fallbackModel, in)
-		if lastFallbackErr == nil {
-			return data, imageURL, nil
-		}
-	}
-	return nil, "", fmt.Errorf("%w; fallback chain failed: %v", primaryErr, lastFallbackErr)
-}
-
-func (s *V1Service) generateAdobeImageWithFallback(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
-	return runAdobeImageFallback(modelItem, in,
-		func(item *model.ModelConfig, request V1ImageRequest) ([]byte, string, error) {
-			return s.generateAdobeImage(ctx, eventID, item, request, aspectRatio, resolution, noStore)
-		},
-		func(item *model.ModelConfig, request V1ImageRequest) ([]byte, string, error) {
-			provider := strings.TrimSpace(item.Provider)
-			if s.events != nil {
-				_ = s.events.SetProvider(ctx, eventID, provider)
-			}
-			log.Printf("adobe image temporary failure: falling back model=%s provider=%s upstream_model=%s", modelItem.ID, provider, item.ID)
-			switch provider {
-			case "runway":
-				return s.generateRunwayImage(ctx, eventID, item, request, aspectRatio, resolution, noStore)
-			case "chatgpt":
-				return s.generateChatGPTImage(ctx, eventID, item, request, aspectRatio, resolution, noStore)
-			case "grok":
-				return s.generateGrokImage(ctx, eventID, item, request, aspectRatio, noStore)
-			default:
-				return nil, "", ErrProviderUnsupported
-			}
-		},
-	)
 }
 
 // noStore url-only mode: adobe returns a presigned image URL (meta["image_url"]);
@@ -2926,14 +3204,20 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 			}
 			blobIDs = append(blobIDs, id)
 		}
-		d, meta, genErr := s.adobe.GenerateImage(ctx, token.Value, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, !urlOnly)
+		d, meta, genErr := s.adobe.GenerateImage(ctx, token.Value, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, false)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
+			if !urlOnly {
+				d, _, genErr = downloadPublicArtifact(ctx, imageURL, staticAssetHosts("adobe"), "", netguard.MediaImage, netguard.MaxImageBytes)
+				if genErr != nil {
+					genErr = fmt.Errorf("%w: invalid image artifact", adobe.ErrTemporaryUpstream)
+				}
+			}
 		}
 		return d, genErr
 	}, adobeErrClass, func(id string) (model.TokenAccount, bool) {
 		return s.refreshAdobeToken(ctx, id)
-	}, true, adobeImageRetryTemporary(modelItem.ID, len(in.ReferenceImages) > 0))
+	}, true, true)
 	return data, imageURL, err
 }
 
@@ -3000,9 +3284,15 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 			}
 			inputs.AudioBlobIDs = append(inputs.AudioBlobIDs, id)
 		}
-		bytes, meta, genErr := s.adobe.GenerateVideo(ctx, token.Value, engine, in.Prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, inputs, downloadResult)
+		bytes, meta, genErr := s.adobe.GenerateVideo(ctx, token.Value, engine, in.Prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, inputs, false)
 		if genErr == nil {
 			videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
+			if downloadResult {
+				bytes, _, genErr = downloadPublicArtifact(ctx, videoURL, staticAssetHosts("adobe"), "", netguard.MediaVideo, netguard.MaxVideoBytes)
+				if genErr != nil {
+					genErr = fmt.Errorf("%w: invalid video artifact", adobe.ErrTemporaryUpstream)
+				}
+			}
 		}
 		return bytes, genErr
 	}, adobeErrClass, func(id string) (model.TokenAccount, bool) {
@@ -3010,11 +3300,6 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	}, true)
 	return data, videoURL, err
 }
-
-// leonardoMinCredits is the per-generation token cost (one Leonardo image = 30
-// tokens). An account with fewer is treated as 限额 and skipped — it can't afford
-// a generation. Daily renewal (tokenRenewalDate) drives auto-recovery.
-const leonardoMinCredits = 30
 
 func (s *V1Service) generateRunwayVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
 	if s.runway == nil {
@@ -3053,64 +3338,29 @@ func (s *V1Service) generateRunwayVideo(ctx context.Context, eventID string, mod
 	}
 	s.rotateRoundRobin("runway", active)
 
-	var lastErr error
 	var videoURL string
-	busy := 0
-	for _, token := range active {
-		// 1 concurrent job per account: skip any account already generating.
-		if !s.acctAcquire(ctx, token.ID, eventID, 1) {
-			busy++
-			continue
+	data, err := s.runPoolWithFailover(ctx, eventID, "runway", active, "video", func(token model.TokenAccount) ([]byte, error) {
+		teamID := ""
+		if token.Meta != nil {
+			teamID = strings.TrimSpace(stringValue(token.Meta["team_id"]))
 		}
-		var data []byte
-		done, failover := func() (bool, bool) {
-			defer s.acctRelease(ctx, token.ID, eventID)
-			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-			_ = s.tokens.TouchLastUsed(ctx, token.ID)
-			teamID := ""
-			if token.Meta != nil {
-				teamID = strings.TrimSpace(stringValue(token.Meta["team_id"]))
+		blob, meta, genErr := s.runway.GenerateVideo(ctx, token.Value, teamID, in.Prompt, aspectRatio, durationSeconds, frame, false)
+		if genErr == nil {
+			videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
+			if downloadResult {
+				blob, _, genErr = downloadPublicArtifact(ctx, videoURL, staticAssetHosts("runway"), "", netguard.MediaVideo, netguard.MaxVideoBytes)
+				if genErr != nil {
+					genErr = fmt.Errorf("%w: invalid video artifact", runway.ErrTemporaryUpstream)
+				}
 			}
-			d, meta, genErr := s.runway.GenerateVideo(ctx, token.Value, teamID, in.Prompt, aspectRatio, durationSeconds, frame, downloadResult)
-			if genErr == nil {
-				_, _ = s.tokens.Update(ctx, "runway", token.ID, map[string]any{
-					"last_used_at":  time.Now(),
-					"success_total": gorm.Expr("success_total + 1"),
-					"fails":         0,
-				})
-				data = d
-				videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
-				return true, false
-			}
-			lastErr = genErr
-			switch {
-			case errors.Is(genErr, runway.ErrAuth), errors.Is(genErr, runway.ErrQuotaExhausted):
-				// 额度没了 / token 失效 → 当 401 判死(status=disabled, dead),换号。
-				s.markTokenFailure(ctx, "runway", token, "video", true, false)
-				return false, true
-			case errors.Is(genErr, runway.ErrTemporaryUpstream):
-				// 上游临时错误 → 直接换下一个号。
-				return false, true
-			default:
-				// 参数级错误(如 prompt 未过审)→ 直接失败,不换号。
-				return false, false
-			}
-		}()
-		if done {
-			return data, videoURL, nil
 		}
-		if failover {
-			continue
-		}
-		return nil, "", lastErr
-	}
-	if lastErr == nil {
-		if busy > 0 {
-			return nil, "", ErrConcurrencyFull
-		}
-		lastErr = ErrProviderExecution
-	}
-	return nil, "", lastErr
+		return blob, genErr
+	}, runwayErrClass, nil, true)
+	return data, videoURL, err
+}
+
+func runwayErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	return errors.Is(err, runway.ErrAuth), errors.Is(err, runway.ErrQuotaExhausted), errors.Is(err, runway.ErrTemporaryUpstream), false
 }
 
 // customAccountServes reports whether a custom (upstream) account is usable for a
@@ -3152,18 +3402,12 @@ func (s *V1Service) customActive(ctx context.Context, modelID string) ([]model.T
 	return active, nil
 }
 
-// accountConcurrency is the configured per-account simultaneous-job cap, with a
-// default of one. Pool-specific defaults are applied by poolAccountConcurrency.
-func accountConcurrency(item model.TokenAccount) int {
-	if item.Concurrency > 0 {
-		return item.Concurrency
-	}
-	return 1
-}
-
 func poolAccountConcurrency(pool string, item model.TokenAccount) int {
 	if item.Concurrency > 0 {
 		return min(item.Concurrency, 20)
+	}
+	if pool == "grok" {
+		return grokConcurrencyPerAccount
 	}
 	if pool == "adobe" {
 		if total, ok := jsonMapInt(item.Meta, "cached_quota_total"); ok && total >= 10000 {
@@ -3171,19 +3415,6 @@ func poolAccountConcurrency(pool string, item model.TokenAccount) int {
 		}
 	}
 	return 1
-}
-
-// effectiveProvider routes a model to the "custom" upstream whenever a custom
-// account declares it serves that model id (id-based override of the model's
-// native provider) — so an upstream can take over any model by matching its id.
-// Otherwise the model's own provider is used.
-func (s *V1Service) effectiveProvider(ctx context.Context, modelItem *model.ModelConfig) string {
-	if s.custom != nil {
-		if active, err := s.customActive(ctx, modelItem.ID); err == nil && len(active) > 0 {
-			return "custom"
-		}
-	}
-	return modelItem.Provider
 }
 
 // generateCustomImage forwards an image generation to an OpenAI-compatible
@@ -3209,58 +3440,27 @@ func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, mod
 	}
 	size := upstreamSize(aspectRatio, resolution)
 	quality := upstreamQualityForModel(modelItem.ID, resolution)
-	var lastErr error
-	busy := 0
-	for _, token := range active {
-		if !s.acctAcquire(ctx, token.ID, eventID, accountConcurrency(token)) {
-			busy++
-			continue
+	var imageURL string
+	data, err := s.runPoolWithFailover(ctx, eventID, "custom", active, "image", func(token model.TokenAccount) ([]byte, error) {
+		baseURL := stringValue(token.Meta["base_url"])
+		d, assetURL, genErr := s.custom.GenerateImage(ctx, baseURL, token.Value, modelItem.ID, in.Prompt, size, quality, refs, false)
+		if genErr != nil {
+			return nil, genErr
 		}
-		var data []byte
-		var imgURL string
-		done, failover := func() (bool, bool) {
-			defer s.acctRelease(ctx, token.ID, eventID)
-			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-			_ = s.tokens.TouchLastUsed(ctx, token.ID)
-			baseURL := stringValue(token.Meta["base_url"])
-			d, u, genErr := s.custom.GenerateImage(ctx, baseURL, token.Value, modelItem.ID, in.Prompt, size, quality, refs, !urlOnly)
-			if genErr == nil {
-				_, _ = s.tokens.Update(ctx, "custom", token.ID, map[string]any{
-					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
-				})
-				data = d
-				imgURL = u
-				return true, false
+		imageURL = strings.TrimSpace(assetURL)
+		if !urlOnly {
+			parsedBase, parseErr := url.Parse(strings.TrimSpace(baseURL))
+			if parseErr != nil || parsedBase.Hostname() == "" || !strings.EqualFold(parsedBase.Scheme, "https") {
+				return nil, fmt.Errorf("%w: unsafe custom base URL", custom.ErrTemporaryUpstream)
 			}
-			lastErr = genErr
-			switch {
-			case errors.Is(genErr, custom.ErrAuth):
-				s.markTokenFailure(ctx, "custom", token, "image", true, false)
-				return false, true
-			case errors.Is(genErr, custom.ErrQuotaExhausted):
-				s.markTokenFailure(ctx, "custom", token, "image", false, true)
-				return false, true
-			case errors.Is(genErr, custom.ErrTemporaryUpstream):
-				return false, true
-			default:
-				return false, false
+			d, _, genErr = downloadPublicArtifact(ctx, imageURL, []string{parsedBase.Hostname()}, token.Value, netguard.MediaImage, netguard.MaxImageBytes)
+			if genErr != nil {
+				return nil, fmt.Errorf("%w: invalid image artifact", custom.ErrTemporaryUpstream)
 			}
-		}()
-		if done {
-			return data, imgURL, nil
 		}
-		if failover {
-			continue
-		}
-		return nil, "", lastErr
-	}
-	if lastErr == nil {
-		if busy > 0 {
-			return nil, "", ErrConcurrencyFull
-		}
-		lastErr = ErrProviderExecution
-	}
-	return nil, "", lastErr
+		return d, nil
+	}, customErrClass, nil, true)
+	return data, imageURL, err
 }
 
 // generateCustomVideo forwards a video generation to an OpenAI-compatible
@@ -3286,58 +3486,31 @@ func (s *V1Service) generateCustomVideo(ctx context.Context, eventID string, mod
 	if err != nil {
 		return nil, "", err
 	}
-	var lastErr error
 	var videoURL string
-	busy := 0
-	for _, token := range active {
-		if !s.acctAcquire(ctx, token.ID, eventID, accountConcurrency(token)) {
-			busy++
-			continue
+	data, err := s.runPoolWithFailover(ctx, eventID, "custom", active, "video", func(token model.TokenAccount) ([]byte, error) {
+		baseURL := stringValue(token.Meta["base_url"])
+		d, assetURL, genErr := s.custom.GenerateVideo(ctx, baseURL, token.Value, modelItem.ID, in.Prompt, size, durationSeconds, frames, false)
+		if genErr != nil {
+			return nil, genErr
 		}
-		var data []byte
-		done, failover := func() (bool, bool) {
-			defer s.acctRelease(ctx, token.ID, eventID)
-			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-			_ = s.tokens.TouchLastUsed(ctx, token.ID)
-			baseURL := stringValue(token.Meta["base_url"])
-			d, url, genErr := s.custom.GenerateVideo(ctx, baseURL, token.Value, modelItem.ID, in.Prompt, size, durationSeconds, frames, downloadResult)
-			if genErr == nil {
-				_, _ = s.tokens.Update(ctx, "custom", token.ID, map[string]any{
-					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
-				})
-				data = d
-				videoURL = url
-				return true, false
+		videoURL = strings.TrimSpace(assetURL)
+		if downloadResult {
+			parsedBase, parseErr := url.Parse(strings.TrimSpace(baseURL))
+			if parseErr != nil || parsedBase.Hostname() == "" || !strings.EqualFold(parsedBase.Scheme, "https") {
+				return nil, fmt.Errorf("%w: unsafe custom base URL", custom.ErrTemporaryUpstream)
 			}
-			lastErr = genErr
-			switch {
-			case errors.Is(genErr, custom.ErrAuth):
-				s.markTokenFailure(ctx, "custom", token, "video", true, false)
-				return false, true
-			case errors.Is(genErr, custom.ErrQuotaExhausted):
-				s.markTokenFailure(ctx, "custom", token, "video", false, true)
-				return false, true
-			case errors.Is(genErr, custom.ErrTemporaryUpstream):
-				return false, true
-			default:
-				return false, false
+			d, _, genErr = downloadPublicArtifact(ctx, videoURL, []string{parsedBase.Hostname()}, token.Value, netguard.MediaVideo, netguard.MaxVideoBytes)
+			if genErr != nil {
+				return nil, fmt.Errorf("%w: invalid video artifact", custom.ErrTemporaryUpstream)
 			}
-		}()
-		if done {
-			return data, videoURL, nil
 		}
-		if failover {
-			continue
-		}
-		return nil, "", lastErr
-	}
-	if lastErr == nil {
-		if busy > 0 {
-			return nil, "", ErrConcurrencyFull
-		}
-		lastErr = ErrProviderExecution
-	}
-	return nil, "", lastErr
+		return d, nil
+	}, customErrClass, nil, true)
+	return data, videoURL, err
+}
+
+func customErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	return errors.Is(err, custom.ErrAuth), errors.Is(err, custom.ErrQuotaExhausted), errors.Is(err, custom.ErrTemporaryUpstream), false
 }
 
 // upstreamSize maps our (ratio, resolution) to an OpenAI-style "WxH" size string
@@ -3466,6 +3639,7 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
 	}
+	ctx = withDispatchCost(ctx, float64(requiredCredits))
 	s.applyGlobalProxy(ctx)
 	items, err := s.tokens.ListByPool(ctx, "oreate")
 	if err != nil {
@@ -3494,30 +3668,12 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 	s.prioritizeOreate80CreditAccounts(active, requiredCredits)
 	var videoURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "oreate", active, "video", func(token model.TokenAccount) ([]byte, error) {
-		// Reserve the exact request cost under the account row lock. This closes the
-		// gap between pool selection and submit when a preceding queued job has just
-		// consumed the same account's balance.
-		allowed, deducted, reserveErr := s.tokens.ReserveQuota(ctx, "oreate", token.ID, requiredCredits)
-		if reserveErr != nil {
-			return nil, fmt.Errorf("%w: reserve credits: %v", oreate.ErrTemporaryUpstream, reserveErr)
-		}
-		if !allowed {
-			return nil, fmt.Errorf("%w: %w", oreate.ErrQuotaExhausted, errAccountTaskQuota)
-		}
 		blob, meta, genErr := s.oreate.GenerateVideo(ctx, oreateAccountFromToken(token), oreate.VideoOptions{
 			ModelID: upstreamModel, Prompt: in.Prompt, Ratio: aspectRatio, Resolution: resolution,
-			Duration: durationSeconds, Audio: in.GenerateAudio, DownloadResult: downloadResult,
+			Duration: durationSeconds, Audio: in.GenerateAudio, DownloadResult: false,
 			ReferenceImages: imageRefs, ReferenceVideos: videoRefs,
 		})
 		if genErr != nil {
-			if deducted {
-				_ = s.tokens.RefundQuota(ctx, "oreate", token.ID, requiredCredits)
-			}
-			if errors.Is(genErr, oreate.ErrQuotaExhausted) {
-				if remaining, known := s.reconcileOreateCredits(ctx, token); known && remaining >= oreateMinUsableCredits {
-					genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
-				}
-			}
 			if errors.Is(genErr, oreate.ErrSpamUser) {
 				s.quarantineOreateSpamAccount(token.ID)
 				genErr = fmt.Errorf("%w (上游只对该账号的视频风控：同一 cookie 在 Oreate 官网仍能出图，已换号重试)", genErr)
@@ -3526,7 +3682,12 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 		}
 		s.oreateSpam.Delete(token.ID)
 		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
-		_, _ = s.reconcileOreateCredits(ctx, token)
+		if downloadResult {
+			blob, _, genErr = downloadPublicArtifact(ctx, videoURL, staticAssetHosts("oreate"), "", netguard.MediaVideo, netguard.MaxVideoBytes)
+			if genErr != nil {
+				return nil, fmt.Errorf("%w: invalid video artifact", oreate.ErrTemporaryUpstream)
+			}
+		}
 		return blob, nil
 	}, oreateErrClass, nil, false)
 	return data, videoURL, err
@@ -3633,18 +3794,6 @@ func (s *V1Service) prioritizeOreate80CreditAccounts(items []model.TokenAccount,
 	})
 }
 
-func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.TokenAccount) (int, bool) {
-	data, err := s.oreate.FetchCreditsBalance(ctx, oreateAccountFromToken(token))
-	if err != nil {
-		return 0, false
-	}
-	remaining, hasRemaining := data["remaining"].(int)
-	if _, updateErr := persistOreateQuotaSnapshot(ctx, s.tokens, token.ID, data, time.Now()); updateErr != nil {
-		log.Printf("oreate reconciliation: could not persist refreshed quota for %s: %v", token.ID, updateErr)
-	}
-	return remaining, hasRemaining
-}
-
 // generateGrokVideo runs grok's imagine video pipeline across the grok pool.
 // Mirrors the runway policy: no pre-deduct, skip accounts known out of credits
 // (cached remaining <= 0), and treat an out-of-credits / auth failure as a dead
@@ -3696,61 +3845,29 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 	if res == "" {
 		res = "720p"
 	}
-	var lastErr error
 	var videoURL string
-	busy := 0
-	for _, token := range active {
-		// grok allows 10 concurrent jobs per account (unlike the 1-per-account
-		// default of the other pools).
-		if !s.acctAcquire(ctx, token.ID, eventID, grokConcurrencyPerAccount) {
-			busy++
-			continue
-		}
-		var data []byte
-		done, failover := func() (bool, bool) {
-			defer s.acctRelease(ctx, token.ID, eventID)
-			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-			_ = s.tokens.TouchLastUsed(ctx, token.ID)
-			d, meta, genErr := s.grok.GenerateVideo(ctx, token.Value, in.Prompt, aspectRatio, res, durationSeconds, frames, downloadResult)
-			if genErr == nil {
-				_, _ = s.tokens.Update(ctx, "grok", token.ID, map[string]any{
-					"last_used_at":  time.Now(),
-					"success_total": gorm.Expr("success_total + 1"),
-					"fails":         0,
-				})
-				data = d
-				videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
-				return true, false
+	data, err := s.runPoolWithFailover(ctx, eventID, "grok", active, "video", func(token model.TokenAccount) ([]byte, error) {
+		blob, meta, genErr := s.grok.GenerateVideo(ctx, token.Value, in.Prompt, aspectRatio, res, durationSeconds, frames, false)
+		if genErr == nil {
+			videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
+			if downloadResult {
+				body, contentType, openErr := s.grok.OpenAsset(ctx, token.Value, videoURL)
+				if openErr != nil {
+					return nil, openErr
+				}
+				blob, genErr = readProviderArtifact(body, contentType, netguard.MediaVideo, netguard.MaxVideoBytes)
+				if genErr != nil {
+					genErr = fmt.Errorf("%w: invalid video artifact", grok.ErrTemporaryUpstream)
+				}
 			}
-			lastErr = genErr
-			switch {
-			case errors.Is(genErr, grok.ErrChallenge):
-				return false, false
-			case errors.Is(genErr, grok.ErrAuth), errors.Is(genErr, grok.ErrQuotaExhausted):
-				// 失效 / 额度没了 → 当 401 判死(不续期),换号。
-				s.markTokenFailure(ctx, "grok", token, "video", true, false)
-				return false, true
-			case errors.Is(genErr, grok.ErrTemporaryUpstream):
-				return false, true
-			default:
-				return false, false
-			}
-		}()
-		if done {
-			return data, videoURL, nil
 		}
-		if failover {
-			continue
-		}
-		return nil, "", lastErr
-	}
-	if lastErr == nil {
-		if busy > 0 {
-			return nil, "", ErrConcurrencyFull
-		}
-		lastErr = ErrProviderExecution
-	}
-	return nil, "", lastErr
+		return blob, genErr
+	}, grokErrClass, nil, true)
+	return data, videoURL, err
+}
+
+func grokErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	return errors.Is(err, grok.ErrAuth), errors.Is(err, grok.ErrQuotaExhausted), errors.Is(err, grok.ErrTemporaryUpstream), false
 }
 
 // generateGrokImage runs grok's Lite (fast mode) text-to-image pipeline across
@@ -3790,58 +3907,25 @@ func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, model
 	}
 	s.rotateRoundRobin("grok", active)
 
-	var lastErr error
 	var imageURL string
-	busy := 0
-	for _, token := range active {
-		if !s.acctAcquire(ctx, token.ID, eventID, grokConcurrencyPerAccount) {
-			busy++
-			continue
-		}
-		var data []byte
-		done, failover := func() (bool, bool) {
-			defer s.acctRelease(ctx, token.ID, eventID)
-			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-			_ = s.tokens.TouchLastUsed(ctx, token.ID)
-			d, meta, genErr := s.grok.GenerateImage(ctx, token.Value, in.Prompt, aspectRatio, !urlOnly)
-			if genErr == nil {
-				_, _ = s.tokens.Update(ctx, "grok", token.ID, map[string]any{
-					"last_used_at":  time.Now(),
-					"success_total": gorm.Expr("success_total + 1"),
-					"fails":         0,
-				})
-				data = d
-				imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
-				return true, false
+	data, err := s.runPoolWithFailover(ctx, eventID, "grok", active, "image", func(token model.TokenAccount) ([]byte, error) {
+		blob, meta, genErr := s.grok.GenerateImage(ctx, token.Value, in.Prompt, aspectRatio, false)
+		if genErr == nil {
+			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
+			if !urlOnly {
+				body, contentType, openErr := s.grok.OpenAsset(ctx, token.Value, imageURL)
+				if openErr != nil {
+					return nil, openErr
+				}
+				blob, genErr = readProviderArtifact(body, contentType, netguard.MediaImage, netguard.MaxImageBytes)
+				if genErr != nil {
+					genErr = fmt.Errorf("%w: invalid image artifact", grok.ErrTemporaryUpstream)
+				}
 			}
-			lastErr = genErr
-			switch {
-			case errors.Is(genErr, grok.ErrChallenge):
-				return false, false
-			case errors.Is(genErr, grok.ErrAuth), errors.Is(genErr, grok.ErrQuotaExhausted):
-				s.markTokenFailure(ctx, "grok", token, "image", true, false)
-				return false, true
-			case errors.Is(genErr, grok.ErrTemporaryUpstream):
-				return false, true
-			default:
-				return false, false
-			}
-		}()
-		if done {
-			return data, imageURL, nil
 		}
-		if failover {
-			continue
-		}
-		return nil, "", lastErr
-	}
-	if lastErr == nil {
-		if busy > 0 {
-			return nil, "", ErrConcurrencyFull
-		}
-		lastErr = ErrProviderExecution
-	}
-	return nil, "", lastErr
+		return blob, genErr
+	}, grokErrClass, nil, true)
+	return data, imageURL, err
 }
 
 // generateRunwayImage runs the Runway gemini image pipeline (Nano Banana Pro or
@@ -3892,66 +3976,25 @@ func (s *V1Service) generateRunwayImage(ctx context.Context, eventID string, mod
 	if imageSize == "" {
 		imageSize = "1K"
 	}
-	var lastErr error
-	busy := 0
-	for _, token := range active {
-		// 1 concurrent job per account: skip any account already generating.
-		if !s.acctAcquire(ctx, token.ID, eventID, 1) {
-			busy++
-			continue
+	var artURL string
+	data, err := s.runPoolWithFailover(ctx, eventID, "runway", active, "image", func(token model.TokenAccount) ([]byte, error) {
+		teamID := ""
+		if token.Meta != nil {
+			teamID = strings.TrimSpace(stringValue(token.Meta["team_id"]))
 		}
-		var data []byte
-		var artURL string
-		done, failover := func() (bool, bool) {
-			defer s.acctRelease(ctx, token.ID, eventID)
-			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-			_ = s.tokens.TouchLastUsed(ctx, token.ID)
-			teamID := ""
-			if token.Meta != nil {
-				teamID = strings.TrimSpace(stringValue(token.Meta["team_id"]))
+		blob, meta, genErr := s.runway.GenerateImage(ctx, token.Value, teamID, modelItem.ID, in.Prompt, aspectRatio, imageSize, refs, false)
+		if genErr == nil {
+			artURL = strings.TrimSpace(stringValue(meta["image_url"]))
+			if !urlOnly {
+				blob, _, genErr = downloadPublicArtifact(ctx, artURL, staticAssetHosts("runway"), "", netguard.MediaImage, netguard.MaxImageBytes)
+				if genErr != nil {
+					genErr = fmt.Errorf("%w: invalid image artifact", runway.ErrTemporaryUpstream)
+				}
 			}
-			// downloadResult=false in url-only mode → skip the artifact download and
-			// just return meta["image_url"].
-			d, meta, genErr := s.runway.GenerateImage(ctx, token.Value, teamID, modelItem.ID, in.Prompt, aspectRatio, imageSize, refs, !urlOnly)
-			if genErr == nil {
-				_, _ = s.tokens.Update(ctx, "runway", token.ID, map[string]any{
-					"last_used_at":  time.Now(),
-					"success_total": gorm.Expr("success_total + 1"),
-					"fails":         0,
-				})
-				data = d
-				artURL = strings.TrimSpace(stringValue(meta["image_url"]))
-				return true, false
-			}
-			lastErr = genErr
-			switch {
-			case errors.Is(genErr, runway.ErrAuth), errors.Is(genErr, runway.ErrQuotaExhausted):
-				// 额度没了 / token 失效 → 当 401 判死(status=disabled, dead),换号。
-				s.markTokenFailure(ctx, "runway", token, "image", true, false)
-				return false, true
-			case errors.Is(genErr, runway.ErrTemporaryUpstream):
-				// 上游临时错误 → 直接换下一个号。
-				return false, true
-			default:
-				// 参数级错误(如 prompt 未过审)→ 直接失败,不换号。
-				return false, false
-			}
-		}()
-		if done {
-			return data, artURL, nil
 		}
-		if failover {
-			continue
-		}
-		return nil, "", lastErr
-	}
-	if lastErr == nil {
-		if busy > 0 {
-			return nil, "", ErrConcurrencyFull
-		}
-		lastErr = ErrProviderExecution
-	}
-	return nil, "", lastErr
+		return blob, genErr
+	}, runwayErrClass, nil, true)
+	return data, artURL, err
 }
 
 // reconcileChatGPTQuota re-reads OpenAI's image_gen remaining right after a
@@ -3977,19 +4020,21 @@ func (s *V1Service) reconcileChatGPTQuota(ctx context.Context, tokenID, accessTo
 	if err != nil {
 		return
 	}
-	meta := cloneJSONMap(item.Meta)
-	meta["cached_quota_remaining"] = rem
-	meta["cached_quota_at"] = int(time.Now().Unix())
-	patch := map[string]any{"meta": meta}
+	metaPatch := map[string]any{
+		"cached_quota_remaining": rem,
+		"cached_quota_at":        int(time.Now().Unix()),
+	}
+	patch := map[string]any{}
 	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
 		patch["cached_quota_reset_after"] = reset
 	} else if strings.TrimSpace(item.CachedQuotaResetAfter) == "" {
-		patch["cached_quota_reset_after"] = leonardoResetAfter("")
+		patch["cached_quota_reset_after"] = time.Unix((time.Now().Unix()/86400+1)*86400, 0).UTC().Format(time.RFC3339)
 	}
 	if exhausted && item.Status == "active" {
 		patch["status"] = "quota"
 	}
-	_, _ = s.tokens.Update(ctx, "chatgpt", tokenID, patch)
+	updateErr := s.tokens.UpdateMergingMeta(ctx, "chatgpt", tokenID, metaPatch, patch)
+	recordBookkeepingError("reconcile chatgpt quota metadata", updateErr)
 }
 
 // chatgpt image URLs are auth-gated (files.oaiusercontent.com — a plain GET
@@ -4036,9 +4081,21 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 	// account dead. Auth/quota fail over immediately (see runPoolWithFailover).
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "chatgpt", active, "image", func(token model.TokenAccount) ([]byte, error) {
-		d, meta, genErr := s.chatgpt.GenerateImage(ctx, token.Value, in.Prompt, modelItem.ID, aspectRatio, resolution, refs, !urlOnly)
+		d, meta, genErr := s.chatgpt.GenerateImage(ctx, token.Value, in.Prompt, modelItem.ID, aspectRatio, resolution, refs, false)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
+			if !urlOnly {
+				body, contentType, openErr := s.chatgpt.OpenAsset(ctx, token.Value, imageURL)
+				if openErr != nil {
+					return nil, openErr
+				}
+				d, genErr = readProviderArtifact(body, contentType, netguard.MediaImage, netguard.MaxImageBytes)
+				if genErr != nil {
+					genErr = fmt.Errorf("%w: invalid image artifact", chatgpt.ErrTemporaryUpstream)
+				}
+			}
+		}
+		if genErr == nil {
 			// Sync the real OpenAI quota BEFORE the concurrency gate releases, so the
 			// freshly-decremented remaining (and 限额 flip at 0) gates the next pick.
 			s.reconcileChatGPTQuota(ctx, token.ID, token.Value)
@@ -4047,369 +4104,6 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 	}, func(e error) (bool, bool, bool, bool) {
 		return errors.Is(e, chatgpt.ErrAuth), errors.Is(e, chatgpt.ErrQuotaExhausted), errors.Is(e, chatgpt.ErrTemporaryUpstream), false
 	}, nil, true) // chatgpt token IS the credential — no cookie to refresh; switch accounts on transient errors
-	return data, imageURL, err
-}
-
-// leonardoResetAfter returns when a Leonardo account's daily free tokens renew.
-// Leonardo resets at 08:00 Beijing == 00:00 UTC, so when the upstream gives no
-// explicit renewal time we deterministically use the next UTC midnight — this is
-// filled at import so 恢复时间 is always populated, not left blank.
-func leonardoResetAfter(availableUntil string) string {
-	if v := strings.TrimSpace(availableUntil); v != "" {
-		return v
-	}
-	return time.Unix((time.Now().Unix()/86400+1)*86400, 0).UTC().Format(time.RFC3339)
-}
-
-// applyLeonardoPlanMeta 记下账号是普通号还是积分号:积分号(paid)的余额是买来的点数 /
-// 订阅点数,按上游 tokenRenewalDate 月度续期,不能套用普通号的每日重置。余额读取失败
-// (unknown,没有 paid 字段)时不写,以免把已知的积分号标记清掉。
-func applyLeonardoPlanMeta(meta map[string]any, data map[string]any) {
-	paid, ok := data["paid"].(bool)
-	if !ok {
-		return
-	}
-	meta["paid_account"] = paid
-	if plan := strings.TrimSpace(stringValue(data["plan"])); plan != "" {
-		meta["plan"] = plan
-	}
-}
-
-// leonardoDimensions maps the catalog's resolution+ratio to Leonardo pixel sizes.
-func leonardoDimensions(resolution, aspectRatio string) (int, int) {
-	res := strings.ToUpper(strings.TrimSpace(resolution))
-	ar := strings.TrimSpace(aspectRatio)
-	if res == "4K" {
-		switch ar {
-		case "2:3":
-			return 2000, 3000
-		case "16:9":
-			return 4096, 2304
-		case "4:3":
-			return 4096, 3072
-		case "4:5":
-			return 3264, 4080
-		case "9:16":
-			return 2160, 3840
-		case "2:1":
-			return 4096, 2048
-		default: // 1:1
-			return 4096, 4096
-		}
-	}
-	switch ar { // 2K (default)
-	case "2:3":
-		return 1664, 2496
-	case "16:9":
-		return 2560, 1440
-	case "4:3":
-		return 2304, 1728
-	case "4:5":
-		return 2432, 3040
-	case "9:16":
-		return 1440, 2560
-	case "2:1":
-		return 3232, 1616
-	default: // 1:1
-		return 2048, 2048
-	}
-}
-
-func (s *V1Service) generateLeonardoImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
-	urlOnly := noStore
-	if s.leonardo == nil {
-		return nil, "", errors.New("leonardo client not configured")
-	}
-	items, err := s.tokens.ListByPool(ctx, "leonardo")
-	if err != nil {
-		return nil, "", err
-	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		// Skip accounts under the per-generation floor (treated as 限额). Unknown
-		// balance gets the benefit of the doubt (upstream rejects if truly empty).
-		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem < leonardoMinCredits {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
-	if len(active) == 0 {
-		return nil, "", ErrNoProviderAccount
-	}
-	s.rotateRoundRobin("leonardo", active)
-
-	width, height := leonardoDimensions(resolution, aspectRatio)
-	// The upstream Leonardo model name (e.g. seedream-4.5): upstream_model when set
-	// (catalog ids must be unique across providers), else the catalog id.
-	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
-	if upstreamModel == "" {
-		upstreamModel = strings.TrimSpace(modelItem.ID)
-	}
-
-	// Optional image-to-image: decode the reference image once up front (Leonardo
-	// seedream takes at most one).
-	refLimit := modelItem.MaxReferenceImages
-	if refLimit <= 0 {
-		refLimit = 1
-	}
-	refs, err := decodeReferenceImages(in.ReferenceImages, refLimit)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// token.Value is the cookie; GenerateImage mints a fresh JWT each attempt, so an
-	// auth failure means the cookie itself is dead — no refresher (nil).
-	var imageURL string
-	data, err := s.runPoolWithFailover(ctx, eventID, "leonardo", active, "image", func(token model.TokenAccount) ([]byte, error) {
-		// Atomically pre-deduct the per-generation cost so concurrent picks of the
-		// same near-empty account can't over-commit it. A known-insufficient
-		// balance surfaces as quota → the driver fails over to the next account.
-		allowed, deducted, rerr := s.tokens.ReserveQuota(ctx, "leonardo", token.ID, leonardoMinCredits)
-		if rerr != nil {
-			return nil, fmt.Errorf("%w: reserve: %v", leonardo.ErrTemporaryUpstream, rerr)
-		}
-		if !allowed {
-			return nil, leonardo.ErrQuotaExhausted
-		}
-		data, meta, genErr := s.leonardo.GenerateImage(ctx, token.Value, upstreamModel, in.Prompt, width, height, nil, refs, !urlOnly)
-		if genErr != nil {
-			// Release the hold so a failed render doesn't burn credits.
-			if deducted {
-				_ = s.tokens.RefundQuota(ctx, "leonardo", token.ID, leonardoMinCredits)
-			}
-			return nil, genErr
-		}
-		imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
-		// Success → overwrite the held value with the REAL upstream balance and
-		// sink to 限额 if below the floor (best-effort; never fails a done render).
-		s.reconcileLeonardoCredits(ctx, token.ID, token.Value)
-		return data, nil
-	}, func(e error) (bool, bool, bool, bool) {
-		return errors.Is(e, leonardo.ErrAuth), errors.Is(e, leonardo.ErrQuotaExhausted), errors.Is(e, leonardo.ErrTemporaryUpstream), false
-	}, nil, true)
-	return data, imageURL, err
-}
-
-// leonardoVideoDimensions maps the catalog resolution+ratio to the pixel sizes
-// Leonardo's video models accept (16:9 / 9:16 landscape-portrait pairs).
-func leonardoVideoDimensions(resolution, aspectRatio string) (int, int) {
-	res := strings.ToLower(strings.TrimSpace(resolution))
-	portrait := strings.TrimSpace(aspectRatio) == "9:16"
-	if res == "1080p" {
-		if portrait {
-			return 1080, 1920
-		}
-		return 1920, 1080
-	}
-	// 720p (default)
-	if portrait {
-		return 720, 1280
-	}
-	return 1280, 720
-}
-
-// leonardoVideoMinCredits is the cheapest per-clip token cost across Leonardo's
-// video models (LTX Fast = 40 tokens); accounts under it can't afford a clip.
-const leonardoVideoMinCredits = 40
-
-// generateLeonardoVideo runs the Leonardo text-to-video pipeline. Same account
-// policy as generateLeonardoImage: atomically pre-reserve the floor cost, refund
-// on failure, reconcile the real upstream balance after success.
-func (s *V1Service) generateLeonardoVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
-	if s.leonardo == nil {
-		return nil, "", errors.New("leonardo client not configured")
-	}
-	items, err := s.tokens.ListByPool(ctx, "leonardo")
-	if err != nil {
-		return nil, "", err
-	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		if item.VideoLimited {
-			continue
-		}
-		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem < leonardoVideoMinCredits {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
-	if len(active) == 0 {
-		return nil, "", ErrNoProviderAccount
-	}
-	s.rotateRoundRobin("leonardo", active)
-
-	width, height := leonardoVideoDimensions(resolution, aspectRatio)
-	// The upstream Leonardo model name: upstream_model when set (catalog ids must
-	// be unique across providers), else the catalog id.
-	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
-	if upstreamModel == "" {
-		upstreamModel = strings.TrimSpace(modelItem.ID)
-	}
-
-	// token.Value is the cookie; GenerateVideo mints a fresh JWT each attempt, so
-	// an auth failure means the cookie itself is dead — no refresher (nil).
-	var videoURL string
-	data, err := s.runPoolWithFailover(ctx, eventID, "leonardo", active, "video", func(token model.TokenAccount) ([]byte, error) {
-		allowed, deducted, rerr := s.tokens.ReserveQuota(ctx, "leonardo", token.ID, leonardoVideoMinCredits)
-		if rerr != nil {
-			return nil, fmt.Errorf("%w: reserve: %v", leonardo.ErrTemporaryUpstream, rerr)
-		}
-		if !allowed {
-			return nil, leonardo.ErrQuotaExhausted
-		}
-		data, meta, genErr := s.leonardo.GenerateVideo(ctx, token.Value, upstreamModel, in.Prompt, width, height, durationSeconds, downloadResult)
-		if genErr != nil {
-			if deducted {
-				_ = s.tokens.RefundQuota(ctx, "leonardo", token.ID, leonardoVideoMinCredits)
-			}
-			return nil, genErr
-		}
-		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
-		s.reconcileLeonardoCredits(ctx, token.ID, token.Value)
-		return data, nil
-	}, func(e error) (bool, bool, bool, bool) {
-		return errors.Is(e, leonardo.ErrAuth), errors.Is(e, leonardo.ErrQuotaExhausted), errors.Is(e, leonardo.ErrTemporaryUpstream), false
-	}, nil, true)
-	return data, videoURL, err
-}
-
-// reconcileLeonardoCredits re-fetches an account's real token balance after a
-// render and writes it back, flipping the account to 限额 when below the per-gen
-// floor. Stores the daily renewal time so RecoverQuota can auto-recover it.
-func (s *V1Service) reconcileLeonardoCredits(ctx context.Context, tokenID, cookie string) {
-	if s.leonardo == nil {
-		return
-	}
-	data, err := s.leonardo.FetchCreditsBalance(ctx, cookie)
-	if err != nil {
-		return
-	}
-	rem, ok := data["remaining"].(int)
-	if !ok {
-		return
-	}
-	item, err := s.tokens.Get(ctx, "leonardo", tokenID)
-	if err != nil {
-		return
-	}
-	meta := cloneJSONMap(item.Meta)
-	meta["cached_quota_remaining"] = rem
-	meta["cached_quota_at"] = int(time.Now().Unix())
-	applyLeonardoPlanMeta(meta, data)
-	patch := map[string]any{"meta": meta}
-	patch["cached_quota_reset_after"] = leonardoResetAfter(stringValue(data["available_until"]))
-	if rem < leonardoMinCredits && item.Status == "active" {
-		patch["status"] = "quota"
-	}
-	_, _ = s.tokens.Update(ctx, "leonardo", tokenID, patch)
-}
-
-// kreaRefreshAndPersist ensures the account's Krea cookie has a valid access token
-// (refreshing via the rotating refresh_token when expired) and persists the new
-// cookie — the refresh_token is single-use, so the rotated value MUST be saved.
-func kreaRefreshAndPersist(ctx context.Context, client *krea.Client, tokens *repo.TokenRepository, tokenID, cookie string) (string, error) {
-	if client == nil {
-		return cookie, nil
-	}
-	fresh, changed, err := client.RefreshIfNeeded(ctx, cookie)
-	if err != nil {
-		return "", err
-	}
-	if changed && tokenID != "" {
-		_, _ = tokens.Update(ctx, "krea", tokenID, map[string]any{"value": fresh})
-	}
-	return fresh, nil
-}
-
-// kreaDimensions maps the catalog's resolution+ratio to Krea pixel sizes.
-func kreaDimensions(resolution, aspectRatio string) (int, int) {
-	res := strings.ToUpper(strings.TrimSpace(resolution))
-	ar := strings.TrimSpace(aspectRatio)
-	if res == "2K" {
-		switch ar {
-		case "4:3":
-			return 2048, 1536
-		case "3:4":
-			return 1536, 2048
-		case "16:9":
-			return 2048, 1152
-		case "9:16":
-			return 1152, 2048
-		default: // 1:1
-			return 2048, 2048
-		}
-	}
-	switch ar { // 1K (default)
-	case "4:3":
-		return 1024, 768
-	case "3:4":
-		return 768, 1024
-	case "16:9":
-		return 1024, 576
-	case "9:16":
-		return 576, 1024
-	default: // 1:1
-		return 1024, 1024
-	}
-}
-
-func (s *V1Service) generateKreaImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
-	urlOnly := noStore
-	if s.krea == nil {
-		return nil, "", errors.New("krea client not configured")
-	}
-	items, err := s.tokens.ListByPool(ctx, "krea")
-	if err != nil {
-		return nil, "", err
-	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		// No numeric floor — Krea signals 限额 with a 402 at generation time, which
-		// the failover driver turns into mark-quota + next account.
-		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
-			active = append(active, item)
-		}
-	}
-	active = pinTestAccount(items, active, in.AccountID)
-	if len(active) == 0 {
-		return nil, "", ErrNoProviderAccount
-	}
-	s.rotateRoundRobin("krea", active)
-
-	width, height := kreaDimensions(resolution, aspectRatio)
-	refLimit := modelItem.MaxReferenceImages
-	if refLimit <= 0 {
-		refLimit = 1
-	}
-	refs, err := decodeReferenceImages(in.ReferenceImages, refLimit)
-	if err != nil {
-		return nil, "", err
-	}
-
-	var imageURL string
-	data, err := s.runPoolWithFailover(ctx, eventID, "krea", active, "image", func(token model.TokenAccount) ([]byte, error) {
-		// Refresh the (rotating) Supabase token if expired and persist the new
-		// cookie, then generate with the fresh cookie.
-		cookie, rerr := kreaRefreshAndPersist(ctx, s.krea, s.tokens, token.ID, token.Value)
-		if rerr != nil {
-			return nil, rerr
-		}
-		data, meta, genErr := s.krea.GenerateImage(ctx, cookie, in.Prompt, width, height, refs, !urlOnly)
-		if genErr == nil {
-			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
-		}
-		return data, genErr
-	}, func(e error) (bool, bool, bool, bool) {
-		return errors.Is(e, krea.ErrAuth), errors.Is(e, krea.ErrQuotaExhausted), errors.Is(e, krea.ErrTemporaryUpstream), false
-	}, nil, true)
 	return data, imageURL, err
 }
 
@@ -4446,6 +4140,7 @@ func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, m
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
 	}
+	ctx = withDispatchCost(ctx, requiredCredits)
 	items, err := s.tokens.ListByPool(ctx, "byteplus")
 	if err != nil {
 		return nil, "", err
@@ -4469,45 +4164,17 @@ func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, m
 
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "byteplus", active, "image", func(token model.TokenAccount) ([]byte, error) {
-		allowed, held, reserveErr := s.tokens.ReserveQuotaTracked(ctx, "byteplus", token.ID, requiredCredits)
-		if reserveErr != nil {
-			return nil, fmt.Errorf("%w: reserve credits: %v", byteplus.ErrTemporaryUpstream, reserveErr)
-		}
-		if !allowed {
-			return nil, fmt.Errorf("%w: %w", byteplus.ErrQuotaExhausted, errAccountTaskQuota)
-		}
 		request.DownloadResult = !noStore
 		result, meta, genErr := s.byteplus.GenerateImage(ctx, token.Value, request)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
-			s.reconcileBytePlusCredits(ctx, token, requiredCredits, held)
 			return result, nil
 		}
 
 		// Accepted or submission-ambiguous requests may already be billed. Never
 		// refund their hold or replay create_task on a different account.
 		if byteplusNoResubmit(genErr) {
-			remaining, known := s.reconcileBytePlusCredits(ctx, token, requiredCredits, held)
-			if errors.Is(genErr, byteplus.ErrQuotaExhausted) {
-				if known && remaining >= byteplusMinUsableCredits {
-					genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
-				} else {
-					s.markTokenFailure(ctx, "byteplus", token, "image", false, true)
-				}
-			}
 			return nil, genErr
-		}
-
-		if held {
-			refundCtx, refundCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			_ = s.tokens.RefundQuotaTracked(refundCtx, "byteplus", token.ID, requiredCredits)
-			refundCancel()
-		}
-		if errors.Is(genErr, byteplus.ErrQuotaExhausted) {
-			remaining, known := s.reconcileBytePlusCredits(ctx, token, 0, false)
-			if known && remaining >= byteplusMinUsableCredits {
-				genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
-			}
 		}
 		return result, genErr
 	}, byteplusErrClass, nil, true)
@@ -4558,42 +4225,6 @@ func (s *V1Service) prioritizeBytePlusAccounts(items []model.TokenAccount) {
 	})
 }
 
-// reconcileBytePlusCredits refreshes after every completed or possibly accepted
-// generation. Settlement and the upstream snapshot are committed under the same
-// account row lock, subtracting other in-flight holds from the refreshed value.
-func (s *V1Service) reconcileBytePlusCredits(parent context.Context, token model.TokenAccount, settledCredits float64, held bool) (float64, bool) {
-	amount := 0.0
-	if held {
-		amount = settledCredits
-	}
-	probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
-	data, err := s.byteplus.FetchCreditsBalance(probeCtx, token.Value)
-	probeCancel()
-	metaPatch := map[string]any{}
-	var upstreamRemaining *float64
-	if err == nil && !boolValueWithDefault(data["unknown"], false) {
-		if remaining, ok := anyFloat(data["remaining"]); ok {
-			upstreamRemaining = &remaining
-			metaPatch["cached_quota_at"] = int(time.Now().Unix())
-		}
-		if used, ok := anyFloat(data["used"]); ok {
-			metaPatch["cached_quota_used"] = canonicalQuotaNumber(used)
-		}
-		if total, ok := anyFloat(data["total"]); ok {
-			metaPatch["cached_quota_total"] = canonicalQuotaNumber(total)
-		}
-	}
-	settleCtx, settleCancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
-	defer settleCancel()
-	if settleErr := s.tokens.SettleQuotaTracked(settleCtx, "byteplus", token.ID, amount, upstreamRemaining, metaPatch); settleErr != nil {
-		log.Printf("byteplus reconciliation: could not settle refreshed quota for %s: %v", token.ID, settleErr)
-	}
-	if upstreamRemaining == nil {
-		return 0, false
-	}
-	return *upstreamRemaining, true
-}
-
 func byteplusErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
 	// An accepted task or an ambiguous create response may both already represent
 	// a paid task. Neither may move to another account or replay create_task.
@@ -4628,115 +4259,8 @@ func mapBytePlusImageError(err error) error {
 	}
 }
 
-// imagineRefreshAndPersist ensures the account's Imagine credential has a valid
-// access token (refreshing via the rotating refreshToken when expired) and
-// persists the new credential — both tokens rotate, so the value MUST be saved.
-func imagineRefreshAndPersist(ctx context.Context, client *imagine.Client, tokens *repo.TokenRepository, tokenID, cred string) (string, error) {
-	if client == nil {
-		return cred, nil
-	}
-	fresh, changed, err := client.RefreshIfNeeded(ctx, cred)
-	if err != nil {
-		return "", err
-	}
-	if changed && tokenID != "" {
-		_, _ = tokens.Update(ctx, "imagine", tokenID, map[string]any{"value": fresh})
-	}
-	return fresh, nil
-}
-
-// imagineStyle maps the catalog model id to its upstream style_id + resolution.
-func imagineStyle(modelID string) (int, string) {
-	if strings.TrimSpace(modelID) == "imagine-1.5pro" {
-		return 41004, "4K"
-	}
-	return 41001, "2K"
-}
-
-func (s *V1Service) generateImagineImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
-	urlOnly := noStore
-	if s.imagine == nil {
-		return nil, "", errors.New("imagine client not configured")
-	}
-	items, err := s.tokens.ListByPool(ctx, "imagine")
-	if err != nil {
-		return nil, "", err
-	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		// No numeric floor — Imagine signals 限额 with a 402 at generation time,
-		// which the failover driver turns into mark-quota + next account.
-		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
-			active = append(active, item)
-		}
-	}
-	active = pinTestAccount(items, active, in.AccountID)
-	if len(active) == 0 {
-		return nil, "", ErrNoProviderAccount
-	}
-	s.rotateRoundRobin("imagine", active)
-
-	// Each model supports exactly one resolution (2K / 4K) — force it per model.
-	styleID, res := imagineStyle(modelItem.ID)
-
-	var imageURL string
-	data, err := s.runPoolWithFailover(ctx, eventID, "imagine", active, "image", func(token model.TokenAccount) ([]byte, error) {
-		// Refresh the (rotating) access token if expired and persist the new
-		// credential, then generate with the fresh token.
-		cred, rerr := imagineRefreshAndPersist(ctx, s.imagine, s.tokens, token.ID, token.Value)
-		if rerr != nil {
-			return nil, rerr
-		}
-		data, meta, genErr := s.imagine.GenerateImage(ctx, cred, styleID, res, aspectRatio, in.Prompt, !urlOnly)
-		if genErr != nil {
-			return nil, genErr
-		}
-		imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
-		return data, nil
-	}, func(e error) (bool, bool, bool, bool) {
-		return errors.Is(e, imagine.ErrAuth), errors.Is(e, imagine.ErrQuotaExhausted), errors.Is(e, imagine.ErrTemporaryUpstream), false
-	}, nil, true)
-	return data, imageURL, err
-}
-
 func (s *V1Service) refundIfNeeded(ctx context.Context, principal *APIPrincipal, eventID string, price float64) error {
-	if principal == nil || principal.User == nil || price <= 0 {
-		return nil
-	}
-	// Exactly-once: claim the refund via the event's `refunded` flag. If another
-	// path (e.g. the abandoned-purge sweep) already refunded, MarkRefunded
-	// returns false and we skip — no double refund.
-	claimed, err := s.events.MarkRefunded(ctx, eventID)
-	if err != nil {
-		return err
-	}
-	if !claimed {
-		return nil
-	}
-	updated, err := s.users.AdjustCredits(ctx, principal.User.ID, price)
-	if err == nil {
-		principal.User = updated
-	}
-	return err
-}
-
-func (s *V1Service) maybeGrantInviteReward(ctx context.Context, principal *APIPrincipal) error {
-	if principal == nil || principal.User == nil || s.settings == nil {
-		return nil
-	}
-	enabledRaw, err := s.settings.GetValue(ctx, "credits.invite_enabled")
-	if err != nil {
-		return err
-	}
-	if !parseBoolSetting(enabledRaw, true) {
-		return nil
-	}
-	rewardRaw, err := s.settings.GetValue(ctx, "credits.invite_reward")
-	if err != nil {
-		return err
-	}
-	_, err = s.users.GrantInviteReward(ctx, principal.User.ID, parseIntSetting(rewardRaw, 3))
-	return err
+	return nil
 }
 
 // ensureReferenceSizes rejects any reference image over the byte cap BEFORE
@@ -4823,8 +4347,16 @@ func decodeReferenceImages(inputs []string, limit int) ([][]byte, error) {
 		if v == "" {
 			continue
 		}
-		// Only raw base64 is accepted (no "data:...;base64," URL prefix). A data
-		// URL now fails to decode rather than being silently stripped.
+		// JSON requests may use either raw base64 or a data URL. The data URL's
+		// declared MIME is intentionally ignored; payload magic and a real decoder
+		// are authoritative.
+		if strings.HasPrefix(strings.ToLower(v), "data:") {
+			comma := strings.IndexByte(v, ',')
+			if comma <= 5 || !strings.Contains(strings.ToLower(v[:comma]), ";base64") {
+				return nil, fmt.Errorf("%w: invalid reference image encoding", ErrUnsupportedParams)
+			}
+			v = strings.TrimSpace(v[comma+1:])
+		}
 		// decoded size ≈ len(b64) * 3 / 4 — reject oversized payloads up front,
 		// before allocating the decoded buffer.
 		if (len(v)*3)/4 > maxReferenceImageBytes {
@@ -4834,16 +4366,43 @@ func decodeReferenceImages(inputs []string, limit int) ([][]byte, error) {
 		if err != nil {
 			data, err = base64.RawStdEncoding.DecodeString(v)
 			if err != nil {
-				return nil, errors.New("invalid reference image encoding")
+				return nil, fmt.Errorf("%w: invalid reference image encoding", ErrUnsupportedParams)
 			}
 		}
 		if len(data) == 0 {
-			return nil, errors.New("empty reference image")
+			return nil, fmt.Errorf("%w: empty reference image", ErrUnsupportedParams)
 		}
 		if len(data) > maxReferenceImageBytes {
 			return nil, ErrReferenceTooLarge
 		}
-		out = append(out, data)
+		actualType := netguard.DetectMediaType(data)
+		switch actualType {
+		case "image/png", "image/jpeg", "image/gif", "image/webp":
+			// These formats are registered with image.Decode by the service package.
+			// Normalize every provider input to PNG so Adobe/Runway/Custom and other
+			// fixed image/png upload paths never lie about JPEG/GIF/WebP bytes.
+		default:
+			return nil, fmt.Errorf("%w: unsupported reference image format", ErrUnsupportedParams)
+		}
+		config, _, configErr := image.DecodeConfig(bytes.NewReader(data))
+		if configErr != nil || config.Width <= 0 || config.Height <= 0 {
+			return nil, fmt.Errorf("%w: reference image dimensions are invalid", ErrUnsupportedParams)
+		}
+		if int64(config.Width)*int64(config.Height) > maxReferencePixels {
+			return nil, ErrReferenceTooLarge
+		}
+		decoded, _, decodeErr := image.Decode(bytes.NewReader(data))
+		if decodeErr != nil {
+			return nil, fmt.Errorf("%w: reference image is not decodable", ErrUnsupportedParams)
+		}
+		var encoded bytes.Buffer
+		if encodeErr := png.Encode(&encoded, decoded); encodeErr != nil {
+			return nil, fmt.Errorf("%w: reference image normalization failed", ErrUnsupportedParams)
+		}
+		if encoded.Len() > maxReferenceImageBytes {
+			return nil, ErrReferenceTooLarge
+		}
+		out = append(out, encoded.Bytes())
 	}
 	return out, nil
 }
@@ -4900,40 +4459,6 @@ func supportsQualityResolutionModel(modelID string) bool {
 	}
 }
 
-// snapRatio returns the entry in supported closest in value to ar ("W:H").
-// ar is returned as-is when it's already supported, unparsable, or the model
-// has no ratio list.
-func snapRatio(ar string, supported []string) string {
-	parse := func(s string) (float64, bool) {
-		var w, h int
-		if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d:%d", &w, &h); err != nil || w <= 0 || h <= 0 {
-			return 0, false
-		}
-		return float64(w) / float64(h), true
-	}
-	v, ok := parse(ar)
-	if !ok || len(supported) == 0 {
-		return ar
-	}
-	best, bestDelta := "", 0.0
-	for _, s := range supported {
-		if strings.TrimSpace(strings.ReplaceAll(s, "x", ":")) == ar {
-			return ar
-		}
-		sv, sok := parse(strings.ReplaceAll(s, "x", ":"))
-		if !sok {
-			continue
-		}
-		if d := absFloat(v - sv); best == "" || d < bestDelta {
-			best, bestDelta = strings.TrimSpace(strings.ReplaceAll(s, "x", ":")), d
-		}
-	}
-	if best == "" {
-		return ar
-	}
-	return best
-}
-
 func guessRatio(w, h int) string {
 	type candidate struct {
 		W int
@@ -4975,30 +4500,6 @@ func (s *V1Service) deaiEnabled(ctx context.Context) bool {
 		return false
 	}
 	return parseBoolSetting(raw, false)
-}
-
-// deaiSurcharge returns the 去AI特征 surcharge (积分) for an image resolution
-// tier, from site settings (defaults: 1K=1, 2K=2, 4K=3).
-func (s *V1Service) deaiSurcharge(ctx context.Context, resolution string) float64 {
-	key, def := "deai.price_1k", 1
-	switch strings.ToUpper(strings.TrimSpace(resolution)) {
-	case "2K":
-		key, def = "deai.price_2k", 2
-	case "4K":
-		key, def = "deai.price_4k", 3
-	}
-	if s.settings == nil {
-		return float64(def)
-	}
-	raw, err := s.settings.GetValue(ctx, key)
-	if err != nil {
-		return float64(def)
-	}
-	n := parseIntSetting(raw, def)
-	if n < 0 {
-		n = 0
-	}
-	return float64(n)
 }
 
 func firstPricedResolution(item *model.ModelConfig) string {
@@ -5205,10 +4706,7 @@ func max(a, b int) int {
 }
 
 func principalCredits(principal *APIPrincipal) float64 {
-	if principal == nil || principal.User == nil {
-		return 0
-	}
-	return principal.User.Credits
+	return 0
 }
 
 // markTokenFailure applies Python mark_bad semantics for a failed generation
@@ -5258,13 +4756,12 @@ func (s *V1Service) markTokenFailure(ctx context.Context, pool string, token mod
 		}
 	case isAuth:
 		// Adobe auth failures are NOT disabling: the access token refreshes from
-		// the cookie. chatgpt/runway/leonardo auth means the stored credential is
-		// dead — a raw JWT (chatgpt/runway) or a cookie whose session no longer
-		// authenticates (leonardo) — there's nothing left to refresh from.
+		// the cookie. ChatGPT/BytePlus/Runway credentials cannot be refreshed by
+		// this request path, so a definitive auth failure disables the account.
 		// grok is intentionally excluded: a grok sso can momentarily 401 while
 		// still valid (upstream blip / proxy / anti-bot), so an auth failure just
 		// fails over for this request without permanently killing the account.
-		if pool == "chatgpt" || pool == "byteplus" || pool == "runway" || pool == "leonardo" || pool == "krea" || pool == "imagine" {
+		if pool == "chatgpt" || pool == "byteplus" || pool == "runway" {
 			patch["status"] = "disabled"
 			patch["dead"] = true
 		}
@@ -5274,7 +4771,8 @@ func (s *V1Service) markTokenFailure(ctx context.Context, pool string, token mod
 		// only tracked for rotation ordering. (A chatgpt *auth* failure still marks
 		// the token dead in the isAuth case above; that is a genuinely dead token.)
 	}
-	_, _ = s.tokens.Update(ctx, pool, token.ID, patch)
+	_, updateErr := s.tokens.Update(ctx, pool, token.ID, patch)
+	recordBookkeepingError("record account failure", updateErr)
 }
 
 // markTokenUpstreamFailure records a failure caused by the provider itself
@@ -5283,22 +4781,24 @@ func (s *V1Service) markTokenFailure(ctx context.Context, pool string, token mod
 // charging it to fails/fail_total makes a perfectly healthy pool look dead in
 // the admin UI (and drowns real per-account problems in noise).
 func (s *V1Service) markTokenUpstreamFailure(ctx context.Context, pool string, token model.TokenAccount) {
-	_, _ = s.tokens.Update(ctx, pool, token.ID, map[string]any{
+	_, updateErr := s.tokens.Update(ctx, pool, token.ID, map[string]any{
 		"last_used_at":   time.Now(),
 		"upstream_fails": gorm.Expr("upstream_fails + 1"),
 	})
+	recordBookkeepingError("record upstream failure", updateErr)
 }
 
 // markTokenDead disables an account and marks it dead on a fatal upstream error
 // (a non-overload temporary Adobe failure that ops policy treats as account death).
 func (s *V1Service) markTokenDead(ctx context.Context, pool string, token model.TokenAccount, kind string) {
-	_, _ = s.tokens.Update(ctx, pool, token.ID, map[string]any{
+	_, updateErr := s.tokens.Update(ctx, pool, token.ID, map[string]any{
 		"last_used_at": time.Now(),
 		"fail_total":   gorm.Expr("fail_total + 1"),
 		"fails":        gorm.Expr("fails + 1"),
 		"status":       "disabled",
 		"dead":         true,
 	})
+	recordBookkeepingError("mark account dead", updateErr)
 }
 
 // nextCursor returns the pool's current round-robin position and advances it by
@@ -5370,8 +4870,8 @@ func pinTestAccount(items, active []model.TokenAccount, accountID string) []mode
 	return nil
 }
 
-// Ordinary 10-credit Adobe accounts can execute partner image models (verified
-// against GPT Image 2, Nano Banana 2, and Flux Kontext Max). Video entitlement
+// Ordinary 10-credit Adobe accounts can execute the retained partner image
+// models (GPT Image 2 and Nano Banana 2). Video entitlement
 // is model-specific: standard Veo 3.1, Luma Ray, and native Firefly Video work
 // on ordinary accounts; Lite/Kling/Runway/Seedance return user_not_entitled.
 // Admin-pinned tests bypass the normal active filters but still call this helper

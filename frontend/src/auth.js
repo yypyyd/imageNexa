@@ -1,83 +1,142 @@
-// Client-side auth state. The session token lives in localStorage and is sent
-// as `Authorization: Bearer <token>` on every admin API call (see api.js).
-// The server slides the 24h session whenever it's used with <22h left, so an
-// active admin never gets logged out; we also re-validate via /me on a timer.
 import { reactive } from 'vue'
 
-const TOKEN_KEY = 'gw_token'
-const BASE = import.meta.env.VITE_API_BASE || ''
+const BASE = import.meta.env?.VITE_API_BASE || ''
 
 export const auth = reactive({
-  token: localStorage.getItem(TOKEN_KEY) || '',
-  user: null,        // { id, email, name, role, status, credits, invite_code, ... }
-  ready: false,      // true once an initial /me check has resolved
-  loginOpen: false,  // is the login modal showing?
-  loginIntent: '',   // where to go after a successful login
-  startMode: 'login',// which tab the modal opens on: 'login' | 'register'
-  pendingInvite: '', // invite code from a /?ref=CODE link, sent with register
+  admin: null,
+  initialized: null,
+  bootstrapTokenRequired: false,
+  ready: false,
+  csrfToken: '',
 })
 
-export function isAuthed() { return !!auth.token && !!auth.user }
-export function isAdmin() { return isAuthed() && auth.user.role === 'admin' }
+let csrfPromise = null
 
-/** Open the login modal, remembering where the user wanted to go. */
-export function openLogin(intent = '') { auth.loginIntent = intent || ''; auth.startMode = 'login'; auth.loginOpen = true }
-/** Open straight to the register tab, carrying an optional invite code.
- *  Default landing is the home page — an invitee clicking a /?ref=CODE
- *  link should NOT be punted into the画图 flow before they've explored. */
-export function openRegister(inviteCode = '', intent = '/') {
-  auth.pendingInvite = inviteCode || ''
-  auth.loginIntent = intent || ''
-  auth.startMode = 'register'
-  auth.loginOpen = true
+function authURL(path) {
+  return `${BASE}/admin/api/auth/${path}`
 }
-export function closeLogin() { auth.loginOpen = false }
 
-export function setSession(token, user) {
-  auth.token = token || ''
-  auth.user = user || null
-  if (token) localStorage.setItem(TOKEN_KEY, token)
-  else localStorage.removeItem(TOKEN_KEY)
+async function parseJSON(response) {
+  try { return await response.json() } catch { return null }
 }
 
 export function clearSession() {
-  auth.token = ''
-  auth.user = null
-  localStorage.removeItem(TOKEN_KEY)
+  auth.admin = null
+  auth.csrfToken = ''
 }
 
-/** Validate the stored token against /me. Refreshes auth.user; clears on 401.
- *  Returns the user (or null). Hitting /me also slides the server session. */
-export async function refreshMe() {
-  if (!auth.token) { auth.user = null; auth.ready = true; return null }
+async function loadAuthStatus() {
   try {
-    const r = await fetch(`${BASE}/admin/api/auth/me`, {
-      headers: { Authorization: `Bearer ${auth.token}` },
+    const response = await fetch(authURL('status'), {
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
     })
-    if (r.ok) {
-      const d = await r.json()
-      auth.user = d.user
-    } else {
-      clearSession()
+    const data = await parseJSON(response)
+    if (response.ok) {
+      if (typeof data?.initialized === 'boolean') auth.initialized = data.initialized
+      else if (typeof data?.needs_initialization === 'boolean') auth.initialized = !data.needs_initialization
+      else if (typeof data?.initialization_open === 'boolean') auth.initialized = !data.initialization_open
+      auth.bootstrapTokenRequired = typeof data?.bootstrap_token_required === 'boolean'
+        ? data.bootstrap_token_required
+        : auth.initialized === false
     }
   } catch {
-    // network error — keep the token, don't force a logout
+    // Keep the state unknown so the bootstrap screen can offer a retry.
   }
+  return auth.initialized
+}
+
+async function refreshMe() {
+  try {
+    const response = await fetch(authURL('me'), {
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    })
+    const data = await parseJSON(response)
+    if (response.ok) {
+      auth.admin = data?.admin || data?.user || data
+      if (data?.csrf_token) auth.csrfToken = data.csrf_token
+    }
+    else if (response.status === 401) clearSession()
+  } catch {
+    // A temporary network failure must not manufacture a logout.
+  }
+  return auth.admin
+}
+
+export async function bootstrapAuth() {
+  if (auth.ready) return auth
+  await loadAuthStatus()
+  if (auth.initialized) await refreshMe()
   auth.ready = true
-  return auth.user
+  return auth
+}
+
+export async function getCSRF(force = false) {
+  if (auth.csrfToken && !force) return auth.csrfToken
+  if (csrfPromise && !force) return csrfPromise
+
+  csrfPromise = (async () => {
+    const response = await fetch(authURL('csrf'), {
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    })
+    const data = await parseJSON(response)
+    if (!response.ok) throw new Error(data?.error?.message || data?.detail || '无法获取 CSRF Token')
+    const token = data?.csrf_token || data?.token || response.headers.get('X-CSRF-Token') || ''
+    if (!token) throw new Error('服务端未返回 CSRF Token')
+    auth.csrfToken = token
+    return token
+  })()
+
+  try { return await csrfPromise } finally { csrfPromise = null }
+}
+
+async function authWrite(path, payload, additionalHeaders = {}) {
+  // Login and one-time initialization have no session yet. The backend protects
+  // those two writes with an exact Origin check; session CSRF starts only after
+  // a successful response. All other auth writes require the per-session token.
+  const needsCSRF = path !== 'login' && path !== 'initialize'
+  const token = needsCSRF ? await getCSRF() : ''
+  const headers = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    ...additionalHeaders,
+  }
+  if (token) headers['X-CSRF-Token'] = token
+  const response = await fetch(authURL(path), {
+    method: 'POST',
+    credentials: 'include',
+    headers,
+    body: JSON.stringify(payload),
+  })
+  const data = await parseJSON(response)
+  if (!response.ok) {
+    const error = new Error(data?.error?.message || data?.detail || data?.message || '请求失败')
+    error.status = response.status
+    throw error
+  }
+  if (path === 'login' || path === 'initialize') {
+    auth.initialized = true
+    auth.admin = data?.admin || data?.user || null
+    auth.csrfToken = data?.csrf_token || ''
+    if (!auth.admin) await refreshMe()
+  }
+  return data
+}
+
+export function login(identifier, password) {
+  return authWrite('login', { identifier, username: identifier, password })
+}
+
+export function initializeAdmin({ username, email, password, bootstrapToken }) {
+  return authWrite(
+    'initialize',
+    { username, email, password },
+    { 'X-Admin-Bootstrap-Token': bootstrapToken },
+  )
 }
 
 export async function logout() {
-  if (auth.token) {
-    try {
-      await fetch(`${BASE}/admin/api/auth/logout`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${auth.token}` },
-      })
-    } catch { /* ignore */ }
-  }
-  clearSession()
+  try { await authWrite('logout', {}) } finally { clearSession() }
 }
-
-// Keep the session warm: re-validate every 10 minutes while a tab is open.
-setInterval(() => { if (auth.token) refreshMe() }, 10 * 60 * 1000)

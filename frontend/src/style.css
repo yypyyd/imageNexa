@@ -1,449 +1,142 @@
 @import "tailwindcss";
 
-/* Edge: suppress the hover "visual search / 视觉搜索" overlay icon on images and
-   videos (legacy-Edge -ms-touch-action trick). Doesn't affect clicks. */
-img,
-video {
-  -ms-touch-action: none;
-}
-
 :root {
   font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-  --tw-ring-color: rgb(15 23 42 / 0.08);
-
-  /* ===== Theme palette — LIGHT (default) =====
-     Drives the app chrome (rails/header) and the public marketing pages.
-     The `.dark` class on <html> flips these to the dark values below.
-     Text over generated images keeps a literal text-white (handled in markup). */
-  --app-bg: rgb(250 250 251);          /* page background */
-  --fg: rgb(15 23 42);                  /* primary heading/text */
-  --fg-2: rgb(15 23 42 / 0.62);         /* body / secondary */
-  --fg-3: rgb(15 23 42 / 0.45);         /* muted */
-  --fg-faint: rgb(15 23 42 / 0.3);      /* labels / hints */
-  --surface: rgb(255 255 255 / 0.7);    /* raised card on page bg */
-  --surface-2: rgb(15 23 42 / 0.035);   /* subtle inset panel (counter cells) */
-  --hairline: rgb(15 23 42 / 0.08);     /* borders / rings */
-  --hover: rgb(15 23 42 / 0.05);        /* hover wash */
-  /* solid CTA button that sits on the page bg — inverts per theme */
+  color-scheme: light;
+  --app-bg: rgb(250 250 251);
+  --fg: rgb(15 23 42);
+  --fg-2: rgb(15 23 42 / 0.64);
+  --fg-3: rgb(15 23 42 / 0.46);
+  --fg-faint: rgb(15 23 42 / 0.3);
+  --surface: rgb(255 255 255 / 0.78);
+  --surface-2: rgb(15 23 42 / 0.04);
+  --hairline: rgb(15 23 42 / 0.09);
+  --hover: rgb(15 23 42 / 0.055);
   --btn-solid-bg: rgb(15 23 42);
-  --btn-solid-bg-h: rgb(30 41 59);
+  --btn-solid-hover: rgb(30 41 59);
   --btn-solid-fg: #fff;
-  --menu-bg: #ffffff;          /* dropdown / popover panel */
+  --menu-bg: #fff;
 }
 
 html.dark {
+  color-scheme: dark;
   --app-bg: #08090d;
   --fg: rgb(255 255 255 / 0.92);
-  --fg-2: rgb(255 255 255 / 0.55);
-  --fg-3: rgb(255 255 255 / 0.4);
+  --fg-2: rgb(255 255 255 / 0.58);
+  --fg-3: rgb(255 255 255 / 0.42);
   --fg-faint: rgb(255 255 255 / 0.3);
-  --surface: rgb(255 255 255 / 0.03);
-  --surface-2: rgb(255 255 255 / 0.04);
-  --hairline: rgb(255 255 255 / 0.06);
-  --hover: rgb(255 255 255 / 0.06);
+  --surface: rgb(255 255 255 / 0.035);
+  --surface-2: rgb(255 255 255 / 0.05);
+  --hairline: rgb(255 255 255 / 0.075);
+  --hover: rgb(255 255 255 / 0.07);
   --btn-solid-bg: #fff;
-  --btn-solid-bg-h: rgb(255 255 255 / 0.9);
+  --btn-solid-hover: rgb(255 255 255 / 0.9);
   --btn-solid-fg: rgb(2 6 23);
   --menu-bg: #15171f;
 }
 
-/* Smooth the flip so toggling doesn't hard-cut. */
-body, .theme-x { transition: background-color 0.25s ease, color 0.25s ease; }
-
-/* Footer CTA band — soft tinted panel that flips with the theme. */
-.cta-band {
-  background:
-    radial-gradient(at 30% 20%, rgb(168 85 247 / 0.16) 0%, transparent 50%),
-    radial-gradient(at 80% 70%, rgb(244 114 182 / 0.14) 0%, transparent 55%),
-    linear-gradient(180deg, rgb(255 255 255), rgb(246 244 251));
+html { scroll-behavior: smooth; overscroll-behavior: none; }
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--app-bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overscroll-behavior: none;
 }
-html.dark .cta-band {
-  background:
-    radial-gradient(at 30% 20%, rgb(168 85 247 / 0.35) 0%, transparent 50%),
-    radial-gradient(at 80% 70%, rgb(244 114 182 / 0.3) 0%, transparent 55%),
-    linear-gradient(180deg, #0f1117, #080a10);
+body, .theme-x { transition: background-color 0.2s ease, color 0.2s ease; }
+button:not(:disabled), [role="button"]:not([aria-disabled="true"]) { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+::selection { background: rgb(139 92 246 / 0.25); }
+img, video { -ms-touch-action: none; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgb(148 163 184 / 0.45); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(100 116 139 / 0.65); }
+::-webkit-scrollbar-track { background: transparent; }
+
+@layer components {
+  .card {
+    @apply rounded-xl shadow-sm;
+    color: var(--fg);
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+  }
+  .field {
+    @apply w-full rounded-lg px-3 py-2 text-sm outline-none transition-colors;
+    color: var(--fg);
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+  }
+  .field::placeholder { color: var(--fg-faint); }
+  .field:focus, .field:focus-visible {
+    border-color: rgb(139 92 246 / 0.65);
+    box-shadow: 0 0 0 3px rgb(139 92 246 / 0.14);
+  }
+  .btn-primary {
+    @apply inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-medium transition-colors disabled:opacity-50;
+    color: var(--btn-solid-fg);
+    background: var(--btn-solid-bg);
+  }
+  .btn-primary:hover:not(:disabled) { background: var(--btn-solid-hover); }
+  .btn-soft {
+    @apply inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50;
+    color: var(--fg-2);
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--hairline);
+  }
+  .btn-soft:hover:not(:disabled) { color: var(--fg); background: var(--hover); }
 }
 
-/* ===== Light-mode rescue for hardcoded-dark pages =====
-   The admin shell + settings/workbench views were authored dark with literal
-   text-white / white-alpha / bg-white utilities (not the slate system). In
-   LIGHT mode, remap those neutral whites to the dark-on-light palette. Scoped
-   to a `.theme-text` wrapper so the marketing homepage's over-image whites are
-   never touched. Un-layered, so these win over Tailwind's @layer utilities. */
+select.field {
+  appearance: none;
+  padding-right: 2.5rem;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.85rem center;
+  background-size: 1rem;
+}
+input.field[type="number"] { appearance: textfield; }
+input.field[type="number"]::-webkit-outer-spin-button,
+input.field[type="number"]::-webkit-inner-spin-button { appearance: none; margin: 0; }
+.card:has(> table) { overflow-x: auto; }
+
+/* Views use white-alpha utility colors as their dark-theme ink. Convert those
+   values to readable neutral ink when the console is in light mode. */
 html:not(.dark) .theme-text :is(.text-white, [class*="text-white/9"], [class*="text-white/8"]) { color: rgb(15 23 42 / 0.95); }
-html:not(.dark) .theme-text :is([class*="text-white/7"], [class*="text-white/6"]) { color: rgb(15 23 42 / 0.7); }
-html:not(.dark) .theme-text :is([class*="text-white/5"], [class*="text-white/4"]) { color: rgb(15 23 42 / 0.52); }
+html:not(.dark) .theme-text :is([class*="text-white/7"], [class*="text-white/6"]) { color: rgb(15 23 42 / 0.72); }
+html:not(.dark) .theme-text :is([class*="text-white/5"], [class*="text-white/4"]) { color: rgb(15 23 42 / 0.54); }
 html:not(.dark) .theme-text :is([class*="text-white/3"], [class*="text-white/2"], [class*="text-white/1"]) { color: rgb(15 23 42 / 0.4); }
 html:not(.dark) .theme-text [class*="bg-white/"] { background-color: var(--surface-2); }
 html:not(.dark) .theme-text [class*="border-white/"] { border-color: var(--hairline); }
 html:not(.dark) .theme-text [class*="ring-white/"] { --tw-ring-color: var(--hairline); }
-/* White placeholders (placeholder:text-white/30 etc.) — the rescue above only
-   recolors element text, not the ::placeholder pseudo. */
-html:not(.dark) .theme-text [class*="placeholder:text-white"]::placeholder { color: var(--fg-faint); }
-/* Exception: "selected" pills / dark buttons keep their white text. They paint a
-   genuinely dark surface (bg-slate-900/800, bg-black) so the rescue must NOT
-   flip their text to dark — that's where it goes invisible. */
-html:not(.dark) .theme-text :is([class*="bg-slate-900"], [class*="bg-slate-800"], [class*="bg-black"])[class*="text-white"] { color: #fff !important; }
-/* Pastel -200/-300 accent text (labels, KPI numbers, badges) is tuned for a dark
-   shell and washes out on white. In LIGHT mode, darken to the -600 tone. The
-   matcher also catches the /80 opacity variants. Badges keep their pale tinted
-   bg (bg-*-500/10) which reads fine on white. */
-html:not(.dark) .theme-text :is([class*="text-indigo-300"], [class*="text-indigo-200"]) { color: rgb(79 70 229); }
-html:not(.dark) .theme-text :is([class*="text-violet-300"], [class*="text-violet-200"]) { color: rgb(124 58 237); }
-html:not(.dark) .theme-text :is([class*="text-fuchsia-300"], [class*="text-fuchsia-200"]) { color: rgb(192 38 211); }
-html:not(.dark) .theme-text :is([class*="text-emerald-300"], [class*="text-emerald-200"]) { color: rgb(5 150 105); }
-html:not(.dark) .theme-text :is([class*="text-sky-300"], [class*="text-sky-200"]) { color: rgb(2 132 199); }
-html:not(.dark) .theme-text :is([class*="text-amber-300"], [class*="text-amber-200"]) { color: rgb(217 119 6); }
-html:not(.dark) .theme-text :is([class*="text-rose-300"], [class*="text-rose-200"]) { color: rgb(225 29 72); }
-html:not(.dark) .theme-text :is([class*="text-teal-300"], [class*="text-teal-200"]) { color: rgb(13 148 136); }
+html:not(.dark) .theme-text :is([class*="text-indigo-3"], [class*="text-indigo-2"]) { color: rgb(79 70 229); }
+html:not(.dark) .theme-text :is([class*="text-violet-3"], [class*="text-violet-2"]) { color: rgb(109 40 217); }
+html:not(.dark) .theme-text :is([class*="text-fuchsia-3"], [class*="text-fuchsia-2"]) { color: rgb(162 28 175); }
+html:not(.dark) .theme-text :is([class*="text-emerald-3"], [class*="text-emerald-2"]) { color: rgb(4 120 87); }
+html:not(.dark) .theme-text :is([class*="text-sky-3"], [class*="text-sky-2"]) { color: rgb(3 105 161); }
+html:not(.dark) .theme-text :is([class*="text-amber-3"], [class*="text-amber-2"]) { color: rgb(180 83 9); }
+html:not(.dark) .theme-text :is([class*="text-rose-3"], [class*="text-rose-2"]) { color: rgb(190 18 60); }
 
-/* Per-view scoped pills / buttons / chips hardcode white for the dark shell.
-   Recolor them centrally in light mode — the extra .theme-text class outranks
-   the scoped `.x[data-v-*]` rules. Dark mode keeps the scoped look (gated on
-   :not(.dark)). */
-html:not(.dark) .theme-text :is(.fp, .pg, .act, .filter-pill, .kind-btn, .preset-btn, .opt, .chip-x, .ro-chip) {
-  color: var(--fg-2); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline);
+html:not(.dark) .theme-text :is(.metric, .health, .quota, .security, .doc-section, .model-group, .filter, .tabs, .small-btn, .icon-btn, .kind, .provider, .status) {
+  background-color: var(--surface-2);
+  border-color: var(--hairline);
 }
-html:not(.dark) .theme-text :is(.fp, .pg, .act, .filter-pill, .kind-btn, .preset-btn, .opt, .chip-x):hover {
-  color: var(--fg); background: var(--hover);
-}
-html:not(.dark) .theme-text :is(.fp-on, .pg-on, .seg-on, .opt-on) { background: rgb(15 23 42); color: #fff; box-shadow: none; }
-/* Tag chips (TagInput) — near-white violet text is unreadable on white; keep
-   the violet tint but switch the label to dark ink. */
-html:not(.dark) .theme-text .chip { color: rgb(15 23 42 / 0.9); }
-html:not(.dark) .theme-text .chip .chip-x { color: rgb(15 23 42 / 0.55); background: transparent; box-shadow: none; }
-html:not(.dark) .theme-text .chip .chip-x:hover { color: #fff; background: rgb(244 63 94 / 0.6); }
-/* ShowcaseView marks the selected filter/kind tab with an `.on` modifier on
-   `.filter-pill`/`.kind-btn` (not the `-on` class above). Without this, the
-   neutral `.filter-pill`/`.kind-btn` rescue paints selected == unselected and
-   the highlight vanishes on a white page. Equal-or-higher specificity, later. */
-html:not(.dark) .theme-text :is(.filter-pill, .kind-btn).on { background: rgb(15 23 42); color: #fff; box-shadow: none; }
-/* Selected COLORED filter pills — their scoped (dark) selected colors get
-   overridden by the neutral `.fp` rescue above, so re-state a light-mode
-   variant (tinted bg + dark-enough text + colored ring) with equal specificity
-   placed later, so the selection reads on a white page. */
-html:not(.dark) .theme-text .fp-emerald { background: rgb(16 185 129 / 0.14); color: rgb(4 120 87); box-shadow: inset 0 0 0 1px rgb(16 185 129 / 0.45); }
-html:not(.dark) .theme-text .fp-rose { background: rgb(244 63 94 / 0.12); color: rgb(190 18 60); box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.45); }
-html:not(.dark) .theme-text .fp-fuchsia { background: rgb(217 70 239 / 0.12); color: rgb(162 28 175); box-shadow: inset 0 0 0 1px rgb(217 70 239 / 0.45); }
-html:not(.dark) .theme-text .fp-amber { background: rgb(245 158 11 / 0.16); color: rgb(180 83 9); box-shadow: inset 0 0 0 1px rgb(245 158 11 / 0.5); }
-html:not(.dark) .theme-text .fp-violet { background: rgb(139 92 246 / 0.14); color: rgb(109 40 217); box-shadow: inset 0 0 0 1px rgb(139 92 246 / 0.45); }
-html:not(.dark) .theme-text .fp-sky { background: rgb(14 165 233 / 0.14); color: rgb(3 105 161); box-shadow: inset 0 0 0 1px rgb(14 165 233 / 0.45); }
-html:not(.dark) .theme-text .fp-teal { background: rgb(20 184 166 / 0.14); color: rgb(15 118 110); box-shadow: inset 0 0 0 1px rgb(20 184 166 / 0.45); }
+html:not(.dark) .theme-text :is(.metric-label, .kpi-label, .table-head, .section-title, .label, .hint, .health-label, .section-desc, .doc-text, .endpoint-list, .tabs button, .filter, .small-btn, .icon-btn, .status) { color: var(--fg-3); }
+html:not(.dark) .theme-text :is(.metric strong, .section-heading, .doc-title code) { color: var(--fg); }
+html:not(.dark) .theme-text :is(.table-row, .model-group h4) { color: var(--fg-2); }
+html:not(.dark) .theme-text .model-group code { color: rgb(109 40 217); }
+html:not(.dark) .theme-text :is(.filter.on, .tabs button.on) { color: #fff; background: rgb(124 58 237); }
+html:not(.dark) .theme-text :is(.status-active, .status-healthy, .status-enabled, .status-succeeded, .status-success, .health .ok, .route) { color: rgb(4 120 87); background: rgb(16 185 129 / 0.12); }
+html:not(.dark) .theme-text :is(.status-cooldown, .status-processing, .status-unknown) { color: rgb(180 83 9); background: rgb(245 158 11 / 0.13); }
+html:not(.dark) .theme-text :is(.status-disabled, .status-auth_error, .status-failed, .health .bad, .notice) { color: rgb(190 18 60); }
+html:not(.dark) .theme-text .provider { color: rgb(109 40 217); background: rgb(139 92 246 / 0.11); }
+html:not(.dark) .theme-text :is(.kind-text, .get) { color: rgb(3 105 161); background: rgb(14 165 233 / 0.11); }
+html:not(.dark) .theme-text :is(.kind-image, .post) { color: rgb(4 120 87); background: rgb(16 185 129 / 0.11); }
+html:not(.dark) .theme-text .kind-video { color: rgb(162 28 175); background: rgb(217 70 239 / 0.11); }
 
-/* Custom checkbox for admin tables (<input type="checkbox" class="chk">).
-   Replaces the plain accent-color box with a rounded, branded one + white check.
-   Neutral border + transparent bg so it reads on both the dark admin shell and
-   light mode; fills fuchsia when checked. */
-.chk {
-  appearance: none;
-  -webkit-appearance: none;
-  width: 1rem;
-  height: 1rem;
-  flex: none;
-  border-radius: 0.3rem;
-  border: 1.5px solid rgb(148 163 184 / 0.55);
-  background: transparent;
-  cursor: pointer;
-  display: inline-grid;
-  place-content: center;
-  vertical-align: middle;
-  transition: background 0.15s, border-color 0.15s;
-}
-.chk:hover:not(:checked) { border-color: rgb(217 70 239 / 0.7); }
-.chk:checked {
-  background: rgb(217 70 239);
-  border-color: rgb(217 70 239);
-}
-.chk:checked::after {
-  content: "";
-  width: 0.3rem;
-  height: 0.55rem;
-  border: solid #fff;
-  border-width: 0 2px 2px 0;
-  transform: rotate(45deg);
-  margin-top: -0.12rem;
-}
-.chk:focus-visible { outline: 2px solid rgb(217 70 239 / 0.45); outline-offset: 1px; }
-/* Capability chips (ModelsView): all variants need bg + ring + color reset in light mode.
-   The scoped dark-shell values (white-alpha bg/ring, pale text) are invisible on white. */
-html:not(.dark) .theme-text .cap-emerald {
-  background: rgb(16 185 129 / 0.12);
-  color: rgb(4 120 87);
-  box-shadow: inset 0 0 0 1px rgb(16 185 129 / 0.4);
-}
-html:not(.dark) .theme-text .cap-amber {
-  background: rgb(245 158 11 / 0.12);
-  color: rgb(180 83 9);
-  box-shadow: inset 0 0 0 1px rgb(245 158 11 / 0.45);
-}
-html:not(.dark) .theme-text :is(.cap-slate, .cap-mono, .seg) {
-  color: var(--fg-2);
-  background: var(--surface-2);
-  box-shadow: inset 0 0 0 1px var(--hairline);
-}
-/* Price chips (ModelsView): the white-alpha bg/ring disappear on a white card. */
-html:not(.dark) .theme-text .price-chip {
-  background: var(--surface-2);
-  box-shadow: inset 0 0 0 1px var(--hairline);
-}
-/* fp-white selected pill: on white bg the all-white fill vanishes — use a neutral dark variant. */
-html:not(.dark) .theme-text .fp-white {
-  background: var(--surface-2);
-  color: var(--fg-2);
-  box-shadow: inset 0 0 0 1px var(--hairline);
-}
-/* label / hint text classes (form labels in modals & config) */
-html:not(.dark) .theme-text .lbl { color: var(--fg); }
-html:not(.dark) .theme-text :is(.hint, .flbl) { color: var(--fg-3); }
-/* Delete icon button: a clean neutral button with a red glyph (not a heavy pink
-   box), filling solid red on hover. */
-html:not(.dark) .theme-text .act.danger { color: rgb(225 29 72); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); }
-html:not(.dark) .theme-text .act.danger:hover { color: #fff; background: rgb(244 63 94); box-shadow: inset 0 0 0 1px rgb(225 29 72); }
-/* Soft "danger" toolbar buttons (删除选中 / 删除异常账号 …): a muted red, not a
-   heavy pink fill; solid red on hover. Outranks the per-view scoped pink. */
-html:not(.dark) .theme-text .btn-soft.danger { color: rgb(190 18 60); background: rgb(244 63 94 / 0.08); box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.22); }
-html:not(.dark) .theme-text .btn-soft.danger:hover { color: #fff; background: rgb(225 29 72); box-shadow: none; }
-
-/* ===== Media card =====
-   An image/video thumbnail whose overlay text sits ON the media — it must stay
-   white even when the surrounding page is in LIGHT mode. The page itself stays
-   light; only these cards keep the dark-on-image treatment. */
-html:not(.dark) .media-card :is(.text-white, [class*="text-white/9"], [class*="text-white/8"], [class*="text-white/7"], [class*="text-white/6"]) { color: rgb(255 255 255 / 0.95) !important; }
-html:not(.dark) .media-card :is([class*="text-white/5"], [class*="text-white/4"]) { color: rgb(255 255 255 / 0.6) !important; }
-html:not(.dark) .media-card :is([class*="text-white/3"], [class*="text-white/2"]) { color: rgb(255 255 255 / 0.45) !important; }
-html:not(.dark) .media-card [class*="bg-white/"] { background-color: rgb(255 255 255 / 0.12) !important; }
-html:not(.dark) .media-card :is([class*="border-white/"], [class*="ring-white/"]) { border-color: rgb(255 255 255 / 0.12) !important; --tw-ring-color: rgb(255 255 255 / 0.12) !important; }
-/* Accent text inside a media-card sits on dark imagery too — keep it at its
-   bright (dark-mode) shade instead of the darkened light-theme rescue above. */
-html:not(.dark) .media-card :is([class*="text-emerald-3"], [class*="text-emerald-2"]) { color: rgb(110 231 183) !important; }
-html:not(.dark) .media-card :is([class*="text-fuchsia-3"], [class*="text-fuchsia-2"]) { color: rgb(240 171 252) !important; }
-html:not(.dark) .media-card :is([class*="text-indigo-3"], [class*="text-indigo-2"]) { color: rgb(165 180 252) !important; }
-html:not(.dark) .media-card :is([class*="text-violet-3"], [class*="text-violet-2"]) { color: rgb(196 181 253) !important; }
-html:not(.dark) .media-card :is([class*="text-sky-3"], [class*="text-sky-2"]) { color: rgb(125 211 252) !important; }
-html:not(.dark) .media-card :is([class*="text-amber-3"], [class*="text-amber-2"]) { color: rgb(252 211 77) !important; }
-
-/* Code example blocks (docs) read like an editor — solid dark surface in BOTH
-   themes. Paired with .media-card so the code/title text stays light in light
-   mode instead of being darkened by the rescue above. */
-.doc-code { background-color: #0f172a; }
-/* `.public-dark code` gives the inner <code> its faint highlight in dark mode;
-   doc-code is dark in BOTH themes, so re-apply the same in light mode. */
-html:not(.dark) .doc-code code { background: rgb(255 255 255 / 0.08); color: rgb(255 255 255 / 0.9); }
-
-html {
-  scroll-behavior: smooth;
-  /* Kill the bounce/glow when scrolling past the top or bottom of any
-     scroll surface (the dark admin shell has fixed viewport height and we
-     don't want a rubber-band-y feel at the edges of inner scroll areas). */
-  overscroll-behavior: none;
-}
-
-body {
-  margin: 0;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-  overscroll-behavior: none;
-  /* Subtle ambient gradient + grain (used by PublicLayout via .ambient-bg) */
-}
-
-::selection { background: rgb(99 102 241 / 0.22); color: rgb(15 23 42); }
-
-/* Tailwind v4 / preflight leaves <button> on the default arrow cursor, so
-   admins miss the affordance on icon-only actions (复制 / 删除 / 生成 等).
-   One global rule restores the pointer cursor everywhere, while disabled
-   buttons keep the "not-allowed" cursor already applied via Tailwind. */
-button:not(:disabled), [role="button"]:not([aria-disabled="true"]) { cursor: pointer; }
-
-/* ===== Global horizontal table scroll =====
-   Data tables use fixed column widths; on a narrow screen the table can be
-   wider than its card. Instead of clipping (overflow-hidden) or squishing the
-   columns, let the card scroll horizontally. overflow-y is left to the card's
-   own utility so vertical clipping / rounded corners are preserved. */
-.card:has(> table) { overflow-x: auto; }
-
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: rgb(203 213 225); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: rgb(148 163 184); }
-::-webkit-scrollbar-track { background: transparent; }
-
-/* ===== Ambient background — used by the public shell ===== */
-.ambient-bg {
-  background:
-    radial-gradient(at 15% 10%, rgb(238 242 255) 0%, transparent 45%),
-    radial-gradient(at 85% 25%, rgb(253 244 255) 0%, transparent 50%),
-    radial-gradient(at 50% 90%, rgb(236 254 255) 0%, transparent 50%),
-    rgb(250 250 251);
-}
-.ambient-grain::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background-image: url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22180%22 height=%22180%22><filter id=%22n%22><feTurbulence baseFrequency=%220.9%22 numOctaves=%222%22 seed=%225%22/></filter><rect width=%22100%25%22 height=%22100%25%22 filter=%22url(%23n)%22 opacity=%220.4%22/></svg>');
-  opacity: 0.035;
-  mix-blend-mode: multiply;
-  z-index: 1;
-}
-
-/* Float a soft mesh "orb" anywhere */
-.mesh-orb {
-  position: absolute;
-  border-radius: 9999px;
-  filter: blur(80px);
-  pointer-events: none;
-  z-index: 0;
-}
-
-/* ===== Dark public-shell theme overrides =====
-   Apply by adding `.public-dark` to a wrapper element. Views can keep their
-   existing Tailwind classes (text-slate-*, .card, .field) — these rules
-   remap them to the dark palette. */
-.public-dark { color: rgb(255 255 255 / 0.9); }
-.public-dark .card {
-  background: rgb(255 255 255 / 0.03);
-  border-color: rgb(255 255 255 / 0.07);
-  color: rgb(255 255 255 / 0.92);
-  box-shadow: 0 1px 0 rgb(255 255 255 / 0.04) inset, 0 8px 24px rgb(0 0 0 / 0.25);
-}
-.public-dark .field {
-  background: rgb(255 255 255 / 0.04);
-  border-color: rgb(255 255 255 / 0.1);
-  color: rgb(255 255 255 / 0.95);
-  transition: border-color 0.18s, background 0.18s, box-shadow 0.18s;
-}
-.public-dark .field::placeholder { color: rgb(255 255 255 / 0.3); }
-/* Single focus treatment shared by every <.field> across the admin shell —
-   matches the per-component overrides in ConfigView/LoginModal so all
-   inputs glow with the same violet ring on focus. */
-.public-dark .field:focus,
-.public-dark .field:focus-visible {
-  border-color: rgb(167 139 250 / 0.65);
-  background: rgb(255 255 255 / 0.06);
-  box-shadow: 0 0 0 3px rgb(167 139 250 / 0.15);
-  outline: none;
-}
-.public-dark .btn-soft {
-  background: rgb(255 255 255 / 0.06);
-  color: rgb(255 255 255 / 0.85);
-}
-.public-dark .btn-soft:hover { background: rgb(255 255 255 / 0.12); color: white; }
-.public-dark .btn-ghost { color: rgb(255 255 255 / 0.65); }
-.public-dark .btn-ghost:hover { background: rgb(255 255 255 / 0.06); color: white; }
-.public-dark .btn-primary {
-  background: white; color: rgb(2 6 23); box-shadow: 0 1px 0 rgb(0 0 0 / 0.1);
-}
-.public-dark .btn-primary:hover { background: rgb(255 255 255 / 0.92); }
-.public-dark .pill { background: rgb(255 255 255 / 0.06); color: rgb(255 255 255 / 0.85); }
-
-/* Remap slate text tokens */
-.public-dark .text-slate-900,
-.public-dark .text-slate-800,
-.public-dark .text-slate-700 { color: rgb(255 255 255 / 0.95); }
-.public-dark .text-slate-600 { color: rgb(255 255 255 / 0.75); }
-.public-dark .text-slate-500 { color: rgb(255 255 255 / 0.55); }
-.public-dark .text-slate-400 { color: rgb(255 255 255 / 0.4); }
-.public-dark .text-slate-300 { color: rgb(255 255 255 / 0.3); }
-
-/* Backgrounds & borders that views used */
-.public-dark .bg-white { background: rgb(255 255 255 / 0.12); color: rgb(255 255 255 / 0.95); }
-.public-dark .bg-slate-50, .public-dark .bg-slate-50\/60 { background: rgb(255 255 255 / 0.025); }
-.public-dark .bg-slate-100 { background: rgb(255 255 255 / 0.06); }
-.public-dark .bg-slate-200 { background: rgb(255 255 255 / 0.1); }
-.public-dark .border-slate-100,
-.public-dark .border-slate-200,
-.public-dark .border-slate-300 { border-color: rgb(255 255 255 / 0.08); }
-.public-dark .ring-slate-200 { --tw-ring-color: rgb(255 255 255 / 0.08); }
-
-/* Tables in dark */
-.public-dark .th { color: rgb(255 255 255 / 0.4); }
-.public-dark .row { border-color: rgb(255 255 255 / 0.06); }
-.public-dark .row:hover { background: rgb(255 255 255 / 0.03); }
-
-/* Inline code blocks (pill highlight) — only for inline <code>, NOT code inside
-   a <pre> block (docs examples), which would get an unwanted full-width tint. */
-.public-dark code { background: rgb(255 255 255 / 0.08); color: rgb(255 255 255 / 0.9); }
-.public-dark pre code { background: transparent; padding: 0; }
-
-/* Filter pills + segmented controls that admin pages stamp with bg-slate-900
-   for the "selected" state — that lands invisible on the dark shell. Treat
-   slate-900 as a strong-contrast surface in the dark palette. */
-.public-dark .bg-slate-900 { background: rgb(255 255 255 / 0.92); color: rgb(15 23 42); }
-.public-dark .hover\:bg-slate-700:hover { background: rgb(255 255 255 / 0.85); color: rgb(15 23 42); }
-.public-dark .text-slate-700 { color: rgb(255 255 255 / 0.85); }
-.public-dark .text-slate-200 { color: rgb(255 255 255 / 0.7); }
-.public-dark .text-slate-100 { color: rgb(255 255 255 / 0.92); }
-
-/* Divider utilities used by lists (recent activity, table rows). */
-.public-dark .divide-slate-50 > :not([hidden]) ~ :not([hidden]),
-.public-dark .divide-slate-100 > :not([hidden]) ~ :not([hidden]) {
-  border-color: rgb(255 255 255 / 0.05);
-}
-.public-dark .border-slate-100\/80 { border-color: rgb(255 255 255 / 0.06); }
-.public-dark .hover\:bg-slate-50:hover { background: rgb(255 255 255 / 0.04); }
-.public-dark .hover\:bg-slate-100:hover { background: rgb(255 255 255 / 0.06); }
-
-@layer components {
-  /* surfaces */
-  .card { @apply bg-white rounded-xl border border-slate-200 shadow-sm; }
-
-  /* buttons — each variant is self-contained (Tailwind v4 can't @apply a custom class) */
-  .btn-primary {
-    @apply inline-flex items-center justify-center gap-1.5 rounded-lg text-sm font-medium
-           transition-colors disabled:opacity-50 disabled:cursor-not-allowed
-           bg-slate-900 text-white hover:bg-slate-700 px-3.5 py-2;
-  }
-  .btn-soft {
-    @apply inline-flex items-center justify-center gap-1.5 rounded-lg text-xs font-medium
-           transition-colors disabled:opacity-50 disabled:cursor-not-allowed
-           bg-slate-100 text-slate-700 hover:bg-slate-200 px-3 py-1.5;
-  }
-  .btn-ghost {
-    @apply inline-flex items-center justify-center gap-1.5 rounded-lg text-xs font-medium
-           transition-colors disabled:opacity-50 disabled:cursor-not-allowed
-           text-slate-600 hover:bg-slate-100 hover:text-slate-900 px-3 py-1.5;
-  }
-
-  /* text link / quiet action */
-  .link { @apply text-slate-500 hover:text-slate-900 transition-colors cursor-pointer; }
-
-  /* form controls */
-  .field {
-    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800
-           outline-none transition-colors placeholder:text-slate-400
-           focus:border-slate-400 focus:ring-2;
-  }
-
-  /* Native <select> using .field: drop the OS arrow for a custom chevron that
-     sits away from the right edge, with room so the text never overlaps it. */
-  select.field {
-    -webkit-appearance: none;
-    -moz-appearance: none;
-    appearance: none;
-    padding-right: 2.5rem;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 0.9rem center;
-    background-size: 1rem;
-  }
-  select.field::-ms-expand { display: none; }
-
-  /* Number inputs using .field: hide the native +/- spinner arrows for a
-     cleaner look (value is still typeable / editable). */
-  input.field[type='number'] { -moz-appearance: textfield; appearance: textfield; }
-  input.field[type='number']::-webkit-outer-spin-button,
-  input.field[type='number']::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
-
-  /* status pill */
-  .pill { @apply inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium; }
-
-  /* table primitives */
-  .th { @apply text-left px-4 py-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400; }
-  .td { @apply px-4 py-3.5 align-middle; }
-  .row { @apply border-t border-slate-100 transition-colors hover:bg-slate-50; }
-
-  /* avatar chip for identity columns */
-  .avatar { @apply w-8 h-8 rounded-full grid place-items-center text-xs font-semibold shrink-0 ring-1 ring-black/5; }
-}
+/* Dialogs and samples intentionally remain dark in either theme. */
+.modal-card .field { color: rgb(255 255 255 / 0.9); background: rgb(255 255 255 / 0.05); border-color: rgb(255 255 255 / 0.1); }
+.modal-card .field::placeholder { color: rgb(255 255 255 / 0.3); }
+html:not(.dark) .theme-text .modal-card :is([class*="text-white"], .label, .hint, .section-title) { color: rgb(255 255 255 / 0.78) !important; }

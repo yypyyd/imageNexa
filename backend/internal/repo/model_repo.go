@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -13,36 +14,68 @@ import (
 )
 
 type ModelRepository struct {
-	db *gorm.DB
+	db       *gorm.DB
+	routes   *ModelRouteRepository
+	quotas   *QuotaRepository
+	dispatch *DispatchRepository
 }
 
 func NewModelRepository(db *gorm.DB) *ModelRepository {
-	return &ModelRepository{db: db}
+	return &ModelRepository{db: db, routes: NewModelRouteRepository(db), quotas: NewQuotaRepository(db), dispatch: NewDispatchRepository(db)}
 }
+
+func (r *ModelRepository) Routes() *ModelRouteRepository { return r.routes }
+func (r *ModelRepository) Quotas() *QuotaRepository      { return r.quotas }
+func (r *ModelRepository) Dispatch() *DispatchRepository { return r.dispatch }
 
 // IncrementGenerationCount bumps a model's persistent success counter by 1.
 // Best-effort: a missing model id is a no-op (0 rows affected, no error).
 func (r *ModelRepository) IncrementGenerationCount(ctx context.Context, modelID string) error {
-	return r.db.WithContext(ctx).Model(&model.ModelConfig{}).
-		Where("id = ?", modelID).
-		UpdateColumn("generation_count", gorm.Expr("generation_count + 1")).Error
+	if !model.IsCanonicalModelID(modelID) {
+		// Internal runtime ids are never counters. Resolve a matching canonical id
+		// only for legacy callers that still pass a route config.
+		for _, definition := range model.CanonicalRoutingCatalog() {
+			for _, route := range definition.Routes {
+				if route.RuntimeModel == modelID {
+					modelID = definition.Model.ID
+					break
+				}
+			}
+		}
+	}
+	if r.routes.hasRoutingTables() {
+		return r.db.WithContext(ctx).Model(&model.LogicalModel{}).Where("id = ?", modelID).
+			UpdateColumn("generation_count", gorm.Expr("generation_count + 1")).Error
+	}
+	return nil
 }
 
 func (r *ModelRepository) List(ctx context.Context) ([]model.ModelConfig, error) {
-	var items []model.ModelConfig
-	// Higher weight floats to the top of the dropdown / admin list; ties fall
-	// back to newest-first so order stays stable for equal-weight models.
-	if err := r.db.WithContext(ctx).Order("weight desc, created_at desc").Find(&items).Error; err != nil {
+	logicalModels, err := r.routes.ListLogical(ctx, false)
+	if err != nil {
 		return nil, err
+	}
+	items := make([]model.ModelConfig, 0, len(logicalModels))
+	for _, logical := range logicalModels {
+		routes, routeErr := r.routes.ListRoutes(ctx, logical.ID, false)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		items = append(items, aggregateModelConfig(logical, routes))
 	}
 	return items, nil
 }
 
 func (r *ModelRepository) Get(ctx context.Context, modelID string) (*model.ModelConfig, error) {
-	var item model.ModelConfig
-	if err := r.db.WithContext(ctx).First(&item, "(alias <> '' AND alias = ?) OR (alias = '' AND id = ?)", modelID, modelID).Error; err != nil {
+	logical, err := r.routes.GetLogical(ctx, strings.TrimSpace(modelID))
+	if err != nil {
 		return nil, err
 	}
+	routes, err := r.routes.ListRoutes(ctx, logical.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	item := aggregateModelConfig(*logical, routes)
 	return &item, nil
 }
 
@@ -100,22 +133,34 @@ func JSONRatios(v datatypes.JSON) []string {
 }
 
 func (r *ModelRepository) Create(ctx context.Context, item *model.ModelConfig) error {
-	return r.db.WithContext(ctx).Create(item).Error
+	if item == nil || !model.IsCanonicalModelID(item.ID) {
+		return errors.New("the public model catalog is closed; bind a route to an existing canonical model")
+	}
+	return r.db.WithContext(ctx).Model(&model.LogicalModel{}).Where("id = ?", item.ID).
+		Updates(map[string]any{"enabled": item.Enabled, "name": item.Name, "weight": item.Weight, "updated_at": time.Now()}).Error
 }
 
 func (r *ModelRepository) Update(ctx context.Context, modelID string, patch map[string]any) (*model.ModelConfig, error) {
-	patch["updated_at"] = time.Now()
-	if err := r.db.WithContext(ctx).Model(&model.ModelConfig{}).Where("id = ?", modelID).Updates(patch).Error; err != nil {
+	if !model.IsCanonicalModelID(modelID) {
+		return nil, gorm.ErrRecordNotFound
+	}
+	allowed := map[string]any{"updated_at": time.Now()}
+	for _, key := range []string{"name", "enabled", "weight"} {
+		if value, ok := patch[key]; ok {
+			allowed[key] = value
+		}
+	}
+	if err := r.db.WithContext(ctx).Model(&model.LogicalModel{}).Where("id = ?", modelID).Updates(allowed).Error; err != nil {
 		return nil, err
 	}
-	var item model.ModelConfig
-	if err := r.db.WithContext(ctx).First(&item, "id = ?", modelID).Error; err != nil {
-		return nil, err
-	}
-	return &item, nil
+	return r.Get(ctx, modelID)
 }
 
 func (r *ModelRepository) Delete(ctx context.Context, modelID string) (int64, error) {
-	res := r.db.WithContext(ctx).Delete(&model.ModelConfig{}, "id = ?", modelID)
+	if !model.IsCanonicalModelID(modelID) {
+		return 0, nil
+	}
+	res := r.db.WithContext(ctx).Model(&model.LogicalModel{}).Where("id = ?", modelID).
+		Updates(map[string]any{"enabled": false, "updated_at": time.Now()})
 	return res.RowsAffected, res.Error
 }

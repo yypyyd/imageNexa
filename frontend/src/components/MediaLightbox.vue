@@ -74,7 +74,7 @@ async function copyImage() {
              controlslist="nodownload noremoteplayback noplaybackrate"
              disablepictureinpicture disableremoteplayback></video>
       <div v-else
-           :style="{ width: `min(96vw, calc(94vh * ${imgRatio}))`, aspectRatio: imgRatio, backgroundImage: `url(${src})` }"
+           :style="{ width: `min(96vw, calc(94vh * ${imgRatio}))`, aspectRatio: imgRatio, backgroundImage: `url(${JSON.stringify(src)})` }"
            class="rounded-lg bg-contain bg-center bg-no-repeat"></div>
 
       <!-- actions: copy (images only) + download -->

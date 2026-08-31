@@ -1,529 +1,115 @@
 <script setup>
-// API 对接文档 — OpenAI-compatible. Lists live models and shows ready-to-run
-// curl / Python(openai SDK) examples for text + image + video, wired to this
-// deployment's base URL and the caller's model ids.
-import { ref, computed, onMounted } from 'vue'
-import { auth } from '../auth'
-import { api } from '../api'
-import { points } from '../credits'
+import { computed, ref } from 'vue'
 import Icon from '../components/Icon.vue'
+import { IMAGE_MODELS, TEXT_MODELS, VIDEO_MODELS } from '../models'
+import { copyText } from '../utils/clipboard'
 
-const base = computed(() => location.origin)            // /v1 is same-origin (dev: Vite proxy)
-const keyHint = computed(() => auth.user?.api_keys?.[0]?.key_preview || 'YOUR_API_KEY')
+const base = computed(() => `${location.protocol}//${location.host}`)
+const copied = ref('')
 
-const models = ref([])
-onMounted(async () => {
-  const r = await api('/managed-models')
-  if (r.ok) models.value = (r.data?.data || []).filter((m) => m.enabled !== false)
-})
-
-const imageModels = computed(() => models.value.filter((m) => m.type === 'image'))
-const videoModels = computed(() => models.value.filter((m) => m.type === 'video'))
-const textModels = computed(() => models.value.filter((m) => m.type === 'text'))
-function pubName(m) {
-  return m?.alias || m?.id || ''
-}
-const sampleImage = computed(() => pubName(imageModels.value[0]) || 'firefly-image-4')
-const sampleVideo = computed(() => pubName(videoModels.value[0]) || 'firefly-kling3')
-const sampleText = computed(() => pubName(textModels.value[0]) || 'gpt-5-5-mini')
-const sampleSeconds = computed(() => String(videoModels.value[0]?.durations?.[0] || '8s').replace(/s$/, ''))
-
-function priceOf(m) {
-  if (m.type === 'video') {
-    // Video charge = resolution price + duration price; show the combined range.
-    const rv = Object.values(m.prices || {}).filter((v) => v != null).map(Number)
-    const dv = Object.values(m.duration_prices || {}).filter((v) => v != null).map(Number)
-    if (!rv.length || !dv.length) return '—'
-    const lo = Math.min(...rv) + Math.min(...dv)
-    const hi = Math.max(...rv) + Math.max(...dv)
-    return lo === hi ? `${points(lo)} 积分` : `${points(lo)}–${points(hi)} 积分`
-  }
-  const vals = Object.values(m.prices || {}).filter((v) => v != null).map(Number)
-  if (!vals.length) return '—'
-  const lo = Math.min(...vals), hi = Math.max(...vals)
-  return lo === hi ? `${points(lo)} 积分` : `${points(lo)}–${points(hi)} 积分`
-}
-
-// ---- request parameter tables ----
-const imageParams = [
-  ['model', 'string', '必填', '模型名(别名优先),见上表(图像)'],
-  ['prompt', 'string', '必填', '文字描述'],
-  ['size', 'string', '可选', '宽x高,如 "1024x1024"。决定比例并按长边决定原生模型分辨率档;留空 = 1:1 · 2K'],
-  ['quality', 'string', '可选', 'low / medium / high / auto;仅 GPT Image 2 家族映射为 1K / 2K / 4K,其他模型不用于改变分辨率'],
-  ['response_format', 'string', '可选', 'url(默认)或 b64_json'],
-]
-const editParams = [
-  ['image', 'file', '必填', '输入图;多张参考图重复 image[] 字段(multipart 文件上传)'],
-  ['prompt', 'string', '必填', '编辑/参考描述'],
-  ['model', 'string', '必填', '模型名(别名优先,需支持图生图)'],
-  ['size', 'string', '可选', '同图像:决定比例和原生模型分辨率档(见下方对照表)'],
-  ['quality', 'string', '可选', 'low / medium / high / auto;仅 GPT Image 2 家族用于分辨率档位'],
-  ['response_format', 'string', '可选', 'url(默认)或 b64_json'],
-]
-const videoParams = [
-  ['model', 'string', '必填', '模型名(别名优先),见上表(视频)'],
-  ['prompt', 'string', '必填', '文字描述'],
-  ['seconds', 'string|int', '必填', '时长秒数,如 "5" "8"(取决于模型支持)'],
-  ['size', 'string', '可选', '如 "1280x720" / "720x1280" → 决定比例与分辨率'],
-  ['input_reference', 'file', '可选', '首帧/参考图(multipart 文件;runway 图生视频必填 1 张)'],
-]
-const textParams = [
-  ['model', 'string', '必填', '文本模型名(别名优先),见上表(文本)'],
-  ['messages', 'array', '必填', 'OpenAI Chat Completions 消息数组'],
-  ['stream', 'boolean', '可选', 'true 返回 text/event-stream,以 data: [DONE] 结束'],
-  ['temperature', 'number', '可选', '原样传给上游;其他 OpenAI 兼容字段同样透传'],
-]
-
-// ---- size → 比例 × 分辨率档 对照表(用 size 该传的值)----
-// size 的长边映射档位:<1800→1K · 1800–3499→2K · ≥3500→4K;宽高比映射比例。
-const sizeTable = [
-  { ratio: '1:1 · 方',   k1: '1024x1024', k2: '2048x2048', k4: '4096x4096' },
-  { ratio: '5:4 · 横',   k1: '1280x1024', k2: '2560x2048', k4: '3840x3072' },
-  { ratio: '4:3 · 横',   k1: '1024x768',  k2: '2048x1536', k4: '4096x3072' },
-  { ratio: '3:2 · 横',   k1: '1200x800',  k2: '2400x1600', k4: '3600x2400' },
-  { ratio: '16:9 · 横',  k1: '1280x720',  k2: '2048x1152', k4: '4096x2304' },
-  { ratio: '2:1 · 横',   k1: '1440x720',  k2: '2880x1440', k4: '4096x2048' },
-  { ratio: '21:9 · 超宽', k1: '1680x720',  k2: '2520x1080', k4: '5040x2160' },
-  { ratio: '3:1 · 超宽',  k1: '1536x512',  k2: '2304x768',  k4: '3840x1280' },
-  { ratio: '4:1 · 超宽',  k1: '1728x432',  k2: '2880x720',  k4: '4096x1024' },
-  { ratio: '8:1 · 超宽',  k1: '1728x216',  k2: '2880x360',  k4: '4096x512' },
-  { ratio: '4:5 · 竖',   k1: '1024x1280', k2: '2048x2560', k4: '3072x3840' },
-  { ratio: '3:4 · 竖',   k1: '768x1024',  k2: '1536x2048', k4: '3072x4096' },
-  { ratio: '2:3 · 竖',   k1: '800x1200',  k2: '1600x2400', k4: '2400x3600' },
-  { ratio: '9:16 · 竖',  k1: '720x1280',  k2: '1152x2048', k4: '2304x4096' },
-  { ratio: '1:3 · 竖',   k1: '512x1536',  k2: '768x2304',  k4: '1280x3840' },
-  { ratio: '1:4 · 竖',   k1: '432x1728',  k2: '720x2880',  k4: '1024x4096' },
-  { ratio: '1:8 · 竖',   k1: '216x1728',  k2: '360x2880',  k4: '512x4096' },
-]
-
-// ---- 视频 size → 比例 × 分辨率(720p / 1080p)----
-// 视频按「短边」判档:短边 <1080 → 720p,≥1080 → 1080p;宽高比映射比例。
-const videoSizeTable = [
-  { ratio: '16:9 · 横', p720: '1280x720', p1080: '1920x1080' },
-  { ratio: '9:16 · 竖', p720: '720x1280', p1080: '1080x1920' },
-  { ratio: '1:1 · 方',  p720: '720x720',  p1080: '1080x1080' },
-  { ratio: '4:3 · 横',  p720: '960x720',  p1080: '1440x1080' },
-  { ratio: '3:4 · 竖',  p720: '720x960',  p1080: '1080x1440' },
-  { ratio: '3:2 · 横',  p720: '1080x720', p1080: '1620x1080' },
-  { ratio: '2:3 · 竖',  p720: '720x1080', p1080: '1080x1620' },
-]
-
-// ---- examples (built in script so refs resolve correctly) ----
-const examples = computed(() => [
-  {
-    title: '文本对话 · curl (非流式)',
-    code:
-`curl ${base.value}/v1/chat/completions \
-  -H "Authorization: Bearer ${keyHint.value}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "${sampleText.value}",
-    "messages": [{"role":"user","content":"用一句话介绍你自己"}]
+const examples = computed(() => ({
+  models: `curl ${base.value}/v1/models \\\n  -H "Authorization: Bearer sk-your-api-key"`,
+  chat: `curl ${base.value}/v1/chat/completions \\\n  -H "Authorization: Bearer sk-your-api-key" \\\n  -H "Content-Type: application/json" \\\n  -d '{
+    "model": "gpt-5-5-mini",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": false
   }'`,
-  },
-  {
-    title: '文本对话 · Python (openai SDK, 流式)',
-    code:
-`from openai import OpenAI
-
-client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
-
-stream = client.chat.completions.create(
-    model="${sampleText.value}",
-    messages=[{"role": "user", "content": "你好"}],
-    stream=True,
-)
-for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="")`,
-  },
-  {
-    title: '文生图 · curl',
-    code:
-`curl ${base.value}/v1/images/generations \\
-  -H "Authorization: Bearer ${keyHint.value}" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "model": "${sampleImage.value}",
-    "prompt": "a corgi running in a golden wheat field, cinematic",
-    "size": "2048x2048"
+  image: `curl ${base.value}/v1/images/generations \\\n  -H "Authorization: Bearer sk-your-api-key" \\\n  -H "Content-Type: application/json" \\\n  -H "Idempotency-Key: image-order-001" \\\n  -d '{
+    "model": "gpt-image-2",
+    "prompt": "A minimal product photograph",
+    "n": 1,
+    "size": "1024x1024"
   }'`,
-  },
-  {
-    title: '文生图 · Python (openai SDK)',
-    code:
-`import urllib.request
-from openai import OpenAI
+  edit: `curl ${base.value}/v1/images/edits \\\n  -H "Authorization: Bearer sk-your-api-key" \\\n  -H "Idempotency-Key: edit-order-001" \\\n  -F "model=nano-banana-pro" \\\n  -F "prompt=Replace the background with a studio backdrop" \\\n  -F "image=@reference.png"`,
+  imageAsync: `curl ${base.value}/v1/images/generations \\\n  -H "Authorization: Bearer sk-your-api-key" \\\n  -H "Content-Type: application/json" \\\n  -H "Idempotency-Key: image-order-002" \\\n  -H "Prefer: respond-async" \\\n  -d '{"model":"seedream-5.0-pro","prompt":"A cinematic city"}'
 
-client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
-
-resp = client.images.generate(
-    model="${sampleImage.value}",
-    prompt="a corgi running in a golden wheat field, cinematic",
-    size="2048x2048",   # 2K · 1:1,见下方对照表
-)
-# 结果是图片 URL(上游原始直链,会过期 → 尽快下载/转存)
-urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
-  },
-  {
-    title: '图生图 / 参考图 · curl (multipart)',
-    code:
-`curl ${base.value}/v1/images/edits \\
-  -H "Authorization: Bearer ${keyHint.value}" \\
-  -F model="${sampleImage.value}" \\
-  -F prompt="把这张图改成赛博朋克风格" \\
-  -F size="2048x2048" \\
-  -F image=@input.png
-# Adobe 参考图中检测到人脸时，会由网关在上传副本上添加轻微网格遮罩
-# 未可靠检测到人脸时保持原图；reference_grid 字段继续保留以兼容旧客户端
-# 多张参考图:重复 -F image=@a.png -F image=@b.png`,
-  },
-  {
-    title: '图生图 · Python (openai SDK)',
-    code:
-`import urllib.request
-from openai import OpenAI
-
-client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
-
-resp = client.images.edit(
-    model="${sampleImage.value}",
-    image=open("input.png", "rb"),     # 多张:image=[open("a.png","rb"), open("b.png","rb")]
-    prompt="把这张图改成赛博朋克风格",
-)
-# 结果是图片 URL(上游原始直链,会过期 → 尽快下载/转存)
-urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
-  },
-  {
-    title: '视频 · curl(创建 → 轮询 → 下载)',
-    code:
-`# 1) 创建任务 → 立即返回 {"id": "...", "status": "queued"}
-curl ${base.value}/v1/videos \\
-  -H "Authorization: Bearer ${keyHint.value}" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "model": "${sampleVideo.value}",
-    "prompt": "a paper boat sailing down a rainy street, cinematic",
-    "seconds": "${sampleSeconds.value}",
-    "size": "1280x720",
-    "reference_grid": true
+curl "${base.value}/v1/images/tasks?request_id=image-order-002" \\\n  -H "Authorization: Bearer sk-your-api-key"`,
+  video: `curl ${base.value}/v1/videos \\\n  -H "Authorization: Bearer sk-your-api-key" \\\n  -H "Content-Type: application/json" \\\n  -H "Idempotency-Key: video-order-001" \\\n  -d '{
+    "model": "veo-3.1",
+    "prompt": "Slow dolly through a neon alley",
+    "seconds": 8,
+    "size": "1280x720"
   }'
 
-# Adobe 与 Oreate Seedance 的视频参考图检测到人脸时，会由网关在上传副本上添加轻微网格遮罩
+curl ${base.value}/v1/videos/VIDEO_ID \\\n  -H "Authorization: Bearer sk-your-api-key"
 
-# 2) 轮询状态,直到 status=completed
-curl ${base.value}/v1/videos/<VIDEO_ID> \\
-  -H "Authorization: Bearer ${keyHint.value}"
+curl ${base.value}/v1/videos/VIDEO_ID/content \\\n  -H "Authorization: Bearer sk-your-api-key" \\\n  --output result.mp4`,
+}))
 
-# 3) 下载 mp4(完成后)
-curl ${base.value}/v1/videos/<VIDEO_ID>/content \\
-  -H "Authorization: Bearer ${keyHint.value}" -o out.mp4`,
-  },
-  {
-    title: '视频 · Python (requests, 轮询)',
-    code:
-`import time, requests
-
-base = "${base.value}/v1"
-h = {"Authorization": "Bearer ${keyHint.value}"}
-
-# 1) 创建
-job = requests.post(f"{base}/videos", headers=h, json={
-    "model": "${sampleVideo.value}",
-    "prompt": "a paper boat sailing down a rainy street",
-    "seconds": "${sampleSeconds.value}",
-    "size": "1280x720",
-}).json()
-vid = job["id"]
-
-# 2) 轮询
-while True:
-    s = requests.get(f"{base}/videos/{vid}", headers=h).json()
-    if s["status"] in ("completed", "failed"):
-        break
-    time.sleep(5)
-
-# 3) 下载
-if s["status"] == "completed":
-    mp4 = requests.get(f"{base}/videos/{vid}/content", headers=h).content
-    open("out.mp4", "wb").write(mp4)`,
-  },
-  {
-    title: '列出模型 · curl',
-    code:
-`curl ${base.value}/v1/models \\
-  -H "Authorization: Bearer ${keyHint.value}"`,
-  },
-])
-
-// ---- copy + toast ----
-const toastMsg = ref('')
-let t = null
-function toast(m) { toastMsg.value = m; clearTimeout(t); t = setTimeout(() => (toastMsg.value = ''), 1800) }
-async function copy(text) {
-  try { await navigator.clipboard.writeText(text); toast('已复制') } catch { toast('复制失败') }
+async function copy(name) {
+  if (await copyText(examples.value[name])) {
+    copied.value = name
+    setTimeout(() => { if (copied.value === name) copied.value = '' }, 1600)
+  }
 }
 </script>
 
 <template>
-  <div class="theme-text space-y-10">
-    <header>
-      <div class="text-[10px] uppercase tracking-[0.3em] text-sky-300/70 font-medium">开发者</div>
-      <h1 class="mt-2 text-4xl md:text-5xl font-bold tracking-tight">接口文档</h1>
-      <p class="text-white/45 mt-2">兼容 OpenAI 接口规范 — 改个 <code class="text-white/70">base_url</code> 和 <code class="text-white/70">api_key</code> 即可直接调用。文本(含流式)/ 图像 / 视频 / 图生图全支持。</p>
-    </header>
+  <section class="space-y-6 max-w-6xl">
+    <div>
+      <h2 class="text-xl font-semibold text-white/90">2API 接入文档</h2>
+      <p class="mt-1 text-xs text-white/40">文本、图片和视频统一使用 OpenAI Bearer 鉴权和 canonical 模型 ID。</p>
+    </div>
 
-    <!-- quickstart -->
-    <section class="grid md:grid-cols-2 gap-4">
-      <div class="card p-6">
-        <h2 class="text-sm font-semibold text-white/80">基础信息</h2>
-        <dl class="mt-4 space-y-3 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-white/45">Base URL</dt><dd class="font-mono text-white/90">{{ base }}/v1</dd>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-white/45">鉴权</dt><dd class="font-mono text-white/90">Authorization: Bearer &lt;key&gt;</dd>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-white/45">你的 Key</dt><dd class="font-mono text-white/70">{{ keyHint }}</dd>
-          </div>
-        </dl>
-        <p class="text-[11px] text-white/40 mt-4">还没有 Key?去 <router-link to="/settings" class="text-violet-300 underline">设置 → API Key</router-link> 生成。</p>
-      </div>
+    <div class="callout">
+      <Icon name="shield" class="w-5 h-5 text-emerald-300 shrink-0" />
+      <div><div class="text-sm font-semibold text-white/85">Authorization</div><code class="block mt-1 text-xs text-emerald-300">Authorization: Bearer sk-your-api-key</code><p class="mt-2 text-[11px] text-white/40">不支持 <code>x-api-key</code>、Query、Cookie 或其他自定义鉴权头。</p></div>
+    </div>
 
-      <div class="card p-6">
-        <h2 class="text-sm font-semibold text-white/80">端点</h2>
-        <ul class="mt-4 space-y-2.5 text-sm font-mono">
-          <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80">/v1/models</span></li>
-          <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/chat/completions</span><span class="text-white/35 font-sans text-xs">文本 / SSE 流式</span></li>
-          <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/images/generations</span><span class="text-white/35 font-sans text-xs">文生图</span></li>
-          <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/images/edits</span><span class="text-white/35 font-sans text-xs">图生图(multipart)</span></li>
-          <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/videos</span><span class="text-white/35 font-sans text-xs">建视频任务</span></li>
-          <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80">/v1/videos/{id}</span><span class="text-white/35 font-sans text-xs">查状态</span></li>
-          <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80">/v1/videos/{id}/content</span><span class="text-white/35 font-sans text-xs">下载 mp4</span></li>
-        </ul>
-      </div>
-    </section>
+    <nav class="card p-4 flex flex-wrap gap-2 text-xs">
+      <a v-for="link in [['模型','#models'],['文本','#chat'],['生图','#images'],['改图','#edits'],['视频','#videos'],['错误','#errors']]" :key="link[1]" :href="link[1]" class="rounded-lg px-3 py-1.5 bg-white/[0.04] text-white/55 hover:text-white hover:bg-white/[0.08]">{{ link[0] }}</a>
+    </nav>
 
-    <!-- models -->
-    <section>
-      <h2 class="text-lg font-semibold mb-3">可用模型</h2>
-      <div class="card overflow-hidden">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
-              <th class="px-4 py-3 font-medium">model</th>
-              <th class="px-4 py-3 font-medium">类型</th>
-              <th class="px-4 py-3 font-medium">分辨率 / 时长</th>
-              <th class="px-4 py-3 font-medium text-right">价格</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="m in models" :key="m.id" class="border-b border-white/[0.04] last:border-0">
-              <td class="px-4 py-3 font-mono text-white/90">{{ pubName(m) }}</td>
-              <td class="px-4 py-3 text-white/60">{{ m.type === 'text' ? '文本' : (m.type === 'video' ? '视频' : '图像') }}</td>
-              <td class="px-4 py-3 text-white/60">{{ m.type === 'text' ? 'Chat Completions' : ((m.type === 'video' ? m.durations : m.resolutions || [])?.join(' · ') || '—') }}</td>
-              <td class="px-4 py-3 text-right tabular-nums text-white/80">{{ priceOf(m) }}</td>
-            </tr>
-            <tr v-if="!models.length"><td colspan="4" class="px-4 py-10 text-center text-white/35">暂无可用模型</td></tr>
-          </tbody>
-        </table>
+    <article id="models" class="doc-section">
+      <div class="doc-title"><span class="get">GET</span><code>/v1/models</code></div>
+      <p class="doc-text">只返回下表 24 个统一 ID，<code>owned_by</code> 固定为 <code>2api</code>。默认返回严格 OpenAI 模型对象；需要比例、分辨率等 2API 能力字段时显式使用 <code>?extended=true</code>。Provider、route 和上游模型 ID 不会对外暴露。</p>
+      <div class="grid lg:grid-cols-3 gap-3">
+        <div class="model-group"><h4>文本 · {{ TEXT_MODELS.length }}</h4><code v-for="id in TEXT_MODELS" :key="id">{{ id }}</code></div>
+        <div class="model-group"><h4>图片 · {{ IMAGE_MODELS.length }}</h4><code v-for="id in IMAGE_MODELS" :key="id">{{ id }}</code></div>
+        <div class="model-group"><h4>视频 · {{ VIDEO_MODELS.length }}</h4><code v-for="id in VIDEO_MODELS" :key="id">{{ id }}</code></div>
       </div>
-    </section>
+      <div class="code-block"><button @click="copy('models')">{{ copied === 'models' ? '已复制' : '复制' }}</button><pre>{{ examples.models }}</pre></div>
+    </article>
 
-    <!-- parameters -->
-    <section class="grid lg:grid-cols-2 gap-6">
-      <div class="lg:col-span-2">
-        <h2 class="text-lg font-semibold mb-3">文本对话参数 <span class="text-xs font-normal text-white/40">/v1/chat/completions · JSON / SSE</span></h2>
-        <div class="card overflow-hidden">
-          <table class="w-full text-sm">
-            <thead><tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
-              <th class="px-4 py-2.5 font-medium">参数</th><th class="px-4 py-2.5 font-medium">类型</th><th class="px-4 py-2.5 font-medium">必填</th><th class="px-4 py-2.5 font-medium">说明</th>
-            </tr></thead>
-            <tbody>
-              <tr v-for="p in textParams" :key="p[0]" class="border-b border-white/[0.04] last:border-0">
-                <td class="px-4 py-2.5 font-mono text-white/85">{{ p[0] }}</td>
-                <td class="px-4 py-2.5 text-white/50 font-mono text-xs">{{ p[1] }}</td>
-                <td class="px-4 py-2.5 text-white/55">{{ p[2] }}</td>
-                <td class="px-4 py-2.5 text-white/60 text-xs">{{ p[3] }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="text-xs text-white/40 mt-2">文本按每次请求固定积分计费;流式与非流式同价。上游失败、无有效 completion 或流式未正常结束会自动退款。</p>
-      </div>
-      <div>
-        <h2 class="text-lg font-semibold mb-3">文生图参数 <span class="text-xs font-normal text-white/40">/v1/images/generations</span></h2>
-        <div class="card overflow-hidden">
-          <table class="w-full text-sm">
-            <thead><tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
-              <th class="px-4 py-2.5 font-medium">参数</th><th class="px-4 py-2.5 font-medium">类型</th><th class="px-4 py-2.5 font-medium">必填</th><th class="px-4 py-2.5 font-medium">说明</th>
-            </tr></thead>
-            <tbody>
-              <tr v-for="p in imageParams" :key="p[0]" class="border-b border-white/[0.04] last:border-0">
-                <td class="px-4 py-2.5 font-mono text-white/85">{{ p[0] }}</td>
-                <td class="px-4 py-2.5 text-white/50 font-mono text-xs">{{ p[1] }}</td>
-                <td class="px-4 py-2.5 text-white/55">{{ p[2] }}</td>
-                <td class="px-4 py-2.5 text-white/60 text-xs">{{ p[3] }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
+    <article id="chat" class="doc-section">
+      <div class="doc-title"><span class="post">POST</span><code>/v1/chat/completions</code></div>
+      <p class="doc-text">兼容 OpenAI Chat Completions，支持 <code>stream: true</code> 的 SSE 输出。响应中的 <code>model</code> 始终是 canonical ID。</p>
+      <div class="code-block"><button @click="copy('chat')">{{ copied === 'chat' ? '已复制' : '复制' }}</button><pre>{{ examples.chat }}</pre></div>
+    </article>
 
-      <div>
-        <h2 class="text-lg font-semibold mb-3">图生图参数 <span class="text-xs font-normal text-white/40">/v1/images/edits · multipart</span></h2>
-        <div class="card overflow-hidden">
-          <table class="w-full text-sm">
-            <thead><tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
-              <th class="px-4 py-2.5 font-medium">参数</th><th class="px-4 py-2.5 font-medium">类型</th><th class="px-4 py-2.5 font-medium">必填</th><th class="px-4 py-2.5 font-medium">说明</th>
-            </tr></thead>
-            <tbody>
-              <tr v-for="p in editParams" :key="p[0]" class="border-b border-white/[0.04] last:border-0">
-                <td class="px-4 py-2.5 font-mono text-white/85">{{ p[0] }}</td>
-                <td class="px-4 py-2.5 text-white/50 font-mono text-xs">{{ p[1] }}</td>
-                <td class="px-4 py-2.5 text-white/55">{{ p[2] }}</td>
-                <td class="px-4 py-2.5 text-white/60 text-xs">{{ p[3] }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
+    <article id="images" class="doc-section">
+      <div class="doc-title"><span class="post">POST</span><code>/v1/images/generations</code></div>
+      <p class="doc-text">JSON 字段：<code>model</code>、<code>prompt</code>、<code>n</code>、<code>size</code>、<code>quality</code>、<code>response_format</code>。路由会按比例、分辨率和完整能力组合筛选。</p>
+      <div class="code-block"><button @click="copy('image')">{{ copied === 'image' ? '已复制' : '复制' }}</button><pre>{{ examples.image }}</pre></div>
+      <h4 class="mt-5 text-xs font-semibold text-white/70">异步生图</h4><p class="doc-text">添加 <code>Prefer: respond-async</code> 获得 202，再用同一 API Key 查询 <code>GET /v1/images/tasks?request_id=...</code>。</p>
+      <div class="code-block"><button @click="copy('imageAsync')">{{ copied === 'imageAsync' ? '已复制' : '复制' }}</button><pre>{{ examples.imageAsync }}</pre></div>
+    </article>
 
-      <div class="lg:col-span-2">
-        <h2 class="text-lg font-semibold mb-3">视频参数 <span class="text-xs font-normal text-white/40">/v1/videos · 异步</span></h2>
-        <div class="card overflow-hidden">
-          <table class="w-full text-sm">
-            <thead><tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
-              <th class="px-4 py-2.5 font-medium">参数</th><th class="px-4 py-2.5 font-medium">类型</th><th class="px-4 py-2.5 font-medium">必填</th><th class="px-4 py-2.5 font-medium">说明</th>
-            </tr></thead>
-            <tbody>
-              <tr v-for="p in videoParams" :key="p[0]" class="border-b border-white/[0.04] last:border-0">
-                <td class="px-4 py-2.5 font-mono text-white/85">{{ p[0] }}</td>
-                <td class="px-4 py-2.5 text-white/50 font-mono text-xs">{{ p[1] }}</td>
-                <td class="px-4 py-2.5 text-white/55">{{ p[2] }}</td>
-                <td class="px-4 py-2.5 text-white/60 text-xs">{{ p[3] }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
+    <article id="edits" class="doc-section">
+      <div class="doc-title"><span class="post">POST</span><code>/v1/images/edits</code></div>
+      <p class="doc-text">必须使用 <code>multipart/form-data</code>，至少上传一个 PNG、JPEG、GIF 或 WebP 格式的 <code>image</code> / <code>image[]</code>。当前不支持 <code>mask</code>、<code>background</code> 与 <code>output_format</code>，传入时会明确返回参数错误。</p>
+      <div class="code-block"><button @click="copy('edit')">{{ copied === 'edit' ? '已复制' : '复制' }}</button><pre>{{ examples.edit }}</pre></div>
+    </article>
 
-    <!-- size 对照表(课时表)—— 解决"传错分辨率" -->
-    <section>
-      <h2 class="text-lg font-semibold mb-1">图像分辨率对照表 · <code class="text-white/70 text-sm">size</code> 该传什么</h2>
-      <p class="text-xs text-white/45 mb-3">
-        左边选比例,上面选分辨率档,交叉格里就是 <code class="text-white/70">size</code> 要传的值(直接复制)。
-        原生模型的图像分辨率只看 <code class="text-white/70">size</code> 的<strong class="text-white/70">长边</strong>；<code class="text-white/70">quality</code> 仅用于 GPT Image 2 家族。
-        档位必须是该模型支持的(见上方「可用模型」的分辨率列),不支持会自动回退到该模型最低档。
-      </p>
-      <div class="card overflow-hidden">
-        <table class="w-full text-sm">
-          <thead><tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
-            <th class="px-4 py-2.5 font-medium">比例</th>
-            <th class="px-4 py-2.5 font-medium">1K</th>
-            <th class="px-4 py-2.5 font-medium">2K</th>
-            <th class="px-4 py-2.5 font-medium">4K</th>
-          </tr></thead>
-          <tbody>
-            <tr v-for="row in sizeTable" :key="row.ratio" class="border-b border-white/[0.04] last:border-0">
-              <td class="px-4 py-2.5 text-white/75">{{ row.ratio }}</td>
-              <td class="px-4 py-2.5 font-mono text-white/85">{{ row.k1 }}</td>
-              <td class="px-4 py-2.5 font-mono text-white/85">{{ row.k2 }}</td>
-              <td class="px-4 py-2.5 font-mono text-white/85">{{ row.k4 }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="text-xs text-white/40 mt-2">
-        例:想要 <strong class="text-white/70">2K 的 16:9 横图</strong> → <code class="text-white/70">"size": "2048x1152"</code>。
-        留空 size = 默认 <strong class="text-white/70">1:1 · 2K</strong>。
-      </p>
+    <article id="videos" class="doc-section">
+      <div class="doc-title"><span class="post">POST</span><code>/v1/videos</code></div>
+      <p class="doc-text">创建异步视频任务，JSON 支持 <code>model</code>、<code>prompt</code>、<code>seconds</code>、<code>size</code>。带参考素材时使用 multipart：<code>input_reference</code>、<code>reference_videos</code>、<code>reference_audios</code>。</p>
+      <div class="endpoint-list"><span class="get">GET</span><code>/v1/videos/:id</code><span>查询状态</span><span class="get">GET</span><code>/v1/videos/:id/content</code><span>下载成品</span></div>
+      <div class="code-block"><button @click="copy('video')">{{ copied === 'video' ? '已复制' : '复制' }}</button><pre>{{ examples.video }}</pre></div>
+    </article>
 
-      <!-- 视频分辨率(720p / 1080p,按短边判) -->
-      <h2 class="text-lg font-semibold mb-1 mt-8">视频分辨率对照表 · <code class="text-white/70 text-sm">size</code> 该传什么</h2>
-      <p class="text-xs text-white/45 mb-3">
-        视频用 <code class="text-white/70">720p</code> / <code class="text-white/70">1080p</code> 两档,只看 <code class="text-white/70">size</code> 的<strong class="text-white/70">短边</strong>(短边 ≥1080 = 1080p,否则 720p)。
-        档位必须是该视频模型支持的(如 grok-video 仅 720p),不支持会被拒。
-      </p>
-      <div class="card overflow-hidden">
-        <table class="w-full text-sm">
-          <thead><tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
-            <th class="px-4 py-2.5 font-medium">比例</th>
-            <th class="px-4 py-2.5 font-medium">720p</th>
-            <th class="px-4 py-2.5 font-medium">1080p</th>
-          </tr></thead>
-          <tbody>
-            <tr v-for="row in videoSizeTable" :key="row.ratio" class="border-b border-white/[0.04] last:border-0">
-              <td class="px-4 py-2.5 text-white/75">{{ row.ratio }}</td>
-              <td class="px-4 py-2.5 font-mono text-white/85">{{ row.p720 }}</td>
-              <td class="px-4 py-2.5 font-mono text-white/85">{{ row.p1080 }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="text-xs text-white/40 mt-2">
-        例:想要 <strong class="text-white/70">720p 的 16:9 横版视频</strong> → <code class="text-white/70">"size": "1280x720"</code>;
-        竖版 9:16 → <code class="text-white/70">"720x1280"</code>。
-      </p>
-    </section>
+    <article id="errors" class="doc-section">
+      <h3 class="text-sm font-semibold text-white/85">OpenAI 错误格式</h3>
+      <pre class="simple-code">{"error":{"message":"...","type":"invalid_request_error","param":"model","code":"model_not_found"}}</pre>
+      <div class="mt-3 grid sm:grid-cols-2 gap-2 text-[11px] text-white/45"><div class="error-item"><strong>401</strong><span><code>invalid_api_key</code> — Key 无效或已吊销</span></div><div class="error-item"><strong>404</strong><span><code>model_not_found</code> — 非 canonical 模型</span></div><div class="error-item"><strong>409</strong><span>同幂等 Key 但请求指纹不同</span></div><div class="error-item"><strong>429</strong><span>API Key 并发超限或无调度容量</span></div></div>
+    </article>
 
-    <!-- examples -->
-    <section class="space-y-4">
-      <h2 class="text-lg font-semibold">调用示例</h2>
-      <div v-for="ex in examples" :key="ex.title" class="card overflow-hidden">
-        <div class="flex items-center justify-between px-4 py-2.5 border-b border-white/[0.06]">
-          <span class="text-xs text-white/55">{{ ex.title }}</span>
-          <button @click="copy(ex.code)" class="text-xs text-white/50 hover:text-white inline-flex items-center gap-1.5 transition-colors">
-            <Icon name="copy" class="w-3.5 h-3.5" /> 复制
-          </button>
-        </div>
-        <pre class="p-4 text-[12px] leading-relaxed text-white/80 overflow-auto"><code>{{ ex.code }}</code></pre>
-      </div>
-    </section>
-
-    <!-- responses -->
-    <section>
-      <h2 class="text-lg font-semibold mb-3">响应 & 计费</h2>
-      <div class="card p-6 space-y-3 text-sm text-white/70">
-        <p><strong class="text-white/90">文本</strong>返回标准 <code class="text-white/85 font-mono">chat.completion</code>;传 <code class="text-white/85 font-mono">stream:true</code> 时返回 <code class="text-white/85 font-mono">chat.completion.chunk</code> SSE,并以 <code class="text-white/85 font-mono">data: [DONE]</code> 结束。号池型文本模型(ChatGPT / Grok)的流式为整段一次性下发的模拟流;接 OpenAI 兼容上游的模型为真流式透传。</p>
-        <p><strong class="text-white/90">图像</strong>(generations / edits)默认返回 OpenAI URL 格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code>。网关不会下载普通请求的上游图片;如需内联内容可显式传 <code class="text-white/85 font-mono">response_format:"b64_json"</code>。URL 可能过期,请尽快下载或转存。</p>
-        <p><strong class="text-white/90">视频</strong>(异步,Sora 风格三步):</p>
-        <ol class="list-decimal list-inside space-y-1 text-white/65 pl-1">
-          <li><code class="text-white/85 font-mono">POST /v1/videos</code> 立即返回任务对象 <code class="text-white/85 font-mono">{{ '{ "id": "...", "object": "video", "status": "queued", ... }' }}</code></li>
-          <li>轮询 <code class="text-white/85 font-mono">GET /v1/videos/{id}</code>,<code class="text-white/70">status</code> 从 <code class="text-white/70">queued → in_progress → completed</code>(或 <code class="text-white/70">failed</code>)</li>
-          <li>完成后 <code class="text-white/85 font-mono">GET /v1/videos/{id}/content</code> 返回 <strong class="text-white/90">mp4 原始二进制</strong>(非 base64、非 URL)</li>
-        </ol>
-        <p><strong class="text-white/90">计费(预扣)</strong>:请求<strong class="text-white/90">前</strong>按上表价格从你的 Key 账号预扣积分;文本按每请求固定价,图像/视频按档位价格。上游失败或返回无效结果会自动退回 —— 失败不扣费。</p>
-        <p><strong class="text-white/90">模型发现</strong>:<code class="text-white/85 font-mono">GET /v1/models</code> 默认返回模型能力元数据，包括 <code class="text-white/70">kind</code>(image/video/text)、<code class="text-white/70">supported_ratios</code>、<code class="text-white/70">supported_resolutions</code>、<code class="text-white/70">max_reference_images</code>、<code class="text-white/70">max_reference_videos</code>、<code class="text-white/70">max_reference_audios</code>、<code class="text-white/70">max_reference_media</code>(三类参考素材合计上限)、<code class="text-white/70">supports_audio_output</code> 和 <code class="text-white/70">reference_mode</code>;视频模型还带 <code class="text-white/70">supported_durations</code>(如 <code class="text-white/70">["5s"]</code>),即 <code class="text-white/70">seconds</code> 可传的档位。需要严格 OpenAI 模型对象时使用 <code class="text-white/70">GET /v1/models?extended=false</code>。</p>
-        <p><strong class="text-white/90">参数映射</strong>:<code class="text-white/70">size</code>(宽x高)决定原生模型的<strong class="text-white/90">比例 + 分辨率档</strong>(长边:&lt;1800→1K · 1800–3499→2K · ≥3500→4K),<code class="text-white/70">seconds</code>→视频时长。<code class="text-white/70">quality</code> 仅在 GPT Image 2 家族中映射为 1K/2K/4K。档位须是该模型支持的(不支持会回退到该模型最低档);参数须落在定价表内否则 400,余额不足 402。</p>
-        <p><strong class="text-white/90">错误格式</strong>:与 OpenAI 一致,统一返回 <code class="text-white/85 font-mono">{{ '{ "error": { "message": "...", "type": "...", "param": null, "code": "..." } }' }}</code>;<code class="text-white/70">type</code> 为 <code class="text-white/70">invalid_request_error / insufficient_quota / rate_limit_error / server_error</code>。</p>
-        <div class="pt-2 grid sm:grid-cols-2 gap-2 text-xs">
-          <div class="flex items-center gap-2"><span class="badge-err">401</span> Key 无效 / 上游需重新授权</div>
-          <div class="flex items-center gap-2"><span class="badge-err">404</span> 未知 model / 视频任务不存在</div>
-          <div class="flex items-center gap-2"><span class="badge-err">400</span> 参数缺失 / 不支持或未定价</div>
-          <div class="flex items-center gap-2"><span class="badge-err">402</span> 积分不足</div>
-          <div class="flex items-center gap-2"><span class="badge-err">409</span> 视频尚未完成(content 未就绪)</div>
-          <div class="flex items-center gap-2"><span class="badge-err">429</span> 账号并发已满,请重试</div>
-          <div class="flex items-center gap-2"><span class="badge-err">503</span> 上游繁忙,请重试</div>
-        </div>
-      </div>
-    </section>
-
-    <transition name="fade">
-      <div v-if="toastMsg" class="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 bg-white text-black text-sm font-medium px-5 py-2.5 rounded-full shadow-2xl">{{ toastMsg }}</div>
-    </transition>
-  </div>
+    <div class="callout text-[11px] text-white/45">
+      <Icon name="info" class="w-4 h-4 shrink-0 text-amber-300" /><p><code>Idempotency-Key</code> 在同一 API Key 下隔离。一旦上游已受理或提交结果未知，2API 不会换号、换 route 或重提。图片请求未提供时会在响应的 <code>Idempotency-Key</code> / <code>Location</code> 头返回本次生成的恢复句柄；跨重试去重仍应由客户端主动复用稳定的 Key。</p>
+    </div>
+  </section>
 </template>
 
 <style scoped>
-.badge-get, .badge-post, .badge-err {
-  border-radius: 4px; padding: 2px 6px; font-size: 10px; line-height: 1;
-}
-.badge-get { background: rgb(16 185 129 / 0.14); color: rgb(4 120 87); box-shadow: inset 0 0 0 1px rgb(16 185 129 / 0.35); }
-.badge-post { background: rgb(14 165 233 / 0.14); color: rgb(3 105 161); box-shadow: inset 0 0 0 1px rgb(14 165 233 / 0.35); }
-.badge-err { background: rgb(244 63 94 / 0.12); color: rgb(190 18 60); box-shadow: inset 0 0 0 1px rgb(244 63 94 / 0.3); font-family: ui-monospace, monospace; }
-html.dark .badge-get { background: rgb(16 185 129 / 0.15); color: rgb(110 231 183); box-shadow: inset 0 0 0 1px rgb(52 211 153 / 0.3); }
-html.dark .badge-post { background: rgb(14 165 233 / 0.15); color: rgb(125 211 252); box-shadow: inset 0 0 0 1px rgb(56 189 248 / 0.3); }
-html.dark .badge-err { background: rgb(244 63 94 / 0.15); color: rgb(253 164 175); box-shadow: inset 0 0 0 1px rgb(251 113 133 / 0.3); }
+.callout{display:flex;gap:.8rem;padding:1rem;border-radius:.85rem;background:rgb(16 185 129 / .06);box-shadow:inset 0 0 0 1px rgb(16 185 129 / .15)}.doc-section{scroll-margin-top:1rem;display:flex;flex-direction:column;gap:.85rem;padding:1.25rem;border-radius:.9rem;background:rgb(255 255 255 / .03);box-shadow:inset 0 0 0 1px rgb(255 255 255 / .06)}.doc-title{display:flex;align-items:center;gap:.6rem}.doc-title code{font-size:.82rem;color:rgb(255 255 255 / .85)}.get,.post{display:inline-flex;border-radius:.35rem;padding:.18rem .4rem;font:bold .58rem ui-monospace,SFMono-Regular,monospace}.get{color:rgb(125 211 252);background:rgb(14 165 233 / .12)}.post{color:rgb(167 243 208);background:rgb(16 185 129 / .12)}.doc-text{font-size:.72rem;line-height:1.75;color:rgb(255 255 255 / .45)}.doc-text code,.callout code{padding:.08rem .28rem;border-radius:.25rem;color:rgb(255 255 255 / .75);background:rgb(255 255 255 / .06)}.model-group{display:flex;flex-direction:column;gap:.45rem;padding:.8rem;border-radius:.7rem;background:rgb(255 255 255 / .025)}.model-group h4{font-size:.65rem;color:rgb(255 255 255 / .4)}.model-group code{font-size:.68rem;color:rgb(196 181 253)}.code-block{position:relative;border-radius:.7rem;background:#090b11;box-shadow:inset 0 0 0 1px rgb(255 255 255 / .07);overflow:auto}.code-block button{position:absolute;right:.6rem;top:.6rem;padding:.25rem .5rem;border-radius:.35rem;font-size:.6rem;color:rgb(255 255 255 / .5);background:rgb(255 255 255 / .07)}.code-block pre,.simple-code{padding:1rem;padding-right:4rem;white-space:pre-wrap;word-break:break-word;font: .68rem/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;color:rgb(167 243 208)}.endpoint-list{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:.5rem .7rem;font-size:.68rem;color:rgb(255 255 255 / .4)}.endpoint-list code{color:rgb(255 255 255 / .7)}.simple-code{padding:1rem;border-radius:.65rem;background:#090b11}.error-item{display:flex;gap:.6rem;padding:.65rem;border-radius:.55rem;background:rgb(255 255 255 / .025)}.error-item strong{color:rgb(253 164 175)}
 </style>

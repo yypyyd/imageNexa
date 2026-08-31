@@ -1,92 +1,121 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"backend/internal/model"
 	"backend/internal/service"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
+// UserToolsHandler owns the administrator-managed service API credentials.
 type UserToolsHandler struct {
-	keys *service.APIKeyService
-	cdks *service.CDKService
+	credentials *service.APICredentialService
 }
 
-func NewUserToolsHandler(keys *service.APIKeyService, cdks *service.CDKService) *UserToolsHandler {
-	return &UserToolsHandler{
-		keys: keys,
-		cdks: cdks,
-	}
+func NewUserToolsHandler(credentials *service.APICredentialService) *UserToolsHandler {
+	return &UserToolsHandler{credentials: credentials}
 }
 
-func (h *UserToolsHandler) APIKeyGet(c *gin.Context) {
-	user := currentUser(c)
-	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
-		return
-	}
-	data, err := h.keys.Current(c.Request.Context(), user.ID)
+func (h *UserToolsHandler) APICredentialsList(c *gin.Context) {
+	includeRevoked, _ := strconv.ParseBool(c.DefaultQuery("include_revoked", "false"))
+	items, err := h.credentials.List(c.Request.Context(), includeRevoked)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load api key"})
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load API Keys"})
 		return
 	}
-	c.JSON(http.StatusOK, data)
+	out := make([]gin.H, 0, len(items))
+	for _, item := range items {
+		out = append(out, gin.H{
+			"id": item.ID, "name": item.Name, "key_preview": item.KeyPreview,
+			"status": item.Status, "enabled": item.Status == model.APICredentialStatusActive,
+			"concurrency_limit": item.ConcurrencyLimit,
+			"active_requests":   h.credentials.ActiveRequests(c.Request.Context(), item.ID),
+			"last_used_at":      item.LastUsedAt, "revoked_at": item.RevokedAt,
+			"created_at": item.CreatedAt, "updated_at": item.UpdatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out, "total": len(out)})
 }
 
-func (h *UserToolsHandler) APIKeyMint(c *gin.Context) {
-	user := currentUser(c)
-	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
+func (h *UserToolsHandler) APICredentialsCreate(c *gin.Context) {
+	var input service.CreateAPICredentialInput
+	if !bindAdminJSON(c, &input, "invalid request body") {
 		return
 	}
-	data, err := h.keys.Mint(c.Request.Context(), user.ID)
+	created, err := h.credentials.Create(c.Request.Context(), input)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to mint api key"})
+		writeCredentialError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, data)
+	// key is intentionally present only in this one response. Every later API
+	// response serializes APICredential with KeyHash excluded.
+	c.JSON(http.StatusCreated, gin.H{
+		"ok":         true,
+		"key":        created.Key,
+		"credential": created.Credential,
+	})
 }
 
-func (h *UserToolsHandler) APIKeyDelete(c *gin.Context) {
-	user := currentUser(c)
-	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
+func (h *UserToolsHandler) APICredentialsUpdate(c *gin.Context) {
+	var input service.UpdateAPICredentialInput
+	if !bindAdminJSON(c, &input, "invalid request body") {
 		return
 	}
-	if err := h.keys.Revoke(c.Request.Context(), user.ID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to revoke api key"})
+	credential, err := h.credentials.Update(c.Request.Context(), c.Param("id"), input)
+	if err != nil {
+		writeCredentialError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "credential": credential})
+}
+
+func (h *UserToolsHandler) APICredentialsRevoke(c *gin.Context) {
+	if err := h.credentials.Revoke(c.Request.Context(), c.Param("id")); err != nil {
+		writeCredentialError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func (h *UserToolsHandler) RedeemCDK(c *gin.Context) {
-	user := currentUser(c)
-	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
-		return
-	}
-	var body struct {
-		Code string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
-		return
-	}
-	data, err := h.cdks.Redeem(c.Request.Context(), user.ID, body.Code)
+func (h *UserToolsHandler) APICredentialsRotate(c *gin.Context) {
+	created, err := h.credentials.Rotate(c.Request.Context(), c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		writeCredentialError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "amount": data["amount"], "credits": data["credits"]})
+	c.JSON(http.StatusCreated, gin.H{
+		"ok": true, "secret": created.Key, "key": created.Key, "credential": created.Credential,
+	})
 }
 
-func currentUser(c *gin.Context) *model.User {
-	value, ok := c.Get("current_user")
-	if !ok {
-		return nil
+func writeCredentialError(c *gin.Context, err error) {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "API Key 不存在"})
+		return
 	}
-	user, _ := value.(*model.User)
-	return user
+	if errors.Is(err, service.ErrCredentialServiceUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "API Key service is temporarily unavailable"})
+		return
+	}
+	message := strings.TrimSpace(err.Error())
+	for _, safe := range []string{
+		"API Key 名称不能为空",
+		"API Key 名称不能超过 100 个字符",
+		"API Key 名称需为 1 到 100 个字符",
+		"并发上限不能小于 0",
+		"已吊销的 API Key 不能修改",
+		"请使用吊销接口永久吊销 API Key",
+		"API Key 状态不正确",
+	} {
+		if message == safe {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": message})
+			return
+		}
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"detail": "API Key operation failed"})
 }
