@@ -17,7 +17,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](#-部署)
 [![OpenAI Compatible](https://img.shields.io/badge/OpenAI-compatible-412991?logo=openai&logoColor=white)](#-openai-兼容-api)
 [![HTTPS](https://img.shields.io/badge/HTTPS-反代自理-lightgrey)](#-部署)
-[![Providers](https://img.shields.io/badge/供应商-8%20平台-orange)](#-支持的模型--供应商)
+[![Providers](https://img.shields.io/badge/供应商-9%20平台-orange)](#-支持的模型--供应商)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-yes-success)](#-部署)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#-license)
 
@@ -47,13 +47,13 @@
 
 ## ✨ 简介
 
-**image2api** 把 Adobe Firefly、OpenAI、Runway、Grok、Leonardo、Krea、Imagine、OreateAI 等平台,以及**任意 OpenAI 兼容上游**的文本 / 图像 / 视频能力,统一封装成**一套 OpenAI 兼容的 API**;背后用多账号池自动调度 —— 权重优先 + 并发感知、额度耗尽自动换号、认证失效自动刷新或判死、临时错误自动重试、token 到期前主动续期 —— 对外提供稳定服务。
+**image2api** 把 Adobe Firefly、BytePlus Lumina、OpenAI、Runway、Grok、Leonardo、Krea、Imagine、OreateAI 等平台,以及**任意 OpenAI 兼容上游**的文本 / 图像 / 视频能力,统一封装成**一套 OpenAI 兼容的 API**;背后用多账号池自动调度 —— 权重优先 + 并发感知、额度耗尽自动换号、认证失效自动刷新或判死、临时错误自动重试、token 到期前主动续期 —— 对外提供稳定服务。
 
 它不只是 API 代理:自带**积分计费、CDK 充值、邀请奖励、用户体系、管理后台、现代化画图前端**,一条命令即可跑成一个对外运营的 AI 生成站点 —— 作者的线上实例 **[Vivid AI · vividai.run](https://vividai.run)**(品牌)即基于本项目搭建。
 
 > 💡 前后端**完全开源**(MIT),Go + Vue 3,可自由二开 / 自部署。
 
-**一句话亮点** 🔌 OpenAI 兼容 · 🤖 8 平台十余模型 · 🔁 自动换号 / Token 保活 · 💳 积分 + 在线充值(易支付)+ 代理价 · 🧩 并发分组 · 🎨 画图前端 + 管理后台 · 🐳 一键部署(TLS 反代自理)
+**一句话亮点** 🔌 OpenAI 兼容 · 🤖 9 平台十余模型 · 🔁 自动换号 / Token 保活 · 💳 积分 + 在线充值(易支付)+ 代理价 · 🧩 并发分组 · 🎨 画图前端 + 管理后台 · 🐳 一键部署(TLS 反代自理)
 
 ## 🖼️ 界面预览
 
@@ -85,7 +85,7 @@
 #### 🎨 生成能力
 - 生图 + 生视频一站式,支持**图生图 / 参考图**(首帧、末帧、风格参考)，以及按模型声明的参考视频、参考音频与同步音频生成
 - 多分辨率(图像 1K / 2K / 4K · 视频 720p / 1080p)、多宽高比、视频多时长,按模型独立配置与定价
-- 8 大供应商、十余模型,后台**动态启用 / 下架 / 改价**,无需改代码
+- 9 大供应商、十余模型,后台**动态启用 / 下架 / 改价**,无需改代码
 - **模型别名**:同一模型可配多个对外 id,API 调用任意别名均可命中
 - **去AI特征**(可选):画图台一键开启,生成图片自动做去AI痕迹处理(细节微扰 + 去除元数据),按画质档位加收积分(默认 1K+1 / 2K+2 / 4K+3,后台可改价、可整体关闭);带标记的作品在画图台、创作记录、日志与后台图片管理中均有「去AI特征」标识
 
@@ -93,13 +93,13 @@
 - 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
 - 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`);Grok 账号既可运行 Web fast 对话,也会按需用 SSO 自动授权 Grok Build OAuth,通过真实 `grok-4.5` 模型对话;还可走自定义 OpenAI 兼容上游
 - 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载，支持按模型上传参考视频/音频及生成同步音频) · `/v1/models`(默认返回比例、分辨率、时长、参考素材上限和音频输出等扩展能力；`?extended=false` 可取严格 OpenAI 四字段对象，比例统一为 `W:H`)
-- **严格 OpenAI 入参**:图像 `size` 决定比例和原生模型分辨率档(看长边 → 1K/2K/4K);仅 GPT Image 2 家族(`gpt-image-2` / `firefly-gpt-image-2`)使用显式 `quality=low/medium/high` 适配为 1K/2K/4K,其他模型忽略它对分辨率的影响;视频 `size` 看短边映射 720p/1080p,改个 `base_url` + `api_key` 即接现有 OpenAI SDK
+- **严格 OpenAI 入参**:图像 `size` 决定比例和原生模型分辨率档(看长边 → 1K/2K/4K);仅 GPT Image 2 家族(`gpt-image-2` / `firefly-gpt-image-2` / `lumina-gpt-image-2`)使用显式 `quality=low/medium/high` 适配为 1K/2K/4K,其他模型忽略它对分辨率的影响;视频 `size` 看短边映射 720p/1080p,改个 `base_url` + `api_key` 即接现有 OpenAI SDK
 - 图片结果默认返回 **URL**,普通请求不下载、不做 base64 编码、不留存文件;显式传 `response_format=b64_json` 时才内联图片。携带 `Idempotency-Key` 的请求会把结果保存到账号私有存储,可在网关超时后通过任务查询恢复;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
 
 #### 🔁 多账号池 + 智能故障转移
 - 账号池调度,单账号出错不影响整体
 - **权重优先 + 并发感知**:按账号权重从高到低调度,某账号并发满了才轮到下一个;同权重组内 round-robin 均摊。每账号并发数可配(上游账号),其余系统固定
-- **额度耗尽→换号** · **认证失效→刷新重试 / 判死** · **临时错误→同号重试 ×3** · **参数错→直接报错**
+- **额度耗尽→换号** · **认证失效→刷新重试 / 判死** · **临时错误→同号重试 ×3** · **Adobe 第三方图片持续过载→兼容供应商降级** · **参数错→直接报错**
 - **预扣额度**:生成前原子扣减,失败自动退回,杜绝并发超额
 
 #### 🔗 自定义上游聚合(OpenAI 兼容)
@@ -130,7 +130,7 @@
 
 #### 🛠️ 管理后台
 - 概览看板(趋势 / DAU / 失败 Top / 消费榜)
-- 模型管理(普通价 + 代理价 + 别名) · 账号管理(批量导入 / 去重 / 单账号额度刷新，支持 CPA JSON/ZIP、Sub2API 聚合 JSON 与 grok2api JSON) · **并发分组** · **订单管理**(筛选 / 搜索 / 分页) · 全站日志 · 用户管理(设为代理 / 分配并发组 / 看累计充值 / 违禁触发次数) · CDK · 图片管理(多选批量删除 / zip 打包下载) · 展示位 · **站点公告** · 站点配置(含易支付、去AI特征开关与附加价格)
+- 模型管理(普通价 + 代理价 + 别名) · 账号管理(批量导入 / 去重 / 单账号额度刷新，支持 BytePlus Lumina 完整 Cookie、CPA JSON/ZIP、Sub2API 聚合 JSON 与 grok2api JSON) · **并发分组** · **订单管理**(筛选 / 搜索 / 分页) · 全站日志 · 用户管理(设为代理 / 分配并发组 / 看累计充值 / 违禁触发次数) · CDK · 图片管理(多选批量删除 / zip 打包下载) · 展示位 · **站点公告** · 站点配置(含易支付、去AI特征开关与附加价格)
 - **违禁词管理**:后台增删违禁词(分页 + 多选批量删除),提示词命中即拦截(画图台 + API,不区分大小写),按词 / 按用户统计触发次数
 
 **🧰 工程亮点**:tls-client(Chrome JA3/JA4 指纹)稳定穿透 Cloudflare · 媒体存 S3/RustFS 经鉴权代理分发 + 保留期清理 · 自愈式维护轮询(恢复额度 / 刷新凭据 / 清理僵死任务并退款) · 一条命令 Docker 部署(TLS 交给你的反代)。
@@ -140,6 +140,7 @@
 | 供应商 | 模型(示例) | 类型 |
 |---|---|---|
 | **Adobe Firefly** | firefly-image-5 · firefly-gpt-image-2 · flux-kontext-max · firefly-video · firefly-ray · gemini-veo31 | 图像 / 视频 |
+| **BytePlus Lumina** | lumina-seedream-5.0-pro · lumina-gpt-image-2 · lumina-seedream-5.0-lite · lumina-nano-banana-2 · lumina-nano-banana-pro | 图像（文生图 / 图生图） |
 | **OpenAI** | gpt-image-2 | 图像 |
 | **Runway** | runway-gen4-turbo · nano-banana-2(Nano Banana 2) | 视频 / 图像 |
 | **Grok（Web + Build）** | grok-4.5（SSO 自动换取 Build OAuth） · grok-chat-fast（Web） · grok-video · grok-imagine-image | 文本 / 图像 / 视频 |
@@ -149,7 +150,7 @@
 | **OreateAI** | oreate-seedance-2.0-mini · oreate-seedance-2.0-fast · oreate-seedance-1.5-pro · oreate-seedance-2.0 · oreate-seedance-2.5 | 视频(文生 / 图片参考 / 视频参考；2.5 支持 5/10/20/30 秒) |
 | **自定义上游** | 任意 OpenAI 兼容 v1 端点(按 id 路由) | 文本 / 图像 / 视频 |
 
-> 模型由管理后台动态启用并定价,可随时增删。自定义上游支持把任何 OpenAI 兼容服务接成账号,按 model id 路由调用。
+> 模型由管理后台动态启用并定价,可随时增删。BytePlus Lumina 内置接入仅开放表中的 5 个 `lumina-*` ID，避免与 OpenAI / Runway 的同名模型冲突；账号须在后台粘贴包含 `csrfToken` 的完整官网 Cookie。Cookie 属于高敏感凭据，请勿写入日志或提交仓库。自定义上游支持把任何 OpenAI 兼容服务接成账号,按 model id 路由调用。
 
 ## 🔌 OpenAI 兼容 API
 
@@ -270,6 +271,7 @@ backend/                       后端源码(Go)
 │   ├── model/                 GORM 数据模型
 │   ├── provider/              各上游供应商客户端
 │   │   ├── adobe/             Adobe Firefly(tls-client 指纹)
+│   │   ├── byteplus/          BytePlus Lumina 官网五模型（Cookie + ImageX）
 │   │   ├── chatgpt/           OpenAI(含 PoW / turnstile)
 │   │   ├── runway/            Runway 视频 + Nano Banana 图像
 │   │   ├── grok/              Grok Web(statsig) + SSO→Build OAuth(grok-4.5)

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
+	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
@@ -27,11 +29,13 @@ import (
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var validTokenPools = map[string]string{
 	"chatgpt":  "openai",
 	"adobe":    "adobe",
+	"byteplus": "byteplus",
 	"runway":   "runway",
 	"leonardo": "leonardo",
 	"krea":     "krea",
@@ -41,20 +45,140 @@ var validTokenPools = map[string]string{
 	"custom":   "custom",
 }
 
+const (
+	bytePlusCredentialFingerprintMetaKey = "byteplus_credential_fingerprint"
+	bytePlusProbeVersionMetaKey          = "byteplus_probe_version"
+)
+
+// bytePlusAccountClient is the narrow provider surface needed by account
+// imports. Keeping the probe behind this interface lets the import lifecycle be
+// exercised with local fakes without ever contacting BytePlus.
+type bytePlusAccountClient interface {
+	FetchProfile(context.Context, string) (map[string]any, error)
+	FetchCreditsBalance(context.Context, string) (map[string]any, error)
+}
+
+// bytePlusPendingStore owns the credential-generation compare-and-set used by
+// asynchronous import probes. The production implementation below performs the
+// comparison inside the SQL UPDATE, so a worker for an older import can never
+// overwrite a newer credential generation.
+type bytePlusPendingStore interface {
+	Create(context.Context, *model.TokenAccount) error
+	Get(context.Context, string) (*model.TokenAccount, error)
+	RefreshCredential(context.Context, string, string, string, string) (*model.TokenAccount, error)
+	CompleteProbe(context.Context, string, string, string, string, bytePlusProbeResult) (bool, error)
+}
+
+type bytePlusProbeResult struct {
+	Status      string
+	Dead        bool
+	Email       string
+	DisplayName string
+	QuotaMeta   map[string]any
+}
+
+type repoBytePlusPendingStore struct {
+	tokens *repo.TokenRepository
+}
+
+func (s repoBytePlusPendingStore) Create(ctx context.Context, item *model.TokenAccount) error {
+	return s.tokens.Create(ctx, item)
+}
+
+func (s repoBytePlusPendingStore) Get(ctx context.Context, id string) (*model.TokenAccount, error) {
+	return s.tokens.Get(ctx, "byteplus", id)
+}
+
+func (s repoBytePlusPendingStore) RefreshCredential(ctx context.Context, id, cookie, fingerprint, version string) (*model.TokenAccount, error) {
+	item, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	metaPatch := map[string]any{
+		"pending_check":                      true,
+		bytePlusCredentialFingerprintMetaKey: fingerprint,
+		bytePlusProbeVersionMetaKey:          version,
+	}
+	patch := map[string]any{
+		"value":  cookie,
+		"status": "pending",
+		"dead":   false,
+		"fails":  0,
+	}
+	// This branch is only expected for a cryptographic ID collision or a legacy
+	// row. Do not carry a different account's discovered identity across it.
+	if stored := strings.TrimSpace(stringValue(item.Meta[bytePlusCredentialFingerprintMetaKey])); stored != "" && stored != fingerprint {
+		patch["account_email"] = ""
+		patch["account_display_name"] = ""
+	}
+	if err := s.tokens.UpdateMergingMeta(ctx, "byteplus", id, metaPatch, patch); err != nil {
+		return nil, err
+	}
+	return s.Get(ctx, id)
+}
+
+func (s repoBytePlusPendingStore) CompleteProbe(ctx context.Context, id, cookie, fingerprint, version string, result bytePlusProbeResult) (bool, error) {
+	current, err := s.Get(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if !bytePlusProbeStillCurrent(current, cookie, fingerprint, version) {
+		return false, nil
+	}
+
+	condition := "value = ? AND meta ->> '" + bytePlusCredentialFingerprintMetaKey + "' = ? AND meta ->> '" + bytePlusProbeVersionMetaKey + "' = ?"
+	args := []any{cookie, fingerprint, version}
+	conditionalValue := func(column string, value any) clause.Expr {
+		exprArgs := append(append([]any{}, args...), value)
+		return gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE "+column+" END", exprArgs...)
+	}
+
+	metaPatch := cloneJSONMap(datatypes.JSONMap(result.QuotaMeta))
+	metaPatch["pending_check"] = false
+	encodedMeta, err := json.Marshal(metaPatch)
+	if err != nil {
+		return false, err
+	}
+	metaArgs := append(append([]any{}, args...), string(encodedMeta))
+	patch := map[string]any{
+		"status": conditionalValue("status", result.Status),
+		"dead":   conditionalValue("dead", result.Dead),
+		"meta": gorm.Expr(
+			"CASE WHEN "+condition+" THEN COALESCE(meta, '{}'::jsonb) || CAST(? AS jsonb) ELSE meta END",
+			metaArgs...,
+		),
+	}
+	if result.Email != "" {
+		patch["account_email"] = conditionalValue("account_email", result.Email)
+	}
+	if result.DisplayName != "" {
+		patch["account_display_name"] = conditionalValue("account_display_name", result.DisplayName)
+	}
+	item, err := s.tokens.Update(ctx, "byteplus", id, patch)
+	if err != nil {
+		return false, err
+	}
+	return bytePlusProbeMatches(item.Meta, fingerprint, version) && !boolValueWithDefault(item.Meta["pending_check"], false), nil
+}
+
 type TokenService struct {
 	tokens   *repo.TokenRepository
 	refresh  *repo.RefreshProfileRepository
 	events   *repo.EventRepository
 	settings *repo.SiteSettingRepository
 	adobe    *adobe.Client
-	chatgpt  *chatgpt.Client
-	runway   *runway.Client
-	leonardo *leonardo.Client
-	krea     *krea.Client
-	imagine  *imagine.Client
-	grok     *grok.Client
-	oreate   *oreate.Client
-	custom   *custom.Client
+	byteplus bytePlusAccountClient
+	// byteplusPending is separate from the general token repository because its
+	// asynchronous probe completion requires a credential-generation CAS.
+	byteplusPending bytePlusPendingStore
+	chatgpt         *chatgpt.Client
+	runway          *runway.Client
+	leonardo        *leonardo.Client
+	krea            *krea.Client
+	imagine         *imagine.Client
+	grok            *grok.Client
+	oreate          *oreate.Client
+	custom          *custom.Client
 	// sem caps concurrent background pending-probe goroutines (mirrors Python's
 	// 10-worker _quota_check_pool) so a big paste doesn't fire hundreds of
 	// simultaneous upstream requests.
@@ -66,13 +190,16 @@ type TokenService struct {
 	oreateRefreshing atomic.Bool
 }
 
-func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
-	return &TokenService{
+func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
+	service := &TokenService{
 		tokens:   tokens,
 		refresh:  refresh,
 		events:   events,
 		settings: settings,
 		adobe:    adobeClient,
+		byteplusPending: repoBytePlusPendingStore{
+			tokens: tokens,
+		},
 		chatgpt:  chatGPTClient,
 		runway:   runwayClient,
 		leonardo: leonardoClient,
@@ -83,6 +210,12 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 		custom:   customClient,
 		sem:      make(chan struct{}, 10),
 	}
+	// Avoid storing a typed nil pointer in the interface: pending imports should
+	// take the explicit no-client path rather than attempting a network probe.
+	if bytePlusClient != nil {
+		service.byteplus = bytePlusClient
+	}
+	return service
 }
 
 // applyProxy keeps only providers with a verified residential-egress
@@ -533,6 +666,155 @@ func (s *TokenService) checkPendingKrea(tokenID, cookie string) {
 		quotaMeta["cached_quota_at"] = int(time.Now().Unix())
 	}
 	s.finishPending(ctx, "krea", tokenID, "active", false, quotaMeta)
+}
+
+// ImportBytePlusCookie imports the complete browser Cookie header used by
+// BytePlus Lumina. The CSRF value is required in both the Cookie header and
+// X-Csrf-Token; storing only csrfToken is therefore insufficient.
+func (s *TokenService) ImportBytePlusCookie(ctx context.Context, cookie string) (*model.TokenAccount, error) {
+	cookie = normalizeBytePlusCookie(cookie)
+	if cookie == "" {
+		return nil, errors.New("cookie required")
+	}
+	if !byteplus.IsBytePlusCookie(cookie) {
+		return nil, errors.New("not a byteplus lumina cookie")
+	}
+	if s.byteplusPending == nil {
+		return nil, errors.New("byteplus token repository unavailable")
+	}
+	fingerprint := bytePlusCredentialFingerprint(cookie)
+	tokenID := bytePlusTokenIDFromFingerprint(fingerprint)
+	version := randomUpper(20)
+	meta := datatypes.JSONMap{
+		"pending_check":                      true,
+		bytePlusCredentialFingerprintMetaKey: fingerprint,
+		bytePlusProbeVersionMetaKey:          version,
+	}
+	now := time.Now()
+	item := &model.TokenAccount{
+		ID: tokenID, Pool: "byteplus", Value: cookie, Status: "pending", Meta: meta,
+		AddedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	err := s.byteplusPending.Create(ctx, item)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil, err
+		}
+		// Re-importing the same complete Cookie is idempotent at the account level:
+		// it refreshes the existing row and advances only the probe generation. The
+		// merge preserves quota fields written by a worker finishing concurrently.
+		item, err = s.byteplusPending.RefreshCredential(ctx, tokenID, cookie, fingerprint, version)
+		if err != nil {
+			return nil, err
+		}
+	}
+	go s.checkPendingBytePlus(tokenID, cookie, fingerprint, version)
+	return item, nil
+}
+
+func (s *TokenService) checkPendingBytePlus(tokenID, cookie, fingerprint, version string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("token import: byteplus pending check panicked for %s: %v", tokenID, r)
+		}
+	}()
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	if s.byteplus == nil {
+		s.completePendingBytePlus(ctx, tokenID, cookie, fingerprint, version, bytePlusProbeResult{Status: "active"})
+		return
+	}
+	profile, err := s.byteplus.FetchProfile(ctx, cookie)
+	if err != nil {
+		if errors.Is(err, byteplus.ErrAuth) {
+			s.completePendingBytePlus(ctx, tokenID, cookie, fingerprint, version, bytePlusProbeResult{Status: "disabled", Dead: true})
+			return
+		}
+		// A transient profile failure is not proof that the durable browser session
+		// is invalid; the generation path remains the final authority.
+		s.completePendingBytePlus(ctx, tokenID, cookie, fingerprint, version, bytePlusProbeResult{Status: "active"})
+		return
+	}
+	result := bytePlusProbeResult{
+		Status:      "active",
+		Email:       firstString(profile, "email", "user_email"),
+		DisplayName: firstString(profile, "display_name", "user_name", "name"),
+		QuotaMeta:   map[string]any{},
+	}
+	if balance, balanceErr := s.byteplus.FetchCreditsBalance(ctx, cookie); balanceErr == nil {
+		for source, target := range map[string]string{
+			"remaining": "cached_quota_remaining",
+			"used":      "cached_quota_used",
+			"total":     "cached_quota_total",
+		} {
+			if value, ok := anyFloat(balance[source]); ok {
+				result.QuotaMeta[target] = canonicalQuotaNumber(value)
+			}
+		}
+		result.QuotaMeta["cached_quota_at"] = int(time.Now().Unix())
+	} else if errors.Is(balanceErr, byteplus.ErrAuth) {
+		result.Status = "disabled"
+		result.Dead = true
+		s.completePendingBytePlus(ctx, tokenID, cookie, fingerprint, version, result)
+		return
+	}
+	s.completePendingBytePlus(ctx, tokenID, cookie, fingerprint, version, result)
+}
+
+func (s *TokenService) completePendingBytePlus(ctx context.Context, tokenID, cookie, fingerprint, version string, result bytePlusProbeResult) {
+	if s.byteplusPending == nil {
+		return
+	}
+	_, _ = s.byteplusPending.CompleteProbe(ctx, tokenID, cookie, fingerprint, version, result)
+}
+
+func normalizeBytePlusCookie(cookie string) string {
+	cookie = cleanAdobeCookie(cookie)
+	parts := strings.Split(cookie, ";")
+	cleaned := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			cleaned = append(cleaned, part)
+		}
+	}
+	return strings.Join(cleaned, "; ")
+}
+
+func bytePlusCredentialFingerprint(cookie string) string {
+	digest := sha256.Sum256([]byte(normalizeBytePlusCookie(cookie)))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func bytePlusTokenIDFromFingerprint(fingerprint string) string {
+	// Forty hex characters retain 160 bits of the complete credential digest,
+	// comfortably within TokenAccount.ID's 64-character database limit.
+	const idFingerprintLength = 40
+	fingerprint = strings.ToUpper(strings.TrimSpace(fingerprint))
+	if len(fingerprint) > idFingerprintLength {
+		fingerprint = fingerprint[:idFingerprintLength]
+	}
+	return "BP" + fingerprint
+}
+
+func bytePlusProbeMatches(meta datatypes.JSONMap, fingerprint, version string) bool {
+	return strings.TrimSpace(stringValue(meta[bytePlusCredentialFingerprintMetaKey])) == fingerprint &&
+		strings.TrimSpace(stringValue(meta[bytePlusProbeVersionMetaKey])) == version
+}
+
+func bytePlusProbeStillCurrent(item *model.TokenAccount, cookie, fingerprint, version string) bool {
+	return item != nil && item.Value == cookie && bytePlusProbeMatches(item.Meta, fingerprint, version)
+}
+
+func firstString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(stringValue(values[key])); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // ImportImagineToken imports an Imagine.art account. The stored credential IS the
@@ -1464,6 +1746,10 @@ func oreateStatusForBalance(item model.TokenAccount, remaining int, known bool) 
 // atomic metadata merge plus the lifecycle transition it authorizes. Low-credit
 // rows are retained in quota state; only a later successful balance at or above
 // the operating floor may reactivate them.
+// oreateVideoQuotaMetaKey caches the part of the balance Oreate accepts for
+// video generation (see Client.FetchCreditsBalance).
+const oreateVideoQuotaMetaKey = "cached_video_quota_remaining"
+
 func oreateQuotaPatches(item model.TokenAccount, data map[string]any, now time.Time) (map[string]any, map[string]any) {
 	metaPatch := map[string]any{
 		"cached_quota_at":           int(now.Unix()),
@@ -1475,6 +1761,9 @@ func oreateQuotaPatches(item model.TokenAccount, data map[string]any, now time.T
 	}
 	if total, ok := data["total"].(int); ok {
 		metaPatch["cached_quota_total"] = total
+	}
+	if videoRemaining, ok := data["video_remaining"].(int); ok {
+		metaPatch[oreateVideoQuotaMetaKey] = videoRemaining
 	}
 	patch := map[string]any{
 		"cached_quota_reset_after": strings.TrimSpace(stringValue(data["reset_after"])),
@@ -1902,6 +2191,58 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			"error":           data["error"],
 		}, nil
 	}
+	if poolToType(item.Pool) == "byteplus" && s.byteplus != nil {
+		data, err := s.byteplus.FetchCreditsBalance(ctx, item.Value)
+		if err != nil {
+			if errors.Is(err, byteplus.ErrAuth) {
+				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
+					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
+				})
+			}
+			return nil, err
+		}
+		metaPatch := map[string]any{}
+		var upstreamRemaining *float64
+		for source, target := range map[string]string{
+			"remaining": "cached_quota_remaining",
+			"used":      "cached_quota_used",
+			"total":     "cached_quota_total",
+		} {
+			if value, ok := anyFloat(data[source]); ok {
+				if source == "remaining" {
+					upstreamRemaining = &value
+				} else {
+					metaPatch[target] = canonicalQuotaNumber(value)
+				}
+			}
+		}
+		if upstreamRemaining != nil {
+			metaPatch["cached_quota_at"] = int(time.Now().Unix())
+		}
+		patch := map[string]any{}
+		if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
+			patch["cached_quota_reset_after"] = reset
+			item.CachedQuotaResetAfter = reset
+		}
+		if upstreamRemaining != nil && *upstreamRemaining > 0 && item.Status == "quota" {
+			patch["status"] = "active"
+		}
+		if err := s.tokens.SettleQuotaTracked(ctx, item.Pool, item.ID, 0, upstreamRemaining, metaPatch); err != nil {
+			return nil, err
+		}
+		if len(patch) > 0 {
+			_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
+		}
+		quotaCachedAt := metaPatch["cached_quota_at"]
+		if quotaCachedAt == nil {
+			quotaCachedAt = item.Meta["cached_quota_at"]
+		}
+		return map[string]any{
+			"supported": true, "remaining": data["remaining"], "used": data["used"], "total": data["total"],
+			"reset_after": emptyToNil(item.CachedQuotaResetAfter), "quota_cached_at": quotaCachedAt,
+			"unchanged": false, "unknown": boolValueWithDefault(data["unknown"], false), "error": data["error"],
+		}, nil
+	}
 	if poolToType(item.Pool) == "krea" && s.krea != nil {
 		s.applyProxy(ctx)
 		cookie, rerr := kreaRefreshAndPersist(ctx, s.krea, s.tokens, item.ID, item.Value)
@@ -2158,12 +2499,12 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			"unchanged": false, "unknown": false, "status": item.Status, "dead": item.Dead, "error": data["error"],
 		}, nil
 	}
-	remaining, hasRemaining := jsonMapInt(item.Meta, "cached_quota_remaining")
+	remaining, hasRemaining := jsonMapFloat(item.Meta, "cached_quota_remaining")
 	quotaAt, _ := jsonMapInt(item.Meta, "cached_quota_at")
 	typeLabel := poolToType(item.Pool)
 	return map[string]any{
-		"supported":       typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "oreate",
-		"remaining":       valueOrNil((typeLabel == "openai" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "oreate") && hasRemaining, remaining),
+		"supported":       typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "byteplus" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "oreate",
+		"remaining":       valueOrNil((typeLabel == "openai" || typeLabel == "byteplus" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "oreate") && hasRemaining, remaining),
 		"total":           nil,
 		"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
 		"quota_cached_at": valueOrNil(quotaAt != 0, quotaAt),
@@ -2202,6 +2543,36 @@ func (s *TokenService) Email(ctx context.Context, pool, id string) (map[string]a
 			return map[string]any{"email": extracted, "cached": false}, nil
 		}
 		return map[string]any{"email": nil, "cached": false}, nil
+	}
+	if poolToType(item.Pool) == "byteplus" {
+		email := strings.TrimSpace(item.AccountEmail)
+		if email != "" {
+			return map[string]any{"email": email, "cached": true}, nil
+		}
+		if s.byteplus == nil {
+			return map[string]any{"email": nil, "cached": false}, nil
+		}
+		profile, err := s.byteplus.FetchProfile(ctx, item.Value)
+		if err != nil {
+			if errors.Is(err, byteplus.ErrAuth) {
+				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
+					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
+				})
+			}
+			return nil, err
+		}
+		patch := map[string]any{}
+		email = firstString(profile, "email", "user_email")
+		if email != "" {
+			patch["account_email"] = email
+		}
+		if name := firstString(profile, "display_name", "user_name", "name"); name != "" {
+			patch["account_display_name"] = name
+		}
+		if len(patch) > 0 {
+			_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
+		}
+		return map[string]any{"email": emptyToNil(email), "cached": false}, nil
 	}
 	if poolToType(item.Pool) == "oreate" {
 		email := strings.TrimSpace(item.AccountEmail)
@@ -2280,8 +2651,8 @@ func (s *TokenService) createToken(ctx context.Context, pool, tokenID, value, st
 }
 
 func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
-	remaining, hasRemaining := jsonMapInt(item.Meta, "cached_quota_remaining")
-	total, hasTotal := jsonMapInt(item.Meta, "cached_quota_total")
+	remaining, hasRemaining := jsonMapFloat(item.Meta, "cached_quota_remaining")
+	total, hasTotal := jsonMapFloat(item.Meta, "cached_quota_total")
 	quotaAt, _ := jsonMapInt(item.Meta, "cached_quota_at")
 	pending, _ := jsonMapBool(item.Meta, "pending_check")
 	// OpenAI email lives in the token's JWT (nested profile claim). Decode it at
@@ -2300,7 +2671,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 	if item.Meta != nil {
 		teamID = strings.TrimSpace(stringValue(item.Meta["team_id"]))
 	}
-	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok" || typeLabel == "oreate"
+	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "byteplus" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok" || typeLabel == "oreate"
 	paidPlan, _ := jsonMapBool(item.Meta, "paid_account")
 	firstImageAt, _ := jsonMapInt(item.Meta, oreateFirstImageAtMetaKey)
 	firstImageState := strings.TrimSpace(stringValue(item.Meta[oreateFirstImageStateMetaKey]))
@@ -2513,6 +2884,9 @@ func newTokenID(pool string) string {
 	prefix := "TK"
 	if pool == "adobe" {
 		prefix = "AD"
+	}
+	if pool == "byteplus" {
+		prefix = "BP"
 	}
 	if pool == "chatgpt" {
 		prefix = "OA"

@@ -1,5 +1,186 @@
 # Design Notes
 
+### 2026-08-31 - BytePlus Lumina website image provider
+
+**Change**: Added the `byteplus` account provider for Lumina website image
+generation. Administrator import accepts one complete website Cookie only when
+it contains a non-empty `csrfToken`; the server keeps that Cookie as the account
+credential and derives `X-Csrf-Token` from the same value. The built-in catalog
+is a closed set of five image models, all supporting text-to-image (`t2i`) and
+image-to-image (`i2i`):
+
+| Public model id | Lumina service id | `req_key` |
+|---|---:|---|
+| `lumina-seedream-5.0-pro` | `7657401949175693322` | `ByteDance-Seedream-5.0-pro` |
+| `lumina-gpt-image-2` | `6824519374061285743` | `gpt-image-2` |
+| `lumina-seedream-5.0-lite` | `7604761017696141358` | `ByteDance-Seedream-5.0` |
+| `lumina-nano-banana-2` | `8162745039814627354` | `gemini-3.1-fi` |
+| `lumina-nano-banana-pro` | `8162745039814627353` | `gemini_nbp` |
+
+Reference images are uploaded through Lumina's ImageX token flow and checked
+with `risk_predict` before their object ids are placed in the task inputs. The
+provider submits `/inference/v2/create_task` with the selected service id,
+`vproxy_overpass` pipeline and `t2i`/`i2i` inference type, then polls
+`/inference/task/query_task_list` by parent task id. Every Lumina JSON/control-
+plane request sends both the complete Cookie and matching `X-Csrf-Token`;
+artifact downloads follow the website's separate resource-fetch path. Completed
+storage objects are normalized through a strict BytePlus-host allowlist.
+API-origin `resource-utils` objects are fetched with the exact account that
+created the task; public CDN objects never receive that Cookie. URL-only API
+responses use an opaque gateway URL and lazily cache the first authenticated
+download.
+
+Lumina GPT Image 2 exposes independent `quality` and `image_size` selects rather
+than a native 1K/2K/4K control. The gateway keeps its existing priced tiers as a
+compatibility adapter (`low`/`medium`/`high`) and maps `image_size` through an
+explicit tier-and-orientation table limited to the seven values published by
+Lumina. This table never promotes a 1K/2K portrait to the 4K-only
+`2160x3840` canvas; exact published pixel sizes are passed through unchanged.
+Some aspect ratios therefore use the nearest available orientation because the
+upstream menu is not a complete tier-by-ratio Cartesian product.
+
+**Reason**: Lumina exposes these models through authenticated website contracts,
+not an OpenAI-compatible bearer-token API. Namespaced public ids keep
+`lumina-gpt-image-2` separate from ChatGPT's `gpt-image-2`, and the two
+`lumina-nano-banana-*` ids separate from Runway's public ids. Service ids and
+request keys remain server-owned model metadata; clients cannot select an
+arbitrary Lumina service.
+
+**Failure and quota semantics**: Lumina code `100000007` marks the selected
+account quota-exhausted so the pool may try another eligible account. Code
+`100000008` is treated as policy-rejected input, and `1000000023` as an
+unsupported model/capability; neither should poison account health or be
+retried with another credential. Authentication failures disable the affected
+Cookie. Before task submission, temporary transport or upstream failures retain
+the normal provider retry/failover behavior. Once `create_task` returns a parent
+task id, the call is treated as non-idempotently accepted: temporary polling
+failures retry only that parent id, and completed-result download failures retry
+only the original URL for a bounded number of attempts. A final post-acceptance
+failure never switches accounts or submits a second paid task. Explicit
+terminal quota, risk, and invalid-parameter outcomes keep their public business
+classification; quota also retires the affected account from later requests.
+Other post-acceptance failures are surfaced as temporary. Gateway credit pre-
+deduction and failure refunds remain unchanged.
+
+HTTP status alone is not destructive account evidence: recognized quota, risk,
+and invalid-parameter business codes/messages take priority over a 403 status.
+Only an explicit authentication/session response disables an account; an
+unclassified 403 remains temporary so one provider-wide policy response cannot
+poison the complete pool. Account rows use a normalized full-Cookie fingerprint,
+and background profile/quota probes verify that fingerprint before every write,
+so a result started for an older credential cannot overwrite or disable a newly
+imported session.
+
+**Security decision**: Import is administrator-only and never accepts a bare
+CSRF token as a substitute for the complete Cookie. Cookie and CSRF values must
+remain in private account storage and request headers; they are excluded from
+public model data, result URLs and logs. Reference uploads retain the gateway's
+existing size/count validation; ImageX upload credentials can only reach
+allowlisted HTTPS hosts and are never followed across redirects. Result URLs
+are likewise host-checked and content/size-checked, while Cookie forwarding is
+limited to the exact Lumina API origin. Authenticated Lumina API calls reject
+redirects instead of replaying Cookie, CSRF headers, or POST bodies. This
+prevents an account-bound storage
+URL or upstream-selected redirect from leaking a durable session to API clients
+or unrelated hosts.
+
+### 2026-08-30 - Track current Adobe partner-image payload contracts
+
+**Change**: Adobe cookie exchange now requests the current `tk_platform` and
+`tk_platform_sync` IMS scopes in addition to the existing Firefly scopes.
+The exchange URL also tracks Firefly's current IMS JavaScript client version,
+`v2-v0.54.0-3-g58cfcb7`, sends the browser Client Hints, and includes Adobe's
+current per-exchange `fingerprint_request_id`. Partner image and video submits no longer fabricate an
+`x-arp-session-id`; the current web client only adds that header when Universal
+Nav has supplied a genuine Adobe ARP feature token, and otherwise omits it.
+The TLS fingerprint dependency is upgraded to `tls-client v1.15.1`, and Adobe
+now uses its newest bundled profile, Chrome 146 on Windows, for cookie exchange,
+account maintenance, submit, polling, and downloads. The former Chrome
+124/131/133 Windows/macOS pool and per-client random selection are removed, so
+one Adobe credential retains one internally consistent browser identity for its
+whole lifecycle. The UA, Client Hints, and TLS ClientHello all describe the same
+Chrome major version; only TLS extension ordering retains the browser-like
+randomization provided by the library.
+Partner submits advertise `Sec-Fetch-Site: cross-site`, matching Chrome's site
+calculation from `firefly.adobe.com` to the distinct `*.ff.adobe.io`
+registrable domain. The former `same-site` value was not browser-reproducible
+and created a contradiction between Origin/Referer and Fetch Metadata.
+Adobe GPT Image 2 requests now send the canonical aspect-ratio
+dimensions in the top-level `size` object and leave `modelSpecificPayload`
+empty for explicit sizes. The gateway maps its existing 1K/2K/4K tiers to
+Adobe detail levels 1/3/5 and uses the dimensions published by the current
+Firefly model configuration. Text-to-image and subject-reference requests share
+the same payload contract. GPT Image 1.5 sends its current seed and empty
+provider-specific object but no longer sends a GPT Image 2 detail level. The
+original Nano Banana keeps concrete top-level dimensions while its
+aspect ratio moves into `modelSpecificPayload`. Nano Banana Pro and Gemini 3.1
+use Adobe's canonical positive dimensions whenever an explicit aspect ratio is
+selected; their `-1`/`-2`/`-4` size sentinels are reserved for the 1K/2K/4K
+Auto-ratio choices, which omit `modelSpecificPayload.aspectRatio`. The original
+model omits `groundSearch`, while the newer two retain it.
+
+**Reason**: Adobe's current Firefly release added the two platform scopes to its
+login contract and moved GPT Image 2's dimensions out of
+`modelSpecificPayload.size`. Corrected GPT Image 2 and GPT Image 1.5 payloads
+still returned the same misleading `timeout_error` / `system under load`
+response across otherwise healthy accounts and different egress paths. A newly
+exchanged token was verified to contain both platform scopes, so missing scope
+was ruled out as the sole cause. The tested account's Floodgate response also
+enabled the shared third-party flag and the GPT Image 2, GPT Image 1.5, Nano
+Banana Pro, and Gemini 3.1 model flags. Live submission also confirmed that
+combining an explicit ratio with the Auto-only negative size sentinels is
+rejected because width and height must be at least one. The remaining
+header-level mismatch was the gateway's locally invented ARP value: Adobe
+decodes an actual feature token
+before forwarding it as `x-arp-session-id` and never constructs the former
+`sid`/`ftr` JSON shape client-side. Adobe's current web client still uses the
+same 3P submit endpoint and public model identifiers.
+An end-to-end check from the production server then used the official Firefly
+page in real Chromium with a freshly exchanged token and the browser's own
+network stack. A GPT Image 2 request made directly by that page still returned
+HTTP 408 with `timeout_error` / `system under load`. The account's decoded APS
+profile explicitly allowed `pm/can_use_gpt-image`, while its subscription was a
+`FREE_ENTITLEMENT` with the `FF_FREE` credit features. Five other refreshable
+production credentials returned the same 408 when exchange and submit both
+used the production server exit. This rules out the request contract, Go's TLS
+stack, one-account risk control, and split egress as the common cause. As a
+separate control, the official page submitted the legacy Adobe-native Firefly
+Image 2 request to `firefly.adobe.io/v2/images/generate` and received HTTP 503.
+At the time of testing, Adobe's own web client therefore reproduced failures on
+both old-model upstreams; client-side changes cannot make those requests
+succeed while that provider state persists.
+Repeated requests had also made the same access token alternate between old
+Chrome majors and two operating systems. Because Adobe correlates IMS and 3P
+traffic as a browser session, that behavior looked like rapid device hopping and
+was a stronger risk-control signal than a stable, current browser profile.
+`v1.15.1` is the latest released `tls-client` version available during this
+change, and Chrome 146 is the newest profile bundled by that release.
+
+**Impact**: Newly exchanged Adobe access tokens include the current platform
+authorization scopes and current IMS client version. Partner submits omit ARP
+unless a future implementation obtains an Adobe-issued feature token. Payload
+construction changes for Adobe `firefly-gpt-image-2`,
+`firefly-gpt-image-1.5`, `firefly-nano-banana`,
+`firefly-nano-banana-pro`, and `firefly-nano-banana-2`. Public model IDs,
+endpoints, reference limits, aspect-ratio choices, and the gateway's 1K/2K/4K
+contract remain stable. Firefly Image 5, Flux Kontext Max, and the enabled video
+models retain their existing provider-specific payloads after comparison with
+the same release. The dependency update also moves Gin to `v1.12.0`, quic-go to
+`v0.59.0`, and qpack to `v0.6.0` to keep the HTTP/3 dependency graph compatible;
+the former qpack `v0.5.1` replacement is removed.
+
+**Security decision**: The gateway must not manufacture provider authentication
+or feature-token headers. It may send `x-arp-session-id` only when an authentic,
+current Adobe-issued value is available; otherwise omission is safer than an
+unsigned lookalike. The expanded IMS scopes are requested only during the
+existing private cookie exchange, and neither the source cookie nor the
+resulting access token is exposed through public APIs, logs, or model payloads.
+Using one current browser identity reduces avoidable device-hopping signals but
+does not disguise the server's network origin. A stable residential Adobe
+egress, if introduced later, must be provider-specific and must keep exchange,
+profile, credit, and submit traffic on the same exit; the existing rotating
+global proxy is not suitable for that trust boundary.
+
 ### 2026-08-25 - Fail-safe Grok Statsig recovery without account-pool sweeps
 
 **Change**: Statsig-protected Grok submit endpoints now classify every HTTP 403
@@ -523,6 +704,18 @@ ZIP processing is memory-only and never extracts paths to disk. It accepts JSON 
 
 ## Change history
 
+### 2026-08-31 - Cross-provider fallback for Adobe third-party images
+
+**Change**: Adobe third-party image models now fall back only after the Adobe account pool returns a temporary upstream error. GPT Image variants use the ChatGPT `gpt-image-2` path. Nano Banana variants first use the closest Runway workflow and then ChatGPT when the Runway pool is unavailable. Reference-free requests may finally use Grok; requests with references never enter that text-only path. The public model ID, local price, request, reference images, and single event remain unchanged, while the event provider/account is updated to the provider that actually executes the fallback.
+
+**Reason**: Adobe's `firefly-3p` gateway currently returns pool-wide `timeout_error: system under load` responses for valid requests, accounts, browser sessions, and payloads. Account-only failover therefore repeats the same provider-wide failure and still exposes it to users.
+
+**Impact**: One billed generation can make one Adobe attempt chain followed by one ordered fallback chain without a second debit or event. Third-party images stop Adobe's former five-minute temporary retry after the bounded three-account attempt chain and enter the explicit fallback immediately; native Firefly models retain the former retry window. Fixed-account administrator tests, authentication/quota failures, content rejection, and parameter errors never cross providers. If every optional fallback is unavailable, the request retains Adobe's temporary-error classification.
+
+**Security boundary**: Provider selection remains server-controlled through a closed model allowlist. Clients cannot choose an upstream credential or URL, and references are forwarded through the existing bounded decode/upload path rather than discarded. Event logs record the actual fallback provider and account without logging credentials.
+
+**Known risk**: A fallback model can differ in rendering style and, for ChatGPT's web path, effective output resolution. This is an availability fallback for sustained Adobe failure, not a claim of byte-for-byte model equivalence.
+
 ### 2026-08-12 - Adaptive Adobe submit pacing with in-request retry
 
 **Change**: Adobe submit lanes pace adaptively instead of at a fixed 1.2-second serialized cadence. Each lane starts at a 600 ms floor with up to 2 in-flight submits; overload responses double the spacing toward a 10-second ceiling, successes decay it back to the floor, and the existing breaker still trips on consecutive overloads. `ADOBE_SUBMIT_INTERVAL_MS` now sets the floor and `ADOBE_SUBMIT_INTERVAL_MAX_MS` the ceiling. Temporary upstream failures (overload responses, an open breaker, a temp-failover cap hit) no longer fail the request: the pool scheduler waits with 3→12 second backoff and retries inside the request for up to 120 seconds before surfacing the error.
@@ -640,3 +833,23 @@ All model-discovery surfaces canonicalize numeric aspect ratios to `W:H` (for ex
 **Impact**: Frontend import parsing and account-import UI only; backend routes and database schema are unchanged.
 
 **Decision**: Normalize into the current ChatGPT import flow so existing deduplication and background validation remain the single source of truth.
+
+### 2026-08-31 - BytePlus model-aware quota scheduling
+
+**Change**: BytePlus Lumina account selection now computes the official upstream
+point cost from the exact normalized model payload, filters accounts whose known
+available balance cannot fund that request, and uses best-fit ordering within
+the existing weight/cooldown groups. Costs retain tenths of a point. Every
+successful or possibly accepted generation refreshes `lumi/computing_points`.
+
+**Concurrency decision**: Submission atomically records both available-credit
+deduction and an in-flight hold. Reconciliation releases only the completed
+request's hold and writes `upstream remaining - other holds`, preventing two
+simultaneous completions from overwriting each other's reservation. Definite
+pre-billing failures refund; accepted or submission-ambiguous tasks settle and
+never fail over, preserving the at-most-once create boundary.
+
+**Impact**: Cheap models can continue using low-balance accounts while large
+balances are preserved for expensive GPT Image 2 requests. Stale known balances
+cannot be concurrently overdrawn, legacy unknown balances remain usable, and
+the admin quota display is refreshed after each completed generation.

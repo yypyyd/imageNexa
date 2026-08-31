@@ -111,6 +111,68 @@ func seedDefaults(ctx context.Context, db *gorm.DB) error {
 			0, 0, now(), now()) ON CONFLICT (id) DO NOTHING`).Error; err != nil {
 		return err
 	}
+	// BytePlus Lumina publishes these five image models. Namespaced public IDs
+	// avoid collisions with the ChatGPT and Runway catalogs, while upstream_model
+	// retains the numeric Lumina service ID used by the provider API.
+	if err := db.WithContext(ctx).Exec(`INSERT INTO model_configs
+		(id, type, name, alias, provider, enabled, ratios, prices, resolutions,
+		 image_to_image, duration_prices, prices_agent, duration_prices_agent,
+		 durations, max_reference_images, max_reference_videos, max_reference_audios,
+		 max_reference_media, supports_audio_output, reference_mode, upstream_model,
+		 weight, generation_count, created_at, updated_at)
+		VALUES
+		 ('lumina-seedream-5.0-pro', 'image', 'Seedream 5.0 Pro', '', 'byteplus', true,
+		  '["1:1","16:9","9:16","4:3","3:4"]'::jsonb,
+		  '{"1K":0,"2K":0}'::jsonb, '["1K","2K"]'::jsonb, true,
+		  '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '[]'::jsonb,
+		  10, 0, 0, 0, false, 'asset', '7657401949175693322', 0, 0, now(), now()),
+		 ('lumina-gpt-image-2', 'image', 'GPT Image 2 (Beta)', '', 'byteplus', true,
+		  '["1:1","16:9","9:16","4:3","3:4"]'::jsonb,
+		  '{"1K":0,"2K":0,"4K":0}'::jsonb, '["1K","2K","4K"]'::jsonb, true,
+		  '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '[]'::jsonb,
+		  14, 0, 0, 0, false, 'asset', '6824519374061285743', 0, 0, now(), now()),
+		 ('lumina-seedream-5.0-lite', 'image', 'Seedream 5.0 Lite', '', 'byteplus', true,
+		  '["1:1","16:9","9:16","4:3","3:4"]'::jsonb,
+		  '{"2K":0}'::jsonb, '["2K"]'::jsonb, true,
+		  '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '[]'::jsonb,
+		  10, 0, 0, 0, false, 'asset', '7604761017696141358', 0, 0, now(), now()),
+		 ('lumina-nano-banana-2', 'image', 'Nano Banana 2 (Beta)', '', 'byteplus', true,
+		  '["16:9","9:16","4:3","3:4","1:1"]'::jsonb,
+		  '{"1K":0,"2K":0,"4K":0}'::jsonb, '["1K","2K","4K"]'::jsonb, true,
+		  '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '[]'::jsonb,
+		  14, 0, 0, 0, false, 'asset', '8162745039814627354', 0, 0, now(), now()),
+		 ('lumina-nano-banana-pro', 'image', 'Nano Banana Pro (Beta)', '', 'byteplus', true,
+		  '["16:9","9:16","4:3","3:4","1:1"]'::jsonb,
+		  '{"1K":0,"2K":0,"4K":0}'::jsonb, '["1K","2K","4K"]'::jsonb, true,
+		  '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '[]'::jsonb,
+		  14, 0, 0, 0, false, 'asset', '8162745039814627353', 0, 0, now(), now())
+		ON CONFLICT (id) DO NOTHING`).Error; err != nil {
+		return err
+	}
+	// Capability-only upgrade backfill. Do not overwrite operator-controlled
+	// aliases, enablement, prices, weights, or counters on existing rows.
+	if err := db.WithContext(ctx).Exec(`UPDATE model_configs AS m SET
+		ratios = v.ratios::jsonb,
+		resolutions = v.resolutions::jsonb,
+		image_to_image = true,
+		max_reference_images = v.max_images,
+		max_reference_videos = 0,
+		max_reference_audios = 0,
+		max_reference_media = 0,
+		supports_audio_output = false,
+		reference_mode = 'asset',
+		upstream_model = v.upstream_model,
+		updated_at = now()
+		FROM (VALUES
+		 ('lumina-seedream-5.0-pro', '["1:1","16:9","9:16","4:3","3:4"]', '["1K","2K"]', 10, '7657401949175693322'),
+		 ('lumina-gpt-image-2', '["1:1","16:9","9:16","4:3","3:4"]', '["1K","2K","4K"]', 14, '6824519374061285743'),
+		 ('lumina-seedream-5.0-lite', '["1:1","16:9","9:16","4:3","3:4"]', '["2K"]', 10, '7604761017696141358'),
+		 ('lumina-nano-banana-2', '["16:9","9:16","4:3","3:4","1:1"]', '["1K","2K","4K"]', 14, '8162745039814627354'),
+		 ('lumina-nano-banana-pro', '["16:9","9:16","4:3","3:4","1:1"]', '["1K","2K","4K"]', 14, '8162745039814627353')
+		) AS v(id, ratios, resolutions, max_images, upstream_model)
+		WHERE m.id = v.id`).Error; err != nil {
+		return err
+	}
 	// OreateAI Seedance capabilities mirror the authenticated account model and
 	// scene configuration. Prices default to zero so deployments can set their
 	// own retail pricing without seed updates overwriting it.

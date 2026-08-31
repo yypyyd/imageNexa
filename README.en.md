@@ -4,7 +4,7 @@
 
 <h1>image2api</h1>
 
-**Multi-provider AI image / video generation gateway — one OpenAI-compatible API, eight platforms aggregated, a ready-to-run operations system**
+**Multi-provider AI image / video generation gateway — one OpenAI-compatible API, nine platforms aggregated, a ready-to-run operations system**
 
 <sub>Live instance (brand): [Vivid AI · vividai.run](https://vividai.run)</sub>
 
@@ -17,7 +17,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](#-deployment)
 [![OpenAI Compatible](https://img.shields.io/badge/OpenAI-compatible-412991?logo=openai&logoColor=white)](#-openai-compatible-api)
 [![HTTPS](https://img.shields.io/badge/HTTPS-your--proxy-lightgrey)](#-deployment)
-[![Providers](https://img.shields.io/badge/providers-8-orange)](#-supported-models--providers)
+[![Providers](https://img.shields.io/badge/providers-9-orange)](#-supported-models--providers)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-yes-success)](#-deployment)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#-license)
 
@@ -47,13 +47,13 @@
 
 ## ✨ Overview
 
-**image2api** wraps the image / video capabilities of Adobe Firefly, OpenAI, Runway, Grok, Leonardo, Krea, Imagine and OreateAI into **a single OpenAI-compatible API**. Behind it, multi-account pools are scheduled automatically — out of quota → switch account, auth expired → refresh or kill, transient errors → retry, tokens proactively renewed before they expire — to deliver a stable service.
+**image2api** wraps the image / video capabilities of Adobe Firefly, BytePlus Lumina, OpenAI, Runway, Grok, Leonardo, Krea, Imagine and OreateAI into **a single OpenAI-compatible API**. Behind it, multi-account pools are scheduled automatically — out of quota → switch account, auth expired → refresh or kill, transient errors → retry, tokens proactively renewed before they expire — to deliver a stable service.
 
 It's more than an API proxy: it ships with **credit billing, CDK top-ups, referral rewards, a user system, an admin console, and a modern generation frontend**, so a single command turns it into a fully operational AI generation site — the author's live instance **[Vivid AI · vividai.run](https://vividai.run)** (brand) is built on this project.
 
 > 💡 Both frontend and backend are **fully open-source** (MIT) — Go + Vue 3, free to fork and self-host.
 
-**At a glance** 🔌 OpenAI-compatible · 🤖 7 platforms, 10+ models · 🔁 auto failover / token keep-alive · 💳 credits + agent pricing · 🎨 generation frontend + admin console · 🐳 one-command deploy (bring your own TLS proxy)
+**At a glance** 🔌 OpenAI-compatible · 🤖 9 platforms, 10+ models · 🔁 auto failover / token keep-alive · 💳 credits + agent pricing · 🎨 generation frontend + admin console · 🐳 one-command deploy (bring your own TLS proxy)
 
 ## 🖼️ Screenshots
 
@@ -85,13 +85,13 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 #### 🎨 Generation
 - Images + videos in one place, with **image-to-image / reference frames** (first frame, last frame, style reference)
 - Multiple resolutions (images 1K / 2K / 4K · videos 720p / 1080p), aspect ratios and video durations — configured and priced per model
-- 8 providers, 10+ models, **enable / disable / re-price from the admin console**, no code changes
+- 9 providers, 10+ models, **enable / disable / re-price from the admin console**, no code changes
 - **Model aliases**: one model can expose multiple public ids — API calls with any alias resolve to it
 - **De-AI fingerprint** (optional): one-click toggle on the playground — generated images get anti-AI-detection post-processing (subtle detail jitter + metadata stripping), charged as a per-tier surcharge (defaults 1K+1 / 2K+2 / 4K+3 credits, admin-configurable, can be disabled globally); processed works carry a "de-AI" badge across the playground, gallery, logs and admin image manager
 
 #### 🔌 OpenAI Compatible
 - Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`, with model-gated video/audio references and generated audio) · `/v1/models` (extended ratios, resolutions, durations, reference limits, and audio-output capabilities by default; `?extended=false` returns strict four-field OpenAI objects, with ratios normalized as `W:H`)
-- **Strict OpenAI params**: image `size` sets the aspect ratio and native-provider tier (long edge → 1K/2K/4K); only the GPT Image 2 family (`gpt-image-2` / `firefly-gpt-image-2`) adapts an explicit `quality=low/medium/high` to 1K/2K/4K, while other models ignore its resolution effect; video `size` maps by short edge to 720p/1080p — just swap `base_url` + `api_key` into an existing OpenAI SDK
+- **Strict OpenAI params**: image `size` sets the aspect ratio and native-provider tier (long edge → 1K/2K/4K); only the GPT Image 2 family (`gpt-image-2` / `firefly-gpt-image-2` / `lumina-gpt-image-2`) adapts an explicit `quality=low/medium/high` to 1K/2K/4K, while other models ignore its resolution effect; video `size` maps by short edge to 720p/1080p — just swap `base_url` + `api_key` into an existing OpenAI SDK
 - Image results default to **URLs**. Ordinary API requests do not download, base64-encode, or store the upstream asset; explicitly request `response_format=b64_json` for inline bytes. The in-app **/docs** ships a size ↔ tier reference table
 
 #### 🔁 Account Pools + Smart Failover
@@ -125,7 +125,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 
 #### 🛠️ Admin Console
 - Overview dashboard (trends / DAU / top failures / top spenders)
-- Model management (normal + agent price + aliases) · account management (bulk import / dedup / per-account quota refresh, including CPA JSON/ZIP and Sub2API bundle JSON) · **concurrency groups** · **order management** (filter / search / paginate) · site-wide logs · user management (set as agent / assign concurrency group / view cumulative top-up / banned-word hits) · CDK · image management (multi-select bulk delete / zip download) · showcase · **announcements** · site config (incl. epay, de-AI fingerprint toggle & surcharge pricing)
+- Model management (normal + agent price + aliases) · account management (bulk import / dedup / per-account quota refresh, including complete BytePlus Lumina Cookies, CPA JSON/ZIP and Sub2API bundle JSON) · **concurrency groups** · **order management** (filter / search / paginate) · site-wide logs · user management (set as agent / assign concurrency group / view cumulative top-up / banned-word hits) · CDK · image management (multi-select bulk delete / zip download) · showcase · **announcements** · site config (incl. epay, de-AI fingerprint toggle & surcharge pricing)
 - **Banned words**: add / remove words in the console (paginated + multi-select bulk delete); prompts containing a banned word are rejected outright (playground + API, case-insensitive), with per-word / per-user hit counters
 
 **🧰 Engineering highlights**: tls-client (Chrome JA3/JA4 fingerprint) reliably passes Cloudflare · media stored in S3/RustFS, served through an authenticated proxy with retention cleanup · self-healing maintenance loop (quota recovery / credential refresh / orphan-job cleanup with refunds) · one-command Docker deploy (TLS via your own reverse proxy).
@@ -135,6 +135,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 | Provider | Models (examples) | Type |
 |---|---|---|
 | **Adobe Firefly** | firefly-image-5 · firefly-gpt-image-2 · flux-kontext-max · firefly-video · firefly-ray · gemini-veo31 | Image / Video |
+| **BytePlus Lumina** | lumina-seedream-5.0-pro · lumina-gpt-image-2 · lumina-seedream-5.0-lite · lumina-nano-banana-2 · lumina-nano-banana-pro | Image (text-to-image / image-to-image) |
 | **OpenAI** | gpt-image-2 | Image |
 | **Runway** | runway-gen4-turbo · nano-banana-2 (Nano Banana 2) | Video / Image |
 | **Grok (grok.com)** | grok-video (imagine text/image-to-video) · grok-imagine-image (Lite, works on free accounts) · grok-chat (text, works on free accounts) | Text / Image / Video |
@@ -143,7 +144,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 | **Imagine.art** | imagine-1.5 · imagine-1.5pro | Image |
 | **OreateAI** | oreate-seedance-2.0-mini · oreate-seedance-2.0-fast · oreate-seedance-1.5-pro · oreate-seedance-2.0 · oreate-seedance-2.5 | Video (text, image, and video references) |
 
-> Models are enabled and priced dynamically from the admin console — add or remove anytime.
+> Models are enabled and priced dynamically from the admin console — add or remove anytime. The built-in BytePlus Lumina integration exposes only the five listed `lumina-*` ids, avoiding collisions with same-named OpenAI / Runway models. Import an account by pasting the complete website Cookie containing `csrfToken` in the admin console. Treat the Cookie as a high-value secret: never log it or commit it to the repository.
 
 ## 🔌 OpenAI-Compatible API
 
@@ -250,6 +251,7 @@ backend/                       Backend source (Go)
 │   ├── model/                 GORM data models
 │   ├── provider/              Upstream provider clients
 │   │   ├── adobe/             Adobe Firefly (tls-client fingerprint)
+│   │   ├── byteplus/          Five-model BytePlus Lumina web integration (Cookie + ImageX)
 │   │   ├── chatgpt/           OpenAI (incl. PoW / turnstile)
 │   │   ├── runway/            Runway video + Nano Banana image
 │   │   ├── grok/              Grok (grok.com, spoofed statsig, text / image / video)

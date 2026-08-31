@@ -34,7 +34,7 @@ function applyEdit(payload) {
   if (payload.concurrency != null) row.concurrency = payload.concurrency
 }
 
-const typeFilter = ref('')      // '' | 'openai' | 'adobe' | 'runway' | 'leonardo'
+const typeFilter = ref('')      // '' | provider account type
 const statusFilter = ref('')    // '' | 'active' | 'quota' | 'disabled'
 const search = ref('')
 
@@ -55,7 +55,7 @@ const stats = ref({
   total: 0, dead_total: 0,
   openai: { ...EMPTY_TYPE }, adobe: { ...EMPTY_TYPE }, runway: { ...EMPTY_TYPE },
   leonardo: { ...EMPTY_TYPE }, krea: { ...EMPTY_TYPE }, imagine: { ...EMPTY_TYPE },
-  grok: { ...EMPTY_TYPE }, oreate: { ...EMPTY_TYPE },
+  grok: { ...EMPTY_TYPE }, oreate: { ...EMPTY_TYPE }, byteplus: { ...EMPTY_TYPE },
 })
 
 // 异常账号 = 已失效(401)被锁定的号(红色锁定行)。用于「一键删除异常账号」。
@@ -64,6 +64,7 @@ const deadCount = computed(() => stats.value.dead_total || 0)
 function typePill(t) {
   return {
     adobe: 'bg-rose-500/10 text-rose-300 ring-rose-400/30',
+    byteplus: 'bg-indigo-500/10 text-indigo-300 ring-indigo-400/30',
     openai: 'bg-emerald-500/10 text-emerald-300 ring-emerald-400/30',
     runway: 'bg-violet-500/10 text-violet-300 ring-violet-400/30',
     leonardo: 'bg-amber-500/10 text-amber-300 ring-amber-400/30',
@@ -208,7 +209,7 @@ async function reconcile() {
   // probed here — the pending poll just reads the store until the worker writes
   // their quota/email. OLD accounts (active) get a real live /quota probe for
   // up-to-date remaining + refresh time.
-  const quotaRows = visible.filter((r) => !r.pending && (r.status === 'active' || (r.type === 'oreate' && r.status === 'quota')) && (r.type === 'openai' || r.type === 'adobe' || r.type === 'runway' || r.type === 'leonardo' || r.type === 'krea' || r.type === 'imagine' || r.type === 'grok' || r.type === 'oreate'))
+  const quotaRows = visible.filter((r) => !r.pending && (r.status === 'active' || (r.type === 'oreate' && r.status === 'quota')) && (r.type === 'openai' || r.type === 'adobe' || r.type === 'byteplus' || r.type === 'runway' || r.type === 'leonardo' || r.type === 'krea' || r.type === 'imagine' || r.type === 'grok' || r.type === 'oreate'))
   const adobeNeedEmail = visible.filter((r) => !r.pending && r.type === 'adobe' && !r.email)
   const total = quotaRows.length + adobeNeedEmail.length
   if (total === 0) { quotaStatus.value = ''; return }
@@ -389,13 +390,13 @@ onMounted(() => { loadAccounts(); loadModelList() })
 <template>
   <section class="space-y-4">
     <!-- KPI strip — 每个类型显示 成功/失败/限额 三个数(绿/红/琥珀) -->
-    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-9 gap-3">
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-10 gap-3">
       <div class="card p-4">
         <div class="text-[11px] uppercase tracking-wider text-white/45">账号总数</div>
         <div class="text-2xl font-semibold mt-1 tabular-nums">{{ stats.total }}</div>
         <div class="text-[10px] text-white/35 mt-0.5">成功/失败/限额</div>
       </div>
-      <div v-for="t in [['openai','OpenAI','text-emerald-300/80'],['adobe','Adobe','text-rose-300/80'],['runway','Runway','text-violet-300/80'],['leonardo','Leonardo','text-amber-300/80'],['krea','Krea','text-sky-300/80'],['imagine','Imagine','text-teal-300/80'],['grok','Grok','text-slate-300/80'],['oreate','OreateAI','text-cyan-300/80']]"
+      <div v-for="t in [['openai','OpenAI','text-emerald-300/80'],['adobe','Adobe','text-rose-300/80'],['byteplus','BytePlus','text-indigo-300/80'],['runway','Runway','text-violet-300/80'],['leonardo','Leonardo','text-amber-300/80'],['krea','Krea','text-sky-300/80'],['imagine','Imagine','text-teal-300/80'],['grok','Grok','text-slate-300/80'],['oreate','OreateAI','text-cyan-300/80']]"
            :key="t[0]" class="card p-4">
         <div class="text-[11px] uppercase tracking-wider" :class="t[2]">{{ t[1] }}</div>
         <div class="text-2xl font-semibold mt-1 tabular-nums">
@@ -414,6 +415,9 @@ onMounted(() => { loadAccounts(); loadModelList() })
         </button>
         <button @click="setFilter(() => typeFilter = 'adobe')" class="fp" :class="typeFilter === 'adobe' && 'fp-rose'">
           <span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span>Adobe
+        </button>
+        <button @click="setFilter(() => typeFilter = 'byteplus')" class="fp" :class="typeFilter === 'byteplus' && 'fp-violet'">
+          <span class="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>BytePlus
         </button>
         <button @click="setFilter(() => typeFilter = 'runway')" class="fp" :class="typeFilter === 'runway' && 'fp-violet'">
           <span class="w-1.5 h-1.5 rounded-full bg-violet-400"></span>Runway
@@ -558,7 +562,7 @@ onMounted(() => { loadAccounts(); loadModelList() })
             <td class="px-3 py-3.5 align-middle text-right text-sm tabular-nums whitespace-nowrap">
               <!-- quota column: 数字 / —  (never "未知"/"失败"/"检测中") -->
               <!-- remaining === -1 is the provider "unlimited" sentinel → show — not a scary red -1 -->
-              <span v-if="(a.type === 'openai' || a.type === 'adobe' || a.type === 'runway' || a.type === 'leonardo' || a.type === 'krea' || a.type === 'imagine' || a.type === 'grok' || a.type === 'oreate') && a.remaining != null && a.remaining !== -1"
+              <span v-if="(a.type === 'openai' || a.type === 'adobe' || a.type === 'byteplus' || a.type === 'runway' || a.type === 'leonardo' || a.type === 'krea' || a.type === 'imagine' || a.type === 'grok' || a.type === 'oreate') && a.remaining != null && a.remaining !== -1"
                     class="font-mono font-semibold"
                     :class="a.remaining > 0 ? 'text-emerald-300' : 'text-rose-300'"
                     :title="a.type === 'adobe' && a.quota_total != null ? `剩余 ${a.remaining} / 总额 ${a.quota_total}` : ''">{{ a.remaining }}{{ a.type === 'grok' ? '%' : '' }}</span>

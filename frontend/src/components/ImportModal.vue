@@ -16,7 +16,7 @@ const fileItems = ref([])
 const fileNames = ref([])
 
 // type → token pool (for the post-import weight PATCH).
-const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonardo: 'leonardo', krea: 'krea', imagine: 'imagine', grok: 'grok', oreate: 'oreate' }
+const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', byteplus: 'byteplus', runway: 'runway', leonardo: 'leonardo', krea: 'krea', imagine: 'imagine', grok: 'grok', oreate: 'oreate' }
 
 // Live preview of what the parser would extract — updates as the user types
 // so they can see whether their paste was understood before clicking import.
@@ -24,13 +24,14 @@ const detected = computed(() => {
   const items = uniqueImportItems([...parseImportInput(input.value), ...fileItems.value])
   const openai = items.filter((x) => x.type === 'openai').length
   const adobe = items.filter((x) => x.type === 'adobe').length
+  const byteplus = items.filter((x) => x.type === 'byteplus').length
   const runway = items.filter((x) => x.type === 'runway').length
   const leonardo = items.filter((x) => x.type === 'leonardo').length
   const krea = items.filter((x) => x.type === 'krea').length
   const imagine = items.filter((x) => x.type === 'imagine').length
   const grok = items.filter((x) => x.type === 'grok').length
   const oreate = items.filter((x) => x.type === 'oreate').length
-  return { total: items.length, openai, adobe, runway, leonardo, krea, imagine, grok, oreate }
+  return { total: items.length, openai, adobe, byteplus, runway, leonardo, krea, imagine, grok, oreate }
 })
 
 const importItems = computed(() => uniqueImportItems([...parseImportInput(input.value), ...fileItems.value]))
@@ -67,6 +68,8 @@ async function doSmartImport() {
           ? await api('/tokens/import-grok-token', jsonBody('POST', { access_token: it.value }))
         : it.type === 'runway'
           ? await api('/tokens/import-runway-token', jsonBody('POST', { access_token: it.value }))
+          : it.type === 'byteplus'
+            ? await api('/tokens/import-byteplus-cookie', jsonBody('POST', { cookie: it.value }))
           : it.type === 'leonardo'
             ? await api('/tokens/import-leonardo-cookie', jsonBody('POST', { cookie: it.value }))
             : it.type === 'krea'
@@ -145,6 +148,7 @@ function clearFiles() {
           <strong class="text-slate-700">Cookie 数组</strong>(多 Adobe 批量)、
           <strong class="text-slate-700">ChatGPT JWT</strong>(<code class="px-1 bg-slate-100 rounded">eyJhbGciOi...</code>)、
           <strong class="text-slate-700">Runway JWT</strong>(自动与 ChatGPT 区分)、
+          <strong class="text-slate-700">BytePlus Cookie</strong>(含 <code class="px-1 bg-slate-100 rounded">csrfToken</code>)、
           <strong class="text-slate-700">Leonardo Cookie</strong>(含 better-auth)、
           <strong class="text-slate-700">Krea Cookie</strong>(含 sb-superb-auth)、
           <strong class="text-slate-700">Imagine Token</strong>(<code class="px-1 bg-slate-100 rounded">{"token","refreshToken","email","parentId"}</code>)、
@@ -173,6 +177,9 @@ function clearFiles() {
             </span>
             <span v-if="detected.adobe" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-rose-700 bg-rose-50 ring-1 ring-rose-200">
               Adobe · <span class="tabular-nums">{{ detected.adobe }}</span>
+            </span>
+            <span v-if="detected.byteplus" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-indigo-700 bg-indigo-50 ring-1 ring-indigo-200">
+              BytePlus · <span class="tabular-nums">{{ detected.byteplus }}</span>
             </span>
             <span v-if="detected.runway" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-violet-700 bg-violet-50 ring-1 ring-violet-200">
               Runway · <span class="tabular-nums">{{ detected.runway }}</span>

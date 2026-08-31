@@ -12,6 +12,7 @@ import (
 	"backend/internal/http/router"
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
+	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
@@ -123,6 +124,7 @@ func NewApp(ctx context.Context) (*App, error) {
 	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("clio-playground-web", "")
+	bytePlusClient := byteplus.NewClient("")
 	// The persisted proxy is restricted to providers whose protected control
 	// plane has a verified residential-egress requirement. Other providers start
 	// and remain direct; protected clients split bulk media onto direct egress.
@@ -141,14 +143,14 @@ func NewApp(ctx context.Context) (*App, error) {
 	grokClient.SetProxy(globalProxy)
 	oreateClient.SetProxy(globalProxy)
 	customClient := custom.NewClient()
-	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient, rustfsClient)
+	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, bytePlusClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient, rustfsClient)
 	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
 	showcaseSvc := service.NewShowcaseService(showcaseRepo)
 	adminReadSvc := service.NewAdminReadService(cfg, userRepo, modelRepo, eventRepo, siteRepo, tokenRepo, cdkRepo, rustfsClient, showcaseRepo)
 	adminWriteSvc := service.NewAdminWriteService(userRepo, showcaseRepo, modelRepo, eventRepo, apiKeyRepo, tokenRepo, orderRepo)
 	cdkSvc := service.NewCDKService(cdkRepo, userRepo, siteRepo, orderRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
-	tokenSvc := service.NewTokenService(tokenRepo, refreshRepo, eventRepo, siteRepo, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient)
+	tokenSvc := service.NewTokenService(tokenRepo, refreshRepo, eventRepo, siteRepo, adobeClient, bytePlusClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient)
 	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient)
 	// Enable refresh-then-retry on a mid-request Adobe 401 (re-mint access token
 	// from the cookie). Wired post-construction to avoid a ctor init cycle.

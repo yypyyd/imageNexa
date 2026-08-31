@@ -9,6 +9,7 @@ import (
 
 func TestResolveImageSizeModelSemantics(t *testing.T) {
 	gptImage2 := &model.ModelConfig{ID: "firefly-gpt-image-2", Prices: datatypes.JSONMap{"1K": 1, "2K": 2, "4K": 4}}
+	luminaGPTImage2 := &model.ModelConfig{ID: "lumina-gpt-image-2", Prices: datatypes.JSONMap{"1K": 1, "2K": 2, "4K": 4}}
 	otherModel := &model.ModelConfig{ID: "seedream-4.5", Prices: datatypes.JSONMap{"1K": 1, "2K": 2, "4K": 4}}
 	tests := []struct {
 		name string
@@ -18,6 +19,7 @@ func TestResolveImageSizeModelSemantics(t *testing.T) {
 	}{
 		{name: "other model ignores quality", item: otherModel, in: V1ImageRequest{Size: "2480x3312", Quality: "high"}, want: "2K"},
 		{name: "GPT Image 2 maps quality", item: gptImage2, in: V1ImageRequest{Size: "2480x3312", Quality: "high"}, want: "4K"},
+		{name: "Lumina GPT Image 2 maps quality", item: luminaGPTImage2, in: V1ImageRequest{Size: "2480x3312", Quality: "high"}, want: "4K"},
 		{name: "blank quality keeps size tier", item: gptImage2, in: V1ImageRequest{Size: "2480x3312"}, want: "2K"},
 		{name: "explicit resolution remains authoritative", item: gptImage2, in: V1ImageRequest{Size: "2480x3312", Quality: "high", Resolution: "2K"}, want: "2K"},
 	}
@@ -43,5 +45,8 @@ func TestResolveImageSizeForwards4KGPTImage2Payload(t *testing.T) {
 	}
 	if quality := upstreamQualityForModel("seedream-4.5", resolution); quality != "" {
 		t.Fatalf("non-GPT upstream quality = %q, want empty", quality)
+	}
+	if quality := upstreamQualityForModel("lumina-gpt-image-2", resolution); quality != "high" {
+		t.Fatalf("Lumina GPT Image 2 upstream quality = %q, want high", quality)
 	}
 }

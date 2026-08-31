@@ -1,16 +1,10 @@
 package adobe
 
 import (
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"os"
 	"strconv"
 	"strings"
-	"time"
-
-	"github.com/google/uuid"
 )
 
 func stringValue(v any) string {
@@ -79,33 +73,6 @@ func decodeJWTPayload(token string) map[string]any {
 		return map[string]any{}
 	}
 	return out
-}
-
-func buildARPSessionID() string {
-	// The partner-model gateway validates the ARP feature-token shape and its
-	// timestamp. Reusing sherlockToken from an imported cookie eventually yields
-	// a misleading HTTP 408 "system under load", so every submit gets a fresh
-	// browser-shaped session value.
-	raw := map[string]any{
-		"sid": uuid.NewString(),
-		"ftr": randomHex(16) + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(os.Getpid()) + "_dUAL43-mnts-ants-d4_31ck__tt",
-	}
-	b, _ := json.Marshal(raw)
-	return base64.StdEncoding.EncodeToString(b)
-}
-
-func randomHex(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		now := time.Now().UnixNano()
-		for i := range buf {
-			buf[i] = byte(now >> ((i % 8) * 8))
-		}
-	}
-	return hex.EncodeToString(buf)
 }
 
 func intOrNil(v any) any {

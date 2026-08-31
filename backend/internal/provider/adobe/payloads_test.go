@@ -30,6 +30,15 @@ func TestNewPartnerPayloadShapes(t *testing.T) {
 	if size := gpt["size"].(map[string]any); size["width"] != 1536 || size["height"] != 1024 {
 		t.Fatalf("gpt size = %#v", size)
 	}
+	if _, ok := gpt["generationSettings"]; ok {
+		t.Fatalf("GPT Image 1.5 generationSettings = %#v, want absent", gpt["generationSettings"])
+	}
+	if seeds, ok := gpt["seeds"].([]int); !ok || len(seeds) != 1 {
+		t.Fatalf("GPT Image 1.5 seeds = %#v, want one seed", gpt["seeds"])
+	}
+	if specific := gpt["modelSpecificPayload"].(map[string]any); len(specific) != 0 {
+		t.Fatalf("GPT Image 1.5 modelSpecificPayload = %#v, want empty object", specific)
+	}
 
 	banana := BuildImagePayloadCandidates("firefly-nano-banana-pro", "test", "16:9", "2K", nil)[0]
 	if banana["modelVersion"] != "nano-banana-2" {
@@ -37,6 +46,52 @@ func TestNewPartnerPayloadShapes(t *testing.T) {
 	}
 	if size := banana["size"].(map[string]any); size["width"] != 2752 || size["height"] != 1536 {
 		t.Fatalf("banana size = %#v", size)
+	}
+}
+
+func TestNanoBananaModelsUseCurrentAdobePayloadShape(t *testing.T) {
+	tests := []struct {
+		model            string
+		resolution       string
+		ratio            string
+		wantWidth        int
+		wantHeight       int
+		wantGroundSearch bool
+	}{
+		{model: "firefly-nano-banana", resolution: "1K", ratio: "4:3", wantWidth: 1184, wantHeight: 864},
+		{model: "firefly-nano-banana", resolution: "1K", ratio: "3:4", wantWidth: 864, wantHeight: 1184},
+		{model: "firefly-nano-banana", resolution: "1K", ratio: "5:4", wantWidth: 1152, wantHeight: 896},
+		{model: "firefly-nano-banana", resolution: "1K", ratio: "4:5", wantWidth: 896, wantHeight: 1152},
+		{model: "firefly-nano-banana-pro", resolution: "1K", ratio: "16:9", wantWidth: 1376, wantHeight: 768, wantGroundSearch: true},
+		{model: "firefly-nano-banana-pro", resolution: "4K", ratio: "1:1", wantWidth: 4096, wantHeight: 4096, wantGroundSearch: true},
+		{model: "firefly-nano-banana-2", resolution: "2K", ratio: "9:16", wantWidth: 1536, wantHeight: 2752, wantGroundSearch: true},
+		{model: "firefly-nano-banana-2", resolution: "4K", ratio: "8:1", wantWidth: 12288, wantHeight: 1536, wantGroundSearch: true},
+		{model: "firefly-nano-banana-2", resolution: "1K", ratio: "auto", wantWidth: -1, wantHeight: -1, wantGroundSearch: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model+"/"+tt.resolution+"/"+tt.ratio, func(t *testing.T) {
+			payload := BuildImagePayloadCandidates(tt.model, "test", tt.ratio, tt.resolution, nil)[0]
+			size := payload["size"].(map[string]any)
+			if size["width"] != tt.wantWidth || size["height"] != tt.wantHeight {
+				t.Fatalf("size = %#v, want %dx%d", size, tt.wantWidth, tt.wantHeight)
+			}
+			specific := payload["modelSpecificPayload"].(map[string]any)
+			if tt.ratio == "auto" {
+				if _, ok := specific["aspectRatio"]; ok {
+					t.Fatalf("modelSpecificPayload.aspectRatio = %#v, want absent for auto", specific["aspectRatio"])
+				}
+			} else if specific["aspectRatio"] != tt.ratio {
+				t.Fatalf("modelSpecificPayload.aspectRatio = %#v, want %q", specific["aspectRatio"], tt.ratio)
+			}
+			if _, ok := payload["generationSettings"]; ok {
+				t.Fatalf("generationSettings = %#v, want absent", payload["generationSettings"])
+			}
+			_, hasGroundSearch := payload["groundSearch"]
+			if hasGroundSearch != tt.wantGroundSearch {
+				t.Fatalf("groundSearch presence = %v, want %v", hasGroundSearch, tt.wantGroundSearch)
+			}
+		})
 	}
 }
 
@@ -52,6 +107,51 @@ func TestImagePayloadSeedsChangeBetweenImmediateAttempts(t *testing.T) {
 			t.Fatalf("duplicate image seed on immediate payload rebuild: %d", seeds[0])
 		}
 		seen[seeds[0]] = true
+	}
+}
+
+func TestGPTImage2UsesCurrentAdobePayloadShape(t *testing.T) {
+	tests := []struct {
+		resolution string
+		ratio      string
+		wantWidth  int
+		wantHeight int
+		wantDetail int
+	}{
+		{resolution: "1K", ratio: "1:1", wantWidth: 1024, wantHeight: 1024, wantDetail: 1},
+		{resolution: "2K", ratio: "16:9", wantWidth: 1376, wantHeight: 768, wantDetail: 3},
+		{resolution: "4K", ratio: "9:16", wantWidth: 768, wantHeight: 1376, wantDetail: 5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.resolution+"/"+tt.ratio, func(t *testing.T) {
+			payload := BuildImagePayloadCandidates("firefly-gpt-image-2", "test", tt.ratio, tt.resolution, nil)[0]
+			size := payload["size"].(map[string]any)
+			if size["width"] != tt.wantWidth || size["height"] != tt.wantHeight {
+				t.Fatalf("size = %#v, want %dx%d", size, tt.wantWidth, tt.wantHeight)
+			}
+			if specific := payload["modelSpecificPayload"].(map[string]any); len(specific) != 0 {
+				t.Fatalf("modelSpecificPayload = %#v, want empty object", specific)
+			}
+			settings := payload["generationSettings"].(map[string]any)
+			if settings["detailLevel"] != tt.wantDetail {
+				t.Fatalf("detailLevel = %#v, want %d", settings["detailLevel"], tt.wantDetail)
+			}
+		})
+	}
+}
+
+func TestGPTImage2SubjectReferencesKeepCurrentPayloadShape(t *testing.T) {
+	payload := BuildImagePayloadCandidates("firefly-gpt-image-2", "edit", "3:2", "2K", []string{"blob-1"})[0]
+	refs := payload["referenceBlobs"].([]any)
+	if len(refs) != 1 || refs[0].(map[string]any)["usage"] != "subject" {
+		t.Fatalf("referenceBlobs = %#v", refs)
+	}
+	if _, ok := payload["size"]; !ok {
+		t.Fatal("top-level size is missing")
+	}
+	if specific := payload["modelSpecificPayload"].(map[string]any); len(specific) != 0 {
+		t.Fatalf("modelSpecificPayload = %#v, want empty object", specific)
 	}
 }
 

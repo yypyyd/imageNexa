@@ -453,6 +453,7 @@ func (s *AdminReadService) Providers(ctx context.Context) ([]map[string]any, err
 	}{
 		{Name: "chatgpt", Pool: "chatgpt", Type: "openai"},
 		{Name: "adobe", Pool: "adobe", Type: "adobe"},
+		{Name: "byteplus", Pool: "byteplus", Type: "byteplus"},
 		{Name: "runway", Pool: "runway", Type: "runway"},
 		{Name: "leonardo", Pool: "leonardo", Type: "leonardo"},
 		{Name: "krea", Pool: "krea", Type: "krea"},

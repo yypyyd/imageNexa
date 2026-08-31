@@ -97,6 +97,28 @@ test('keeps existing credential types in mixed JSON arrays', () => {
   assert.equal(items[2].type, 'leonardo')
 })
 
+test('classifies a BytePlus Lumina cookie before the Adobe fallback', () => {
+  const cookie = 'sessionid=byteplus-session; csrfToken=byteplus-csrf; locale=en-US'
+  assert.deepEqual(parseImportInput(cookie), [{ type: 'byteplus', value: cookie }])
+  assert.deepEqual(parseImportInput('csrfToken=anonymous; locale=en-US; __spti=tracking'), [{
+    type: 'adobe',
+    value: 'csrfToken=anonymous; locale=en-US; __spti=tracking',
+  }])
+  assert.deepEqual(parseImportInput('sessionid=unknown-session'), [{ type: 'adobe', value: 'sessionid=unknown-session' }])
+})
+
+test('parses a BytePlus browser cookie export as one account', () => {
+  const items = parseImportInput(JSON.stringify([
+    { name: 'sessionid', value: 'byteplus-session' },
+    { name: 'csrfToken', value: 'byteplus-csrf' },
+    { name: 'locale', value: 'en-US' },
+  ]))
+  assert.deepEqual(items, [{
+    type: 'byteplus',
+    value: 'sessionid=byteplus-session; csrfToken=byteplus-csrf; locale=en-US',
+  }])
+})
+
 test('parses OreateAI export without retaining its password', () => {
   const exported = {
     base_url: 'https://www.oreateai.com/',

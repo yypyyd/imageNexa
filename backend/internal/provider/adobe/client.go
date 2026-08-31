@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/url"
 	"strings"
 	"sync"
@@ -18,6 +17,7 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	"github.com/google/uuid"
 )
 
 const (
@@ -589,11 +589,12 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
 		"sec-ch-ua-platform": {sess.fp.platform},
-		"sec-fetch-site":     {"same-site"},
-		"sec-fetch-mode":     {"cors"},
-		"sec-fetch-dest":     {"empty"},
-		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {buildARPSessionID()},
+		// firefly.adobe.com and *.ff.adobe.io have different registrable
+		// domains, so Chrome classifies this CORS request as cross-site.
+		"sec-fetch-site": {"cross-site"},
+		"sec-fetch-mode": {"cors"},
+		"sec-fetch-dest": {"empty"},
+		"user-agent":     {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -610,7 +611,6 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 			"sec-fetch-dest",
 			"user-agent",
 			"x-nonce",
-			"x-arp-session-id",
 		},
 	}
 	if nonce := buildSubmitNonce(token, prompt); nonce != "" {
@@ -767,11 +767,12 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
 		"sec-ch-ua-platform": {sess.fp.platform},
-		"sec-fetch-site":     {"same-site"},
-		"sec-fetch-mode":     {"cors"},
-		"sec-fetch-dest":     {"empty"},
-		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {buildARPSessionID()},
+		// firefly.adobe.com and *.ff.adobe.io have different registrable
+		// domains, so Chrome classifies this CORS request as cross-site.
+		"sec-fetch-site": {"cross-site"},
+		"sec-fetch-mode": {"cors"},
+		"sec-fetch-dest": {"empty"},
+		"user-agent":     {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -788,7 +789,6 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 			"sec-fetch-dest",
 			"user-agent",
 			"x-nonce",
-			"x-arp-session-id",
 		},
 	}
 	// The working video submit (HAR) carries x-nonce just like the image submit.
@@ -1011,40 +1011,27 @@ type fingerprint struct {
 	platform  string // quoted sec-ch-ua-platform value, e.g. `"Windows"`
 }
 
-const (
-	osWindows = iota
-	osMac
-)
-
-func newChromeFingerprint(profile profiles.ClientProfile, major, osKind int) fingerprint {
+func newChromeFingerprint(profile profiles.ClientProfile, major int) fingerprint {
 	ua := fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", major)
 	platform := `"Windows"`
-	if osKind == osMac {
-		ua = fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", major)
-		platform = `"macOS"`
-	}
 	return fingerprint{
 		profile:   profile,
 		userAgent: ua,
-		secCHUA:   fmt.Sprintf(`"Not?A_Brand";v="99", "Google Chrome";v="%d", "Chromium";v="%d"`, major, major),
+		secCHUA:   fmt.Sprintf(`"Not=A?Brand";v="99", "Google Chrome";v="%d", "Chromium";v="%d"`, major, major),
 		platform:  platform,
 	}
 }
 
-// adobeFingerprints is a small pool of recent desktop Chrome builds across
-// Windows/macOS. Each request draws one at random so the outbound TLS
-// fingerprint and headers vary from call to call instead of presenting a single
-// static signature to Adobe's anti-bot layer.
-var adobeFingerprints = []fingerprint{
-	newChromeFingerprint(profiles.Chrome_133, 133, osWindows),
-	newChromeFingerprint(profiles.Chrome_131, 131, osWindows),
-	newChromeFingerprint(profiles.Chrome_124, 124, osWindows),
-	newChromeFingerprint(profiles.Chrome_133, 133, osMac),
-	newChromeFingerprint(profiles.Chrome_131, 131, osMac),
-}
+// Adobe correlates IMS exchange and generation traffic as one browser session.
+// Rotating the advertised browser version and operating system on every HTTP
+// client made a single access token appear to jump between unrelated devices,
+// which the 3P gateway masks as timeout_error / "system under load". Keep one
+// modern, internally consistent Chrome identity across the complete account
+// lifecycle. Chrome itself still randomizes TLS extension order below.
+var adobeBrowserFingerprint = newChromeFingerprint(profiles.Chrome_146, 146)
 
-func randomFingerprint() fingerprint {
-	return adobeFingerprints[rand.Intn(len(adobeFingerprints))]
+func currentAdobeFingerprint() fingerprint {
+	return adobeBrowserFingerprint
 }
 
 // tlsSession pairs a configured TLS client with the fingerprint it was built
@@ -1057,13 +1044,13 @@ type tlsSession struct {
 // newProxyTLSClient is used for authentication, account maintenance, and
 // generation-submit requests. Large media and artifact transfers use direct.
 func (c *Client) newProxyTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), true)
+	return c.newTLSSession(currentAdobeFingerprint(), true)
 }
 
 func (c *Client) newSubmitTLSClient() (*tlsSession, error) { return c.newProxyTLSClient() }
 
 func (c *Client) newDirectTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), false)
+	return c.newTLSSession(currentAdobeFingerprint(), false)
 }
 
 func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, error) {
@@ -1089,20 +1076,29 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 		return nil, ErrAdobeCookieEmpty
 	}
 
-	body := "client_id=" + clientID + "&guest_allowed=true&scope=" + strings.ReplaceAll(scopeValue, ",", "%2C")
+	// Adobe's current IMS library binds each cookie exchange to a browser
+	// fingerprint request. Omitting this field still returns a token, but leaves
+	// the resulting session without the request correlation used by Firefly's 3P
+	// gateway. Match the current web client and send the client hints belonging to
+	// the same TLS/User-Agent profile as well.
+	body := buildCookieExchangeForm()
 	req, err := http.NewRequest(http.MethodPost, refreshURL, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
+
 	req = req.WithContext(ctx)
 	req.Header = http.Header{
-		"accept":          {"*/*"},
-		"accept-language": {"zh-CN,zh;q=0.9"},
-		"content-type":    {"application/x-www-form-urlencoded;charset=UTF-8"},
-		"cookie":          {cookie},
-		"origin":          {"https://firefly.adobe.com"},
-		"referer":         {"https://firefly.adobe.com/"},
-		"user-agent":      {sess.fp.userAgent},
+		"accept":             {"*/*"},
+		"accept-language":    {"zh-CN,zh;q=0.9"},
+		"content-type":       {"application/x-www-form-urlencoded;charset=UTF-8"},
+		"cookie":             {cookie},
+		"origin":             {"https://firefly.adobe.com"},
+		"referer":            {"https://firefly.adobe.com/"},
+		"sec-ch-ua":          {sess.fp.secCHUA},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {sess.fp.platform},
+		"user-agent":         {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"accept",
 			"accept-language",
@@ -1110,6 +1106,9 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 			"cookie",
 			"origin",
 			"referer",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
 			"user-agent",
 		},
 	}
@@ -1139,6 +1138,15 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 		ExpiresIn:   intValue(payload["expires_in"]),
 		Raw:         payload,
 	}, nil
+}
+
+func buildCookieExchangeForm() string {
+	return url.Values{
+		"client_id":              {clientID},
+		"guest_allowed":          {"true"},
+		"scope":                  {scopeValue},
+		"fingerprint_request_id": {uuid.NewString()},
+	}.Encode()
 }
 
 func buildSubmitNonce(token, prompt string) string {

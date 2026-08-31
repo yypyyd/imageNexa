@@ -41,10 +41,14 @@ var lumaSize = map[string]map[string][2]int{
 	},
 }
 
-var gptImageSize = map[string]map[string][2]int{
-	"1K": {"1:1": {1024, 1024}, "5:4": {1120, 896}, "9:16": {720, 1280}, "21:9": {1456, 624}, "16:9": {1280, 720}, "4:3": {1152, 864}, "3:2": {1248, 832}, "4:5": {896, 1120}, "3:4": {864, 1152}, "2:3": {832, 1248}},
-	"2K": {"1:1": {2048, 2048}, "5:4": {2240, 1792}, "9:16": {1440, 2560}, "21:9": {3024, 1296}, "16:9": {2560, 1440}, "4:3": {2304, 1728}, "3:2": {2496, 1664}, "4:5": {1792, 2240}, "3:4": {1728, 2304}, "2:3": {1664, 2496}},
-	"4K": {"1:1": {2880, 2880}, "5:4": {3200, 2560}, "9:16": {2160, 3840}, "21:9": {3696, 1584}, "16:9": {3840, 2160}, "4:3": {3264, 2448}, "3:2": {3504, 2336}, "4:5": {2560, 3200}, "3:4": {2448, 3264}, "2:3": {2336, 3504}},
+// GPT Image 2 keeps one canonical size per aspect ratio. Output quality is a
+// separate detailLevel (1/3/5), rather than a multiplier on these dimensions.
+// These values mirror Adobe Firefly's current gpt-image-2 model configuration.
+var gptImage2Size = map[string][2]int{
+	"21:9": {1584, 672}, "16:9": {1376, 768}, "5:4": {1152, 928},
+	"4:3": {1200, 896}, "3:2": {1264, 848}, "1:1": {1024, 1024},
+	"4:5": {928, 1152}, "3:4": {896, 1200}, "2:3": {848, 1264},
+	"9:16": {768, 1376},
 }
 
 var gptImage15Size = map[string][2]int{
@@ -55,29 +59,36 @@ var gptImage15Size = map[string][2]int{
 
 var nanoBananaSize = map[string][2]int{
 	"1:1": {1024, 1024}, "3:2": {1248, 832}, "2:3": {832, 1248},
-	"4:3": {1152, 896}, "3:4": {896, 1152}, "5:4": {1184, 864},
-	"4:5": {864, 1184}, "9:16": {768, 1344}, "16:9": {1344, 768},
+	"4:3": {1184, 864}, "3:4": {864, 1184}, "5:4": {1152, 896},
+	"4:5": {896, 1152}, "9:16": {768, 1344}, "16:9": {1344, 768},
 	"21:9": {1536, 672},
 }
 
-var nanoBananaProSize = map[string]map[string][2]int{
+// Nano Banana Pro and Gemini 3.1 use canonical dimensions for an explicit
+// aspect ratio. Negative sentinel dimensions are valid only for the Auto
+// aspect-ratio option; sending them with an explicit ratio is rejected by the
+// current 3P endpoint because width/height must then be positive.
+var nanoBananaTierSize = map[string]map[string][2]int{
 	"1K": {
-		"1:1": {1024, 1024}, "3:2": {1264, 848}, "2:3": {848, 1264},
-		"4:3": {1200, 896}, "3:4": {896, 1200}, "5:4": {1152, 928},
-		"4:5": {928, 1152}, "9:16": {768, 1376}, "16:9": {1376, 768},
-		"21:9": {1584, 672},
+		"4:3": {1200, 896}, "1:1": {1024, 1024}, "9:16": {768, 1376},
+		"16:9": {1376, 768}, "3:4": {896, 1200}, "21:9": {1584, 672},
+		"3:2": {1264, 848}, "5:4": {1152, 928}, "4:5": {928, 1152},
+		"2:3": {848, 1264}, "8:1": {3072, 384}, "4:1": {2048, 512},
+		"1:4": {512, 2048}, "1:8": {384, 3072}, "auto": {-1, -1},
 	},
 	"2K": {
-		"1:1": {2048, 2048}, "3:2": {2528, 1696}, "2:3": {1696, 2528},
-		"4:3": {2400, 1792}, "3:4": {1792, 2400}, "5:4": {2304, 1856},
-		"4:5": {1856, 2304}, "9:16": {1536, 2752}, "16:9": {2752, 1536},
-		"21:9": {3168, 1344},
+		"4:3": {2400, 1792}, "1:1": {2048, 2048}, "9:16": {1536, 2752},
+		"16:9": {2752, 1536}, "3:4": {1792, 2400}, "21:9": {3168, 1344},
+		"3:2": {2528, 1696}, "5:4": {2304, 1856}, "4:5": {1856, 2304},
+		"2:3": {1696, 2528}, "8:1": {6144, 768}, "4:1": {4096, 1024},
+		"1:4": {1024, 4096}, "1:8": {768, 6144}, "auto": {-2, -2},
 	},
 	"4K": {
-		"1:1": {4096, 4096}, "3:2": {5056, 3392}, "2:3": {3392, 5056},
-		"4:3": {4800, 3584}, "3:4": {3584, 4800}, "5:4": {4608, 3712},
-		"4:5": {3712, 4608}, "9:16": {3072, 5504}, "16:9": {5504, 3072},
-		"21:9": {6336, 2688},
+		"4:3": {4800, 3584}, "1:1": {4096, 4096}, "9:16": {3072, 5504},
+		"16:9": {5504, 3072}, "3:4": {3584, 4800}, "21:9": {6336, 2688},
+		"3:2": {5056, 3392}, "5:4": {4608, 3712}, "4:5": {3712, 4608},
+		"2:3": {3392, 5056}, "8:1": {12288, 1536}, "4:1": {8192, 2048},
+		"1:4": {2048, 8192}, "1:8": {1536, 12288}, "auto": {-4, -4},
 	},
 }
 
@@ -178,15 +189,16 @@ func buildGPTImage15Payloads(spec modelSpec, prompt, ratio string, blobIDs []str
 		size = gptImage15Size["1:1"]
 	}
 	base := map[string]any{
-		"modelId":            spec.UpstreamModelID,
-		"modelVersion":       spec.UpstreamModelVersion,
-		"n":                  1,
-		"prompt":             prompt,
-		"size":               map[string]any{"width": size[0], "height": size[1]},
-		"output":             map[string]any{"storeInputs": true},
-		"referenceBlobs":     []any{},
-		"generationMetadata": map[string]any{"module": "text2image", "submodule": "ff-image-generate"},
-		"generationSettings": map[string]any{"detailLevel": 3},
+		"modelId":              spec.UpstreamModelID,
+		"modelVersion":         spec.UpstreamModelVersion,
+		"n":                    1,
+		"prompt":               prompt,
+		"size":                 map[string]any{"width": size[0], "height": size[1]},
+		"seeds":                []int{nextImageSeed()},
+		"output":               map[string]any{"storeInputs": true},
+		"referenceBlobs":       []any{},
+		"generationMetadata":   map[string]any{"module": "text2image", "submodule": "ff-image-generate"},
+		"modelSpecificPayload": map[string]any{},
 	}
 	if len(blobIDs) == 0 {
 		return []map[string]any{base}
@@ -198,13 +210,28 @@ func buildGPTImage15Payloads(spec modelSpec, prompt, ratio string, blobIDs []str
 
 func buildGeminiPayloads(spec modelSpec, prompt, ratio, resolution string, blobIDs []string) []map[string]any {
 	var size [2]int
-	if spec.UpstreamModelVersion == "nano-banana" {
+	isOriginal := spec.UpstreamModelVersion == "nano-banana"
+	if isOriginal {
 		size = nanoBananaSize[ratio]
 		if size == [2]int{} {
 			size = nanoBananaSize["1:1"]
 		}
 	} else {
-		size = getSize(nanoBananaProSize, resolution, ratio, "1:1")
+		level := strings.ToUpper(strings.TrimSpace(resolution))
+		levelSizes := nanoBananaTierSize[level]
+		if levelSizes == nil {
+			levelSizes = nanoBananaTierSize["2K"]
+		}
+		size = levelSizes[strings.ToLower(strings.TrimSpace(ratio))]
+		if size == [2]int{} {
+			size = levelSizes["1:1"]
+		}
+	}
+	modelSpecific := map[string]any{
+		"parameters": map[string]any{"addWatermark": false},
+	}
+	if !strings.EqualFold(strings.TrimSpace(ratio), "auto") {
+		modelSpecific["aspectRatio"] = ratio
 	}
 	base := map[string]any{
 		"modelId":      spec.UpstreamModelID,
@@ -213,17 +240,16 @@ func buildGeminiPayloads(spec modelSpec, prompt, ratio, resolution string, blobI
 		"prompt":       prompt,
 		"size":         map[string]any{"width": size[0], "height": size[1]},
 		"seeds":        []int{nextImageSeed()},
-		"groundSearch": false,
 		"output":       map[string]any{"storeInputs": true},
 		"generationMetadata": map[string]any{
 			"module":    "text2image",
 			"submodule": "ff-image-generate",
 		},
-		"generationSettings": map[string]any{"aspectRatio": ratio},
-		"modelSpecificPayload": map[string]any{
-			"parameters": map[string]any{"addWatermark": false},
-		},
-		"referenceBlobs": []any{},
+		"modelSpecificPayload": modelSpecific,
+		"referenceBlobs":       []any{},
+	}
+	if !isOriginal {
+		base["groundSearch"] = false
 	}
 	if len(blobIDs) == 0 {
 		return []map[string]any{base}
@@ -234,22 +260,26 @@ func buildGeminiPayloads(spec modelSpec, prompt, ratio, resolution string, blobI
 }
 
 func buildGPTImagePayloads(spec modelSpec, prompt, ratio, resolution string, blobIDs []string) []map[string]any {
-	size := getSize(gptImageSize, resolution, ratio, "1:1")
-	// Mirrors the captured working gpt-image request shape: modelSpecificPayload.size,
-	// generationSettings.detailLevel 3, and NO top-level size / outputResolution
-	// (sending those got 403). Keeps the chosen size via modelSpecificPayload.size
-	// ("WxH") rather than "auto".
+	size := gptImage2Size[ratio]
+	if size == [2]int{} {
+		size = gptImage2Size["1:1"]
+	}
+	// Adobe moved GPT Image 2 dimensions from modelSpecificPayload.size to the
+	// top-level size object. The configured 1K/2K/4K tiers now select the
+	// provider's low/medium/high detail level while the canonical ratio size
+	// stays fixed.
 	base := map[string]any{
 		"modelId":              spec.UpstreamModelID,
 		"modelVersion":         spec.UpstreamModelVersion,
 		"n":                    1,
 		"prompt":               prompt,
+		"size":                 map[string]any{"width": size[0], "height": size[1]},
 		"seeds":                []int{nextImageSeed()},
 		"output":               map[string]any{"storeInputs": true},
 		"referenceBlobs":       []any{},
 		"generationMetadata":   map[string]any{"module": "text2image", "submodule": "ff-image-generate"},
-		"modelSpecificPayload": map[string]any{"size": sizeString(size)},
-		"generationSettings":   map[string]any{"detailLevel": 3},
+		"modelSpecificPayload": map[string]any{},
+		"generationSettings":   map[string]any{"detailLevel": gptImage2DetailLevel(resolution)},
 	}
 	if len(blobIDs) == 0 {
 		return []map[string]any{base}
@@ -257,6 +287,17 @@ func buildGPTImagePayloads(spec modelSpec, prompt, ratio, resolution string, blo
 	subject := cloneMap(base)
 	subject["referenceBlobs"] = blobRefs(blobIDs, "subject")
 	return []map[string]any{subject}
+}
+
+func gptImage2DetailLevel(resolution string) int {
+	switch strings.ToUpper(strings.TrimSpace(resolution)) {
+	case "1K":
+		return 1
+	case "4K":
+		return 5
+	default:
+		return 3
+	}
 }
 
 func buildFluxPayloads(spec modelSpec, prompt, ratio string, blobIDs []string) []map[string]any {

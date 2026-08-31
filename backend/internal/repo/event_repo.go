@@ -634,6 +634,16 @@ func (r *EventRepository) SetAccount(ctx context.Context, eventID, accountID, ac
 		Updates(map[string]any{"account_id": accountID, "account_email": accountEmail}).Error
 }
 
+// SetProvider records the provider that actually fulfilled an in-flight event.
+// It is normally identical to the catalog model's provider, but an operational
+// fallback may move a request to another provider after the event was created.
+func (r *EventRepository) SetProvider(ctx context.Context, eventID, provider string) error {
+	return r.db.WithContext(ctx).
+		Model(&model.EventLog{}).
+		Where("id = ?", eventID).
+		Updates(map[string]any{"provider": strings.TrimSpace(provider)}).Error
+}
+
 // InFlightByAccount counts pending (in-flight) events grouped by account_id, for
 // the accounts view's live "in-flight" column.
 func (r *EventRepository) InFlightByAccount(ctx context.Context) (map[string]int64, error) {

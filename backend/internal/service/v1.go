@@ -25,6 +25,7 @@ import (
 	"backend/internal/config"
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
+	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
@@ -75,6 +76,8 @@ var (
 	errAccountTaskQuota = errors.New("provider account balance below current task cost")
 )
 
+const byteplusMinUsableCredits = 1.0
+
 // maxReferenceImageBytes bounds a single decoded reference image. 20 MB
 // comfortably covers real photos/screenshots; anything larger is almost
 // certainly abuse or a mistake. Mirrors Python core/refs.py.
@@ -93,6 +96,7 @@ type V1Service struct {
 	settings *repo.SiteSettingRepository
 	cgroups  *repo.ConcurrencyGroupRepository
 	adobe    *adobe.Client
+	byteplus *byteplus.Client
 	chatgpt  *chatgpt.Client
 	runway   *runway.Client
 	leonardo *leonardo.Client
@@ -375,7 +379,7 @@ type MediaReference struct {
 	Filename    string
 }
 
-func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, store *storage.Client) *V1Service {
+func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, store *storage.Client) *V1Service {
 	service := &V1Service{
 		cfg:      cfg,
 		models:   models,
@@ -386,6 +390,7 @@ func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.
 		cgroups:  cgroups,
 		conc:     conc,
 		adobe:    adobeClient,
+		byteplus: bytePlusClient,
 		chatgpt:  chatGPTClient,
 		runway:   runwayClient,
 		leonardo: leonardoClient,
@@ -1260,7 +1265,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	var imageBytes []byte
 	switch s.effectiveProvider(genCtx, modelItem) {
 	case "adobe":
-		b, u, execErr := s.generateAdobeImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
+		b, u, execErr := s.generateAdobeImageWithFallback(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -1276,6 +1281,15 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			default:
 				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
 			}
+		}
+		imageBytes = b
+		upstreamURL = u
+	case "byteplus":
+		b, u, execErr := s.generateBytePlusImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
+		if execErr != nil {
+			_ = s.refundIfNeeded(ctx, principal, eventID, price)
+			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
+			return nil, mapBytePlusImageError(execErr)
 		}
 		imageBytes = b
 		upstreamURL = u
@@ -2016,6 +2030,24 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		}
 		return s.grok.OpenAsset(ctx, acct.Value, ev.File)
 	}
+	// Lumina resource-utils URLs are session-bound and short-lived. Fetch them
+	// with the exact Cookie account that created the task, then expose the bytes
+	// only through this opaque event URL.
+	if ev.Provider == "byteplus" && s.byteplus != nil {
+		cacheKey := imageCacheKey(ev.ID)
+		if cached, ct, ok := s.openCachedImage(ctx, cacheKey); ok {
+			return cached, ct, nil
+		}
+		acct, _ := s.tokens.Get(ctx, "byteplus", ev.AccountID)
+		if acct == nil || strings.TrimSpace(acct.Value) == "" {
+			return nil, "", fmt.Errorf("%w: byteplus account no longer available for this image", ErrProviderTemporary)
+		}
+		data, ct, openErr := s.byteplus.OpenAsset(ctx, acct.Value, ev.File)
+		if openErr != nil {
+			return nil, "", openErr
+		}
+		return s.cacheImageStream(ctx, cacheKey, io.NopCloser(bytes.NewReader(data)), ct)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ev.File, nil)
 	if err != nil {
 		return nil, "", err
@@ -2554,6 +2586,20 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
 	tempFailover bool,
 ) ([]byte, error) {
+	return s.runPoolWithFailoverPolicy(ctx, eventID, pool, active, kind, attempt, classify, refreshOnAuth, tempFailover, true)
+}
+
+// runPoolWithFailoverPolicy is the policy-bearing implementation. Most pools
+// retain the bounded in-request temporary retry. Adobe third-party images pass
+// retryTemporary=false because they have an explicit cross-provider fallback;
+// waiting five minutes before entering that fallback defeats its purpose.
+func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool string, active []model.TokenAccount, kind string,
+	attempt func(token model.TokenAccount) ([]byte, error),
+	classify func(error) (isAuth, isQuota, isTemporary, isDead bool),
+	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
+	tempFailover bool,
+	retryTemporary bool,
+) ([]byte, error) {
 	tempDeadCount := 0
 	queueDeadline := time.Now().Add(providerAccountQueueWait)
 	tempRetryDeadline := time.Now().Add(tempRetryWindow)
@@ -2562,7 +2608,7 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 	// upstream failure. It reports false once the retry window is spent or the
 	// caller has gone away, at which point the error is surfaced.
 	waitTempRetry := func() bool {
-		if time.Now().After(tempRetryDeadline) || ctx.Err() != nil {
+		if !retryTemporary || time.Now().After(tempRetryDeadline) || ctx.Err() != nil {
 			return false
 		}
 		timer := time.NewTimer(tempRetryBackoff)
@@ -2736,6 +2782,102 @@ func adobeErrClass(e error) (bool, bool, bool, bool) {
 	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream), errors.Is(e, adobe.ErrDeadUpstream)
 }
 
+type adobeImageFallbackTarget struct {
+	provider string
+	modelID  string
+}
+
+type adobeImageGenerator func(*model.ModelConfig, V1ImageRequest) ([]byte, string, error)
+
+// adobeImageFallbacks maps only Adobe's third-party image catalog to ordered
+// provider candidates. Native Firefly models intentionally stay on Adobe:
+// silently changing those would alter the requested model semantics. Grok is
+// appended only for text-to-image because its image path cannot accept refs.
+func adobeImageFallbacks(modelID string, hasReferences bool) []adobeImageFallbackTarget {
+	var targets []adobeImageFallbackTarget
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "firefly-gpt-image", "firefly-gpt-image-1.5", "firefly-gpt-image-2":
+		targets = append(targets, adobeImageFallbackTarget{provider: "chatgpt", modelID: "gpt-image-2"})
+	case "firefly-nano-banana-2":
+		targets = append(targets,
+			adobeImageFallbackTarget{provider: "runway", modelID: "nano-banana-2"},
+			adobeImageFallbackTarget{provider: "chatgpt", modelID: "gpt-image-2"},
+		)
+	case "firefly-nano-banana", "firefly-nano-banana-pro", "flux-kontext-max":
+		// Runway's Pro workflow accepts the same prompt, resolution tiers and
+		// reference images, so edits are not degraded into a text-only fallback.
+		targets = append(targets,
+			adobeImageFallbackTarget{provider: "runway", modelID: "nano-banana-pro"},
+			adobeImageFallbackTarget{provider: "chatgpt", modelID: "gpt-image-2"},
+		)
+	default:
+		return nil
+	}
+	if !hasReferences {
+		targets = append(targets, adobeImageFallbackTarget{provider: "grok", modelID: "grok-imagine-image"})
+	}
+	return targets
+}
+
+func adobeImageRetryTemporary(modelID string, hasReferences bool) bool {
+	return len(adobeImageFallbacks(modelID, hasReferences)) == 0
+}
+
+// runAdobeImageFallback owns the cross-provider decision while keeping the
+// provider implementations and billing path separate. The fallback receives
+// the original request unchanged (including references); only a cloned internal
+// model config is remapped. Any fallback failure remains classified as the
+// original Adobe temporary failure so account/auth errors from an optional
+// backup pool cannot change the public contract or poison the Adobe pool.
+func runAdobeImageFallback(modelItem *model.ModelConfig, in V1ImageRequest, primary, fallback adobeImageGenerator) ([]byte, string, error) {
+	data, imageURL, primaryErr := primary(modelItem, in)
+	if primaryErr == nil || !errors.Is(primaryErr, adobe.ErrTemporaryUpstream) || strings.TrimSpace(in.AccountID) != "" {
+		return data, imageURL, primaryErr
+	}
+	targets := adobeImageFallbacks(modelItem.ID, len(in.ReferenceImages) > 0)
+	if len(targets) == 0 {
+		return data, imageURL, primaryErr
+	}
+
+	var lastFallbackErr error
+	for _, target := range targets {
+		fallbackModel := *modelItem
+		fallbackModel.ID = target.modelID
+		fallbackModel.Provider = target.provider
+		fallbackModel.UpstreamModel = ""
+		data, imageURL, lastFallbackErr = fallback(&fallbackModel, in)
+		if lastFallbackErr == nil {
+			return data, imageURL, nil
+		}
+	}
+	return nil, "", fmt.Errorf("%w; fallback chain failed: %v", primaryErr, lastFallbackErr)
+}
+
+func (s *V1Service) generateAdobeImageWithFallback(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
+	return runAdobeImageFallback(modelItem, in,
+		func(item *model.ModelConfig, request V1ImageRequest) ([]byte, string, error) {
+			return s.generateAdobeImage(ctx, eventID, item, request, aspectRatio, resolution, noStore)
+		},
+		func(item *model.ModelConfig, request V1ImageRequest) ([]byte, string, error) {
+			provider := strings.TrimSpace(item.Provider)
+			if s.events != nil {
+				_ = s.events.SetProvider(ctx, eventID, provider)
+			}
+			log.Printf("adobe image temporary failure: falling back model=%s provider=%s upstream_model=%s", modelItem.ID, provider, item.ID)
+			switch provider {
+			case "runway":
+				return s.generateRunwayImage(ctx, eventID, item, request, aspectRatio, resolution, noStore)
+			case "chatgpt":
+				return s.generateChatGPTImage(ctx, eventID, item, request, aspectRatio, resolution, noStore)
+			case "grok":
+				return s.generateGrokImage(ctx, eventID, item, request, aspectRatio, noStore)
+			default:
+				return nil, "", ErrProviderUnsupported
+			}
+		},
+	)
+}
+
 // noStore url-only mode: adobe returns a presigned image URL (meta["image_url"]);
 // skip the download and return it directly.
 func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
@@ -2775,7 +2917,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 	// current one, capped at maxTempFailoverAccounts; auth/quota also fail over
 	// (see runPoolWithFailover). imageURL is captured from the successful attempt.
 	var imageURL string
-	data, err := s.runPoolWithFailover(ctx, eventID, "adobe", active, "image", func(token model.TokenAccount) ([]byte, error) {
+	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "adobe", active, "image", func(token model.TokenAccount) ([]byte, error) {
 		var blobIDs []string
 		for _, ref := range refs {
 			id, upErr := s.adobe.UploadImage(ctx, token.Value, ref, "image/png", "")
@@ -2791,7 +2933,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 		return d, genErr
 	}, adobeErrClass, func(id string) (model.TokenAccount, bool) {
 		return s.refreshAdobeToken(ctx, id)
-	}, true)
+	}, true, adobeImageRetryTemporary(modelItem.ID, len(in.ReferenceImages) > 0))
 	return data, imageURL, err
 }
 
@@ -4271,6 +4413,221 @@ func (s *V1Service) generateKreaImage(ctx context.Context, eventID string, model
 	return data, imageURL, err
 }
 
+// generateBytePlusImage runs one of the five Lumina image models through the
+// normal account-pool scheduler. The provider client owns the closed model
+// mapping, request-specific defaults, ImageX reference uploads, polling and
+// authenticated artifact download.
+func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
+	if s.byteplus == nil {
+		return nil, "", errors.New("byteplus client not configured")
+	}
+	refLimit := modelItem.MaxReferenceImages
+	if refLimit <= 0 {
+		refLimit = 14
+	}
+	refs, err := decodeReferenceImages(in.ReferenceImages, refLimit)
+	if err != nil {
+		return nil, "", err
+	}
+
+	modelKey := strings.TrimSpace(modelItem.ID)
+	if strings.TrimSpace(modelItem.UpstreamModel) != "" {
+		modelKey = strings.TrimSpace(modelItem.UpstreamModel)
+	}
+	request := byteplus.ImageRequest{
+		Model:       modelKey,
+		Prompt:      in.Prompt,
+		Size:        resolution,
+		AspectRatio: aspectRatio,
+		Quality:     upstreamQualityForModel(modelItem.ID, resolution),
+		References:  refs,
+	}
+	requiredCredits, err := byteplus.RequiredCredits(request)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
+	}
+	items, err := s.tokens.ListByPool(ctx, "byteplus")
+	if err != nil {
+		return nil, "", err
+	}
+	active := make([]model.TokenAccount, 0, len(items))
+	for _, item := range items {
+		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
+			active = append(active, item)
+		}
+	}
+	active = pinTestAccount(items, active, in.AccountID)
+	active, knownInsufficient := filterBytePlusAccountsByCredits(active, requiredCredits)
+	if len(active) == 0 {
+		if knownInsufficient {
+			return nil, "", byteplus.ErrQuotaExhausted
+		}
+		return nil, "", ErrNoProviderAccount
+	}
+	s.rotateRoundRobin("byteplus", active)
+	s.prioritizeBytePlusAccounts(active)
+
+	var imageURL string
+	data, err := s.runPoolWithFailover(ctx, eventID, "byteplus", active, "image", func(token model.TokenAccount) ([]byte, error) {
+		allowed, held, reserveErr := s.tokens.ReserveQuotaTracked(ctx, "byteplus", token.ID, requiredCredits)
+		if reserveErr != nil {
+			return nil, fmt.Errorf("%w: reserve credits: %v", byteplus.ErrTemporaryUpstream, reserveErr)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("%w: %w", byteplus.ErrQuotaExhausted, errAccountTaskQuota)
+		}
+		request.DownloadResult = !noStore
+		result, meta, genErr := s.byteplus.GenerateImage(ctx, token.Value, request)
+		if genErr == nil {
+			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
+			s.reconcileBytePlusCredits(ctx, token, requiredCredits, held)
+			return result, nil
+		}
+
+		// Accepted or submission-ambiguous requests may already be billed. Never
+		// refund their hold or replay create_task on a different account.
+		if byteplusNoResubmit(genErr) {
+			remaining, known := s.reconcileBytePlusCredits(ctx, token, requiredCredits, held)
+			if errors.Is(genErr, byteplus.ErrQuotaExhausted) {
+				if known && remaining >= byteplusMinUsableCredits {
+					genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
+				} else {
+					s.markTokenFailure(ctx, "byteplus", token, "image", false, true)
+				}
+			}
+			return nil, genErr
+		}
+
+		if held {
+			refundCtx, refundCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			_ = s.tokens.RefundQuotaTracked(refundCtx, "byteplus", token.ID, requiredCredits)
+			refundCancel()
+		}
+		if errors.Is(genErr, byteplus.ErrQuotaExhausted) {
+			remaining, known := s.reconcileBytePlusCredits(ctx, token, 0, false)
+			if known && remaining >= byteplusMinUsableCredits {
+				genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
+			}
+		}
+		return result, genErr
+	}, byteplusErrClass, nil, true)
+	return data, imageURL, err
+}
+
+// filterBytePlusAccountsByCredits keeps legacy accounts with an unknown balance
+// eligible, but never submits a request to an account whose known available
+// balance is below this model/size/reference combination's exact upstream cost.
+func filterBytePlusAccountsByCredits(items []model.TokenAccount, required float64) ([]model.TokenAccount, bool) {
+	eligible := make([]model.TokenAccount, 0, len(items))
+	knownInsufficient := false
+	for _, item := range items {
+		if remaining, ok := jsonMapFloat(item.Meta, "cached_quota_remaining"); ok && remaining+0.000001 < required {
+			knownInsufficient = true
+			continue
+		}
+		eligible = append(eligible, item)
+	}
+	return eligible, knownInsufficient
+}
+
+// prioritizeBytePlusAccounts uses best-fit balance ordering within the existing
+// cooling/weight groups. Cheap models drain smaller balances first, preserving
+// high-credit accounts for GPT Image 2's 96/230-point requests; unknown balances
+// remain a compatibility fallback behind known-sufficient accounts.
+func (s *V1Service) prioritizeBytePlusAccounts(items []model.TokenAccount) {
+	if len(items) < 2 {
+		return
+	}
+	cooling := make(map[string]bool, len(items))
+	for _, item := range items {
+		cooling[item.ID] = s.accountCooling("byteplus", item.ID)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if cooling[items[i].ID] != cooling[items[j].ID] {
+			return !cooling[items[i].ID]
+		}
+		if items[i].Weight != items[j].Weight {
+			return items[i].Weight > items[j].Weight
+		}
+		left, leftKnown := jsonMapFloat(items[i].Meta, "cached_quota_remaining")
+		right, rightKnown := jsonMapFloat(items[j].Meta, "cached_quota_remaining")
+		if leftKnown != rightKnown {
+			return leftKnown
+		}
+		return leftKnown && left < right
+	})
+}
+
+// reconcileBytePlusCredits refreshes after every completed or possibly accepted
+// generation. Settlement and the upstream snapshot are committed under the same
+// account row lock, subtracting other in-flight holds from the refreshed value.
+func (s *V1Service) reconcileBytePlusCredits(parent context.Context, token model.TokenAccount, settledCredits float64, held bool) (float64, bool) {
+	amount := 0.0
+	if held {
+		amount = settledCredits
+	}
+	probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+	data, err := s.byteplus.FetchCreditsBalance(probeCtx, token.Value)
+	probeCancel()
+	metaPatch := map[string]any{}
+	var upstreamRemaining *float64
+	if err == nil && !boolValueWithDefault(data["unknown"], false) {
+		if remaining, ok := anyFloat(data["remaining"]); ok {
+			upstreamRemaining = &remaining
+			metaPatch["cached_quota_at"] = int(time.Now().Unix())
+		}
+		if used, ok := anyFloat(data["used"]); ok {
+			metaPatch["cached_quota_used"] = canonicalQuotaNumber(used)
+		}
+		if total, ok := anyFloat(data["total"]); ok {
+			metaPatch["cached_quota_total"] = canonicalQuotaNumber(total)
+		}
+	}
+	settleCtx, settleCancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
+	defer settleCancel()
+	if settleErr := s.tokens.SettleQuotaTracked(settleCtx, "byteplus", token.ID, amount, upstreamRemaining, metaPatch); settleErr != nil {
+		log.Printf("byteplus reconciliation: could not settle refreshed quota for %s: %v", token.ID, settleErr)
+	}
+	if upstreamRemaining == nil {
+		return 0, false
+	}
+	return *upstreamRemaining, true
+}
+
+func byteplusErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	// An accepted task or an ambiguous create response may both already represent
+	// a paid task. Neither may move to another account or replay create_task.
+	if byteplusNoResubmit(err) {
+		return false, false, false, false
+	}
+	return errors.Is(err, byteplus.ErrAuth), errors.Is(err, byteplus.ErrQuotaExhausted), errors.Is(err, byteplus.ErrTemporaryUpstream), false
+}
+
+func byteplusNoResubmit(err error) bool {
+	return errors.Is(err, byteplus.ErrTaskAccepted) || errors.Is(err, byteplus.ErrTaskSubmissionUnknown)
+}
+
+func mapBytePlusImageError(err error) error {
+	// Explicit terminal business outcomes remain user-visible even when the task
+	// was already accepted. The no-resubmit marker controls scheduling only.
+	switch {
+	case errors.Is(err, byteplus.ErrQuotaExhausted):
+		return ErrProviderQuota
+	case errors.Is(err, byteplus.ErrRiskControl):
+		return fmt.Errorf("%w: %v", ErrContentRejected, err)
+	case errors.Is(err, byteplus.ErrInvalidParams):
+		return fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
+	case byteplusNoResubmit(err):
+		return ErrProviderTemporary
+	case errors.Is(err, byteplus.ErrAuth):
+		return ErrProviderAuth
+	case errors.Is(err, byteplus.ErrTemporaryUpstream):
+		return ErrProviderTemporary
+	default:
+		return fmt.Errorf("%w: %v", ErrProviderExecution, err)
+	}
+}
+
 // imagineRefreshAndPersist ensures the account's Imagine credential has a valid
 // access token (refreshing via the rotating refreshToken when expired) and
 // persists the new credential — both tokens rotate, so the value MUST be saved.
@@ -4536,7 +4893,7 @@ func resolveImageSize(item *model.ModelConfig, in V1ImageRequest) (string, strin
 
 func supportsQualityResolutionModel(modelID string) bool {
 	switch strings.ToLower(strings.TrimSpace(modelID)) {
-	case "gpt-image-2", "firefly-gpt-image-2":
+	case "gpt-image-2", "firefly-gpt-image-2", "lumina-gpt-image-2":
 		return true
 	default:
 		return false
@@ -4739,6 +5096,10 @@ func jsonMapFloat(m map[string]any, key string) (float64, bool) {
 	if !ok || v == nil {
 		return 0, false
 	}
+	return anyFloat(v)
+}
+
+func anyFloat(v any) (float64, bool) {
 	switch x := v.(type) {
 	case float64:
 		return x, true
@@ -4762,6 +5123,13 @@ func jsonMapFloat(m map[string]any, key string) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func canonicalQuotaNumber(value float64) any {
+	if value == float64(int(value)) {
+		return int(value)
+	}
+	return value
 }
 
 func sanitizeOwnerName(v string) string {
@@ -4896,7 +5264,7 @@ func (s *V1Service) markTokenFailure(ctx context.Context, pool string, token mod
 		// grok is intentionally excluded: a grok sso can momentarily 401 while
 		// still valid (upstream blip / proxy / anti-bot), so an auth failure just
 		// fails over for this request without permanently killing the account.
-		if pool == "chatgpt" || pool == "runway" || pool == "leonardo" || pool == "krea" || pool == "imagine" {
+		if pool == "chatgpt" || pool == "byteplus" || pool == "runway" || pool == "leonardo" || pool == "krea" || pool == "imagine" {
 			patch["status"] = "disabled"
 			patch["dead"] = true
 		}

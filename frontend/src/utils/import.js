@@ -58,6 +58,20 @@ function looksLikeOreateCookie(s) {
   return /(?:^|;\s*)OUID=[^;]+/.test(s || '') && /(?:^|;\s*)ouss=[^;]+/.test(s || '')
 }
 
+// BytePlus Lumina website sessions expose this cookie. Check it before the
+// generic Adobe fallback because both providers otherwise look like opaque
+// browser Cookie strings.
+function looksLikeBytePlusCookie(s) {
+  const cookies = String(s || '').split(';').map((part) => {
+    const index = part.indexOf('=')
+    return index > 0
+      ? { name: part.slice(0, index).trim().toLowerCase(), value: part.slice(index + 1).trim() }
+      : null
+  }).filter(Boolean)
+  if (!cookies.some(({ name, value }) => name === 'csrftoken' && value)) return false
+  return cookies.some(({ name, value }) => value && name !== 'csrftoken' && name !== 'lang' && name !== 'locale' && !name.startsWith('__spti'))
+}
+
 // An Imagine.art credential is a JSON object { token, refreshToken } (both JWTs).
 function isImagineObj(o) {
   return !!o && typeof o === 'object' &&
@@ -77,6 +91,7 @@ function cookieType(v) {
   if (looksLikeOreateCookie(v)) return 'oreate'
   if (looksLikeKreaCookie(v)) return 'krea'
   if (looksLikeLeonardoCookie(v)) return 'leonardo'
+  if (looksLikeBytePlusCookie(v)) return 'byteplus'
   return 'adobe'
 }
 
