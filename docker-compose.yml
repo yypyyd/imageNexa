@@ -20,11 +20,13 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -75,7 +77,7 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       POSTGRES_DSN: host=postgres user=${POSTGRES_USER:-postgres} password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env} dbname=${POSTGRES_DB:-vivid_ai} port=5432 sslmode=disable TimeZone=Asia/Shanghai
       REDIS_ADDR: redis:6379
-      REDIS_PASSWORD: ""
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
       REDIS_DB: "0"
       RUSTFS_ENDPOINT: http://rustfs:9000
       RUSTFS_BUCKET: ${RUSTFS_BUCKET:-twoapi}
