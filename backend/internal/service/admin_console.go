@@ -58,6 +58,8 @@ type AccountImportInput struct {
 	Credential any
 }
 
+var adminAccountProviders = []string{"chatgpt", "adobe", "byteplus", "runway", "grok", "oreate", "custom"}
+
 func NewAdminConsoleService(cfg *config.Config, db *gorm.DB, models *repo.ModelRepository, tokens *repo.TokenRepository, tokenSvc *TokenService, settings *repo.SiteSettingRepository) *AdminConsoleService {
 	return &AdminConsoleService{cfg: cfg, db: db, models: models, tokens: tokens, tokenSvc: tokenSvc, settings: settings}
 }
@@ -130,8 +132,7 @@ func (s *AdminConsoleService) UpdateLogicalRoute(ctx context.Context, logicalID,
 }
 
 func (s *AdminConsoleService) ListAccounts(ctx context.Context, filter AccountListFilter) ([]map[string]any, int64, error) {
-	allowedProviders := []string{"chatgpt", "adobe", "byteplus", "runway", "grok", "oreate", "custom"}
-	query := s.db.WithContext(ctx).Model(&model.TokenAccount{}).Where("pool IN ?", allowedProviders)
+	query := s.db.WithContext(ctx).Model(&model.TokenAccount{}).Where("pool IN ?", adminAccountProviders)
 	if requested := strings.TrimSpace(filter.Provider); requested != "" {
 		provider := normalizeAdminProvider(requested)
 		if provider == "" {
@@ -164,6 +165,28 @@ func (s *AdminConsoleService) ListAccounts(ctx context.Context, filter AccountLi
 		rows = append(rows, row)
 	}
 	return rows, total, nil
+}
+
+func (s *AdminConsoleService) CountAccountsByProvider(ctx context.Context) (map[string]int64, error) {
+	type providerCount struct {
+		Provider string `gorm:"column:provider"`
+		Count    int64  `gorm:"column:count"`
+	}
+	var rows []providerCount
+	if err := s.db.WithContext(ctx).Model(&model.TokenAccount{}).
+		Select("pool AS provider, COUNT(*) AS count").
+		Where("pool IN ?", adminAccountProviders).
+		Group("pool").Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	counts := make(map[string]int64, len(adminAccountProviders))
+	for _, provider := range adminAccountProviders {
+		counts[provider] = 0
+	}
+	for _, row := range rows {
+		counts[row.Provider] = row.Count
+	}
+	return counts, nil
 }
 
 func (s *AdminConsoleService) accountRow(ctx context.Context, account model.TokenAccount) (map[string]any, error) {

@@ -12,35 +12,26 @@ const accounts = ref([])
 const loading = ref(true)
 const error = ref('')
 const total = ref(0)
+const providerCounts = ref({})
 const page = ref(1)
-const limit = 100
+const limit = 20
 const query = ref('')
 const provider = ref('')
 const status = ref('')
-const expanded = ref(new Set())
 const busy = ref('')
 const importing = ref(false)
 const importForm = reactive({ provider: 'byteplus', label: '', credential: '' })
 
-const filtered = computed(() => {
-  const q = query.value.trim().toLowerCase()
-  return accounts.value.filter((a) => {
-    if (!ALLOWED_PROVIDERS.includes(String(a.provider || '').toLowerCase())) return false
-    if (provider.value && a.provider !== provider.value) return false
-    if (status.value && a.status !== status.value) return false
-    if (q && !`${a.label || ''} ${a.email || ''} ${a.id || ''} ${a.provider || ''}`.toLowerCase().includes(q)) return false
-    return true
-  })
-})
-
 const pages = computed(() => Math.max(1, Math.ceil(total.value / limit)))
-
-const stats = computed(() => ({
-  total: total.value,
-  active: accounts.value.filter((a) => ALLOWED_PROVIDERS.includes(a.provider) && ['active', 'enabled', 'healthy'].includes(a.status)).length,
-  cooldown: accounts.value.filter((a) => ['cooldown', 'quota', 'pending'].includes(a.status)).length,
-  disabled: accounts.value.filter((a) => ['disabled', 'auth_error'].includes(a.status)).length,
-}))
+const pageItems = computed(() => {
+  const last = pages.value
+  if (last <= 7) return Array.from({ length: last }, (_, index) => index + 1)
+  const wanted = new Set([1, last, page.value - 1, page.value, page.value + 1])
+  if (page.value <= 4) [2, 3, 4, 5].forEach((value) => wanted.add(value))
+  if (page.value >= last - 3) [last - 4, last - 3, last - 2, last - 1].forEach((value) => wanted.add(value))
+  const ordered = [...wanted].filter((value) => value >= 1 && value <= last).sort((a, b) => a - b)
+  return ordered.flatMap((value, index) => index > 0 && value - ordered[index - 1] > 1 ? [`gap-${value}`, value] : [value])
+})
 
 function listURL() {
   const params = new URLSearchParams({ page: String(page.value), limit: String(limit) })
@@ -56,18 +47,39 @@ async function load() {
   if (response.ok) {
     accounts.value = listOf(response.data)
     total.value = Number(response.data?.total ?? accounts.value.length)
+    providerCounts.value = response.data?.provider_counts || {}
     error.value = ''
   } else error.value = response.error
   loading.value = false
 }
 
-function search() { page.value = 1; load() }
-function go(delta) { page.value = Math.max(1, Math.min(pages.value, page.value + delta)); load() }
+function search() {
+  page.value = 1
+  load()
+}
 
-function toggleOpen(id) {
-  const next = new Set(expanded.value)
-  next.has(id) ? next.delete(id) : next.add(id)
-  expanded.value = next
+function selectProvider(value) {
+  provider.value = provider.value === value ? '' : value
+  search()
+}
+
+function goTo(target) {
+  const next = Math.max(1, Math.min(pages.value, Number(target) || 1))
+  if (next === page.value) return
+  page.value = next
+  load()
+}
+
+function enabledRoutes(account) {
+  return (account.routes || []).filter((route) => route.enabled !== false)
+}
+
+function routeTitle(account) {
+  return enabledRoutes(account).map((route) => route.model_id || route.logical_model_id).join('、')
+}
+
+function firstQuota(account) {
+  return (account.quota_buckets || [])[0] || null
 }
 
 function quotaPercent(bucket) {
@@ -81,10 +93,8 @@ function quotaValue(value, unit) {
   return `${Number(value).toLocaleString('zh-CN')} ${unit || ''}`.trim()
 }
 
-function fmtTime(value) {
-  if (!value) return '—'
-  const d = new Date(value)
-  return Number.isNaN(d.getTime()) ? value : d.toLocaleString('zh-CN', { hour12: false })
+function statusLabel(value) {
+  return ({ active: '可用', quota: '额度受限', pending: '待校验', disabled: '已禁用' })[value] || value || '未知'
 }
 
 async function patchAccount(account, patch, key) {
@@ -151,11 +161,10 @@ onMounted(load)
 
     <p v-if="error" class="notice">{{ error }}</p>
 
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-      <div v-for="item in [['匹配账号',stats.total],['本页可用',stats.active],['本页额度受限',stats.cooldown],['本页已禁用',stats.disabled]]" :key="item[0]" class="card p-4">
-        <div class="text-[10px] uppercase tracking-wider text-white/40">{{ item[0] }}</div>
-        <div class="mt-1 text-2xl font-semibold tabular-nums">{{ item[1] }}</div>
-      </div>
+    <div class="provider-stock" aria-label="各平台账号数量">
+      <button v-for="option in PROVIDER_OPTIONS" :key="option.value" :class="provider === option.value && 'on'" @click="selectProvider(option.value)">
+        <span>{{ option.label }}</span><strong>{{ Number(providerCounts[option.value] || 0).toLocaleString('zh-CN') }}</strong>
+      </button>
     </div>
 
     <div class="card p-3 flex flex-wrap items-center gap-2">
@@ -165,58 +174,66 @@ onMounted(load)
       <button class="btn-soft" @click="search"><Icon name="refresh" class="w-3.5 h-3.5" />查询</button>
     </div>
 
-    <div class="space-y-2">
-      <article v-for="account in filtered" :key="account.id" class="card overflow-hidden">
-        <div class="px-4 py-3.5 grid grid-cols-[auto_minmax(0,1fr)_auto] lg:grid-cols-[auto_minmax(13rem,1fr)_9rem_9rem_8rem_auto] items-center gap-3">
-          <button class="text-white/35 hover:text-white/80" @click="toggleOpen(account.id)"><span class="inline-block transition-transform" :class="expanded.has(account.id) && 'rotate-90'">›</span></button>
-          <div class="min-w-0">
-            <div class="flex items-center gap-2">
-              <span class="provider">{{ account.provider }}</span>
-              <strong class="text-xs text-white/85 truncate">{{ account.label || account.email || account.id }}</strong>
-            </div>
-            <div class="mt-1 text-[10px] text-white/35 truncate">{{ account.email || account.id }} · {{ (account.routes || []).filter((r) => r.enabled !== false).length }} 个 route</div>
-          </div>
-          <div class="hidden lg:block text-[10px] text-white/40">并发 <span class="text-white/75">{{ account.active_jobs || 0 }} / {{ account.max_concurrency || '∞' }}</span></div>
-          <div class="hidden lg:block text-[10px] text-white/40">权重 <span class="text-white/75">{{ account.weight ?? 1 }}</span></div>
-          <div class="hidden lg:block"><span class="status" :class="`status-${account.status}`">{{ account.status || 'unknown' }}</span></div>
-          <div class="flex items-center gap-1 justify-end">
-            <button class="icon-btn" title="校验账号并刷新真实额度" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
-            <button class="switch" :class="!['disabled','auth_error'].includes(account.status) && 'on'" @click="toggleAccount(account)"><span></span></button>
-            <button class="icon-btn danger" title="删除" @click="removeAccount(account)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
-          </div>
-        </div>
+    <div class="card overflow-hidden">
+      <div class="px-4 py-3 flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06]">
+        <div class="text-xs text-white/45">匹配 <strong class="text-sm text-white/85 tabular-nums">{{ total }}</strong> 个账号 <span class="ml-2">每页 {{ limit }} 个</span></div>
+        <nav class="pagination" aria-label="账号分页">
+          <button :disabled="page <= 1" @click="goTo(page - 1)">上一页</button>
+          <template v-for="item in pageItems" :key="item">
+            <span v-if="typeof item !== 'number'">…</span>
+            <button v-else :class="item === page && 'on'" :aria-current="item === page ? 'page' : undefined" @click="goTo(item)">{{ item }}</button>
+          </template>
+          <button :disabled="page >= pages" @click="goTo(page + 1)">下一页</button>
+        </nav>
+      </div>
 
-        <div v-if="expanded.has(account.id)" class="border-t border-white/[0.06] p-4 md:px-11 bg-white/[0.015] space-y-5">
-          <div>
-            <div class="section-title">额度桶</div>
-            <div v-if="(account.quota_buckets || []).length" class="grid md:grid-cols-2 xl:grid-cols-3 gap-2 mt-2">
-              <div v-for="bucket in account.quota_buckets" :key="bucket.id || bucket.name" class="quota">
-                <div class="flex justify-between gap-3 text-[10px]"><span class="text-white/65">{{ bucket.name || bucket.model_id || '默认额度' }}</span><span class="text-white/40">{{ quotaValue(bucket.remaining, bucket.unit) }} / {{ quotaValue(bucket.total, bucket.unit) }}</span></div>
-                <div class="mt-2 h-1.5 rounded-full bg-white/[0.07] overflow-hidden"><span class="block h-full bg-gradient-to-r from-violet-500 to-cyan-400" :style="{width:`${quotaPercent(bucket)}%`}"></span></div>
-                <div class="mt-2 flex justify-between text-[9px] text-white/30"><span>已预占 {{ quotaValue(bucket.reserved || 0, bucket.unit) }}</span><span>重置 {{ fmtTime(bucket.reset_at) }}</span></div>
-              </div>
-            </div>
-            <p v-else class="mt-2 text-xs text-white/30">暂无额度桶，请刷新账号授权。</p>
-          </div>
-          <div>
-            <div class="section-title">Route 授权</div>
-            <div class="mt-2 flex flex-wrap gap-1.5">
-              <span v-for="route in account.routes || []" :key="route.id" class="route" :class="route.enabled === false && 'off'">{{ route.model_id || route.logical_model_id }} <small>{{ route.enabled === false ? '停用' : '可用' }}</small></span>
-              <span v-if="!(account.routes || []).length" class="text-xs text-white/30">暂无 route 授权</span>
-            </div>
-          </div>
-          <div class="grid md:grid-cols-2 gap-3 max-w-2xl">
-            <label><span class="section-title">权重</span><input type="number" min="0" class="field mt-1.5" :value="account.weight ?? 1" @change="patchAccount(account,{weight:Number($event.target.value)},'weight')" /></label>
-            <label><span class="section-title">账号并发（0 = 不限）</span><input type="number" min="0" class="field mt-1.5" :value="account.max_concurrency || 0" @change="patchAccount(account,{max_concurrency:Number($event.target.value)},'concurrency')" /></label>
-          </div>
-        </div>
-      </article>
-      <div v-if="!loading && !filtered.length" class="card py-16 text-center text-xs text-white/35">没有匹配的账号</div>
-    </div>
+      <div class="overflow-x-auto">
+        <table class="account-table">
+          <thead><tr><th>账号</th><th>Provider</th><th>Route 授权</th><th>额度</th><th>并发</th><th>权重</th><th>状态</th><th class="text-right">操作</th></tr></thead>
+          <tbody>
+            <tr v-if="loading"><td colspan="8" class="empty-cell">正在加载账号…</td></tr>
+            <tr v-else-if="!accounts.length"><td colspan="8" class="empty-cell">没有匹配的账号</td></tr>
+            <tr v-for="account in accounts" v-else :key="account.id">
+              <td class="account-cell">
+                <strong :title="account.label || account.email || account.id">{{ account.label || account.email || account.id }}</strong>
+                <span :title="account.email || account.id">{{ account.email || account.id }}</span>
+              </td>
+              <td><span class="provider">{{ account.provider }}</span></td>
+              <td class="routes-cell" :title="routeTitle(account)">
+                <div><b>{{ enabledRoutes(account).length }}</b> / {{ (account.routes || []).length }} 个可用</div>
+                <div class="route-preview">
+                  <span v-for="route in enabledRoutes(account).slice(0, 2)" :key="route.id">{{ route.model_id || route.logical_model_id }}</span>
+                  <span v-if="enabledRoutes(account).length > 2">+{{ enabledRoutes(account).length - 2 }}</span>
+                </div>
+              </td>
+              <td class="quota-cell">
+                <template v-if="firstQuota(account)">
+                  <div class="quota-line"><span :title="firstQuota(account).name">{{ firstQuota(account).name }}</span><b>{{ quotaValue(firstQuota(account).remaining, firstQuota(account).unit) }}</b></div>
+                  <div class="quota-bar"><span :style="{ width: `${quotaPercent(firstQuota(account))}%` }"></span></div>
+                  <small>共 {{ quotaValue(firstQuota(account).total, firstQuota(account).unit) }}<template v-if="(account.quota_buckets || []).length > 1"> · {{ account.quota_buckets.length }} 个额度桶</template></small>
+                </template>
+                <span v-else class="text-white/30">未获取</span>
+              </td>
+              <td>
+                <div class="job-count">运行中 {{ account.active_jobs || 0 }}</div>
+                <input type="number" min="0" class="compact-input" :value="account.max_concurrency || 0" title="账号并发，0 表示不限" @change="patchAccount(account,{max_concurrency:Number($event.target.value)},'concurrency')" />
+              </td>
+              <td><input type="number" min="0" class="compact-input" :value="account.weight ?? 1" title="调度权重" @change="patchAccount(account,{weight:Number($event.target.value)},'weight')" /></td>
+              <td><span class="status" :class="`status-${account.status}`">{{ statusLabel(account.status) }}</span></td>
+              <td><div class="flex items-center gap-1 justify-end">
+                <button class="icon-btn" title="校验账号并刷新真实额度" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
+                <button class="switch" :class="!['disabled','auth_error'].includes(account.status) && 'on'" :title="account.status === 'disabled' ? '启用账号' : '停用账号'" @click="toggleAccount(account)"><span></span></button>
+                <button class="icon-btn danger" title="删除账号" @click="removeAccount(account)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
+              </div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
-    <div class="flex items-center justify-between text-xs text-white/35">
-      <span>共 {{ total }} 个账号，本页 {{ accounts.length }} 个</span>
-      <div class="flex items-center gap-2"><button class="btn-soft" :disabled="page <= 1" @click="go(-1)">上一页</button><span>{{ page }} / {{ pages }}</span><button class="btn-soft" :disabled="page >= pages" @click="go(1)">下一页</button></div>
+      <div v-if="total > limit" class="px-4 py-3 flex items-center justify-between gap-3 border-t border-white/[0.06] text-xs text-white/40">
+        <span>第 {{ page }} / {{ pages }} 页</span>
+        <nav class="pagination" aria-label="账号底部分页"><button :disabled="page <= 1" @click="goTo(page - 1)">上一页</button><button :disabled="page >= pages" @click="goTo(page + 1)">下一页</button></nav>
+      </div>
     </div>
 
     <div v-if="importing" class="modal-bg" @click.self="importing = false">
@@ -235,16 +252,39 @@ onMounted(load)
 
 <style scoped>
 .notice { border-radius: .7rem; padding: .7rem .9rem; font-size: .72rem; color: rgb(253 164 175); background: rgb(244 63 94 / .09); box-shadow: inset 0 0 0 1px rgb(244 63 94 / .22); }
+.provider-stock { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.5rem }
+.provider-stock button { display:flex;align-items:center;justify-content:space-between;gap:.75rem;min-width:0;border:1px solid var(--hairline);border-radius:.7rem;padding:.65rem .8rem;color:var(--fg-3);background:var(--surface);transition:border-color .15s,background-color .15s,color .15s }
+.provider-stock button:hover { color:var(--fg);background:var(--hover) }.provider-stock button.on{color:rgb(109 40 217);border-color:rgb(139 92 246 / .45);background:rgb(139 92 246 / .09)}
+.provider-stock span { overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.65rem;font-weight:600 }.provider-stock strong{color:var(--fg);font-size:1rem;font-variant-numeric:tabular-nums}
+@media (min-width: 768px) { .provider-stock{grid-template-columns:repeat(4,minmax(0,1fr))} }
+@media (min-width: 1280px) { .provider-stock{grid-template-columns:repeat(7,minmax(0,1fr))} }
 .provider,.status { display: inline-flex; border-radius: 999px; padding: .15rem .48rem; font: 600 .6rem ui-monospace,SFMono-Regular,monospace; color: rgb(196 181 253); background: rgb(139 92 246 / .12); box-shadow: inset 0 0 0 1px rgb(167 139 250 / .2); }
 .status { color: rgb(255 255 255 / .5); background: rgb(255 255 255 / .05); }
 .status-active,.status-healthy,.status-enabled { color: rgb(110 231 183); background: rgb(16 185 129 / .1); }
-.status-cooldown { color: rgb(252 211 77); background: rgb(245 158 11 / .1); }
+.status-cooldown,.status-quota,.status-pending { color: rgb(252 211 77); background: rgb(245 158 11 / .1); }
 .status-disabled,.status-auth_error { color: rgb(253 164 175); background: rgb(244 63 94 / .1); }
-.icon-btn { width: 1.9rem; height: 1.9rem; display: inline-grid; place-items: center; flex: none; border-radius: .5rem; color: rgb(255 255 255 / .55); background: rgb(255 255 255 / .04); box-shadow: inset 0 0 0 1px rgb(255 255 255 / .07); }
-.icon-btn:hover { color: white; background: rgb(255 255 255 / .09); }.icon-btn.danger { color: rgb(253 164 175); }
+.icon-btn { width: 1.9rem; height: 1.9rem; display: inline-grid; place-items: center; flex: none; border-radius: .5rem; color: var(--fg-3); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); }
+.icon-btn:hover { color: var(--fg); background: var(--hover); }.icon-btn.danger { color: rgb(244 63 94 / .75); }
 .switch { position: relative; width: 2.2rem; height: 1.25rem; flex: none; border-radius: 999px; background: rgb(255 255 255 / .12); }.switch span { position:absolute;width:.95rem;height:.95rem;left:.15rem;top:.15rem;border-radius:999px;background:white;transition:transform .15s}.switch.on{background:rgb(16 185 129 / .7)}.switch.on span{transform:translateX(.95rem)}
-.section-title { font-size: .65rem; font-weight: 600; letter-spacing: .04em; color: rgb(255 255 255 / .42); }
-.quota { border-radius: .65rem; padding: .75rem; background: rgb(255 255 255 / .03); box-shadow: inset 0 0 0 1px rgb(255 255 255 / .055); }
-.route { display:inline-flex;align-items:center;gap:.4rem;border-radius:999px;padding:.25rem .55rem;font:.62rem ui-monospace,SFMono-Regular,monospace;color:rgb(167 243 208);background:rgb(16 185 129 / .09);box-shadow:inset 0 0 0 1px rgb(16 185 129 / .18)}.route small{opacity:.55}.route.off{color:rgb(255 255 255 / .35);background:rgb(255 255 255 / .035)}
+.section-title { font-size: .65rem; font-weight: 600; letter-spacing: .04em; color: var(--fg-3); }
+.account-table { width: 100%; min-width: 1240px; table-layout: fixed; border-collapse: collapse; font-size: .72rem; }
+.account-table th { padding: .65rem .75rem; color: var(--fg-3); background: var(--surface-2); font-size: .62rem; font-weight: 600; letter-spacing: .04em; text-align: left; }
+.account-table td { padding: .7rem .75rem; color: var(--fg-2); vertical-align: middle; border-top: 1px solid var(--hairline); }
+.account-table tbody tr { transition: background-color .15s ease; }
+.account-table tbody tr:hover { background: var(--hover); }
+.account-table th:nth-child(1) { width: 20%; }.account-table th:nth-child(2) { width: 8%; }.account-table th:nth-child(3) { width: 20%; }.account-table th:nth-child(4) { width: 18%; }.account-table th:nth-child(5) { width: 9%; }.account-table th:nth-child(6) { width: 7%; }.account-table th:nth-child(7) { width: 8%; }.account-table th:nth-child(8) { width: 10%; }
+.account-cell strong,.account-cell span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-cell strong { color: var(--fg); font-size: .74rem; font-weight: 600; }.account-cell span { margin-top: .25rem; color: var(--fg-3); font-size: .62rem; }
+.routes-cell > div:first-child { color: var(--fg-3); font-size: .62rem; }.routes-cell b { color: var(--fg); font-size: .72rem; }
+.route-preview { display: flex; align-items: center; gap: .25rem; min-width: 0; margin-top: .35rem; overflow: hidden; }
+.route-preview span { flex: none; max-width: 7.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 999px; padding: .13rem .38rem; color: rgb(5 150 105); background: rgb(16 185 129 / .1); font: 500 .55rem ui-monospace,SFMono-Regular,monospace; }
+.quota-line { display:flex;align-items:center;justify-content:space-between;gap:.5rem;font-size:.58rem;color:var(--fg-3) }.quota-line span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.quota-line b{flex:none;color:var(--fg-2);font-weight:600}
+.quota-bar { height:.25rem;margin-top:.4rem;border-radius:999px;overflow:hidden;background:var(--surface-2) }.quota-bar span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,rgb(139 92 246),rgb(34 211 238))}
+.quota-cell small { display:block;margin-top:.3rem;color:var(--fg-faint);font-size:.56rem }
+.job-count { margin-bottom:.3rem;color:var(--fg-3);font-size:.58rem }
+.compact-input { width:4.25rem;border:1px solid var(--hairline);border-radius:.45rem;padding:.3rem .45rem;color:var(--fg);background:var(--surface);font-size:.68rem;outline:none }
+.compact-input:focus { border-color:rgb(139 92 246 / .65);box-shadow:0 0 0 2px rgb(139 92 246 / .12) }
+.empty-cell { height:10rem;text-align:center;color:var(--fg-3)!important }
+.pagination { display:flex;align-items:center;gap:.25rem }.pagination button{min-width:1.8rem;height:1.8rem;padding:0 .5rem;border-radius:.45rem;color:var(--fg-2);background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--hairline);font-size:.65rem}.pagination button:hover:not(:disabled){color:var(--fg);background:var(--hover)}.pagination button.on{color:white;background:rgb(124 58 237);box-shadow:none}.pagination button:disabled{opacity:.35}.pagination span{padding:0 .2rem;color:var(--fg-faint)}
 .modal-bg { position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:1rem;background:rgb(0 0 0 / .65);backdrop-filter:blur(6px) }.modal-card{width:100%;max-width:36rem;display:flex;flex-direction:column;gap:1rem;border-radius:1rem;padding:1.25rem;color:rgb(255 255 255 / .7);background:#11131a;box-shadow:0 24px 80px rgb(0 0 0 / .45),inset 0 0 0 1px rgb(255 255 255 / .08)}
 </style>

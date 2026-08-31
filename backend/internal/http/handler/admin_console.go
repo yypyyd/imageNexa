@@ -75,7 +75,12 @@ func (h *AdminConsoleHandler) Accounts(c *gin.Context) {
 		adminConsoleError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": items, "total": total, "page": page, "limit": limit})
+	providerCounts, err := h.console.CountAccountsByProvider(c.Request.Context())
+	if err != nil {
+		adminConsoleError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": items, "total": total, "page": page, "limit": limit, "provider_counts": providerCounts})
 }
 
 func (h *AdminConsoleHandler) ImportAccount(c *gin.Context) {
