@@ -111,7 +111,7 @@ services:
     # nginx serves the SPA + proxies the API on container port 2000 (HTTP only).
     # Point your own reverse proxy at host:2000.
     ports:
-      - "2000:2000"
+      - "127.0.0.1:2000:2000"
     depends_on:
       backend:
         condition: service_healthy
