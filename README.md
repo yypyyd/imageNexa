@@ -122,7 +122,7 @@ Cookie 是高敏感凭据：不要写入日志、截图、文档、`.env` 或 Gi
 
 ## 快速部署
 
-要求：Docker Engine 与 Docker Compose v2。Compose 会启动 PostgreSQL、Redis、RustFS、Go API 和管理员 SPA；宿主机通过 HTTP `2000` 端口访问。
+要求：Docker Engine 与 Docker Compose v2。Compose 会启动 PostgreSQL、Redis、RustFS、Go API 和管理员 SPA；HTTP `2000` 端口仅绑定宿主机回环地址，由同机反向代理对外提供 HTTPS。
 
 1. 创建部署环境文件：
 
@@ -149,6 +149,7 @@ Copy-Item .env.example .env
 | `ADMIN_BOOTSTRAP_TOKEN` | 首次创建唯一超级管理员所需的高熵秘密；至少 32 字节且不能使用模板值 |
 | `TRUSTED_PROXY_CIDRS` | 可被后端信任并从右向左解析 `X-Forwarded-For` 的反向代理 CIDR |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | PostgreSQL 配置；生产密码至少 16 字节，不能使用默认值 |
+| `REDIS_PASSWORD` | Redis 与后端共享的高熵密码；Compose 会强制 Redis 鉴权 |
 | `RUSTFS_BUCKET` / `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | 私有对象存储配置；生产 Access Key 至少 16 字节、Secret Key 至少 32 字节 |
 
 可用以下命令生成初始化令牌：

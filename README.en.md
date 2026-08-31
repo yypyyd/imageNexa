@@ -122,7 +122,7 @@ Treat the Cookie as a high-value secret. Never place it in logs, screenshots, do
 
 ## Quick Deployment
 
-Requirements: Docker Engine and Docker Compose v2. The stack starts PostgreSQL, Redis, RustFS, the Go API, and the administrator SPA. Host port `2000` serves HTTP.
+Requirements: Docker Engine and Docker Compose v2. The stack starts PostgreSQL, Redis, RustFS, the Go API, and the administrator SPA. HTTP port `2000` binds only to the host loopback interface and is exposed as HTTPS by a reverse proxy on the same host.
 
 1. Create the deployment environment file:
 
@@ -149,6 +149,7 @@ Copy-Item .env.example .env
 | `ADMIN_BOOTSTRAP_TOKEN` | High-entropy secret required to create the singleton administrator; at least 32 bytes and never the template value |
 | `TRUSTED_PROXY_CIDRS` | Exact reverse-proxy CIDRs allowed while walking `X-Forwarded-For` from right to left |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | PostgreSQL configuration; production passwords must be at least 16 bytes and non-default |
+| `REDIS_PASSWORD` | High-entropy password shared by Redis and the backend; Compose enforces Redis authentication |
 | `RUSTFS_BUCKET` / `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | Private object storage; production access keys must be at least 16 bytes and secret keys at least 32 bytes |
 
 Generate the initialization token with:
