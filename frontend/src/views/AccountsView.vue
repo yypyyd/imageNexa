@@ -11,6 +11,9 @@ const PROVIDER_OPTIONS = ALLOWED_PROVIDERS.map((value) => ({ value, label: value
 const accounts = ref([])
 const loading = ref(true)
 const error = ref('')
+const total = ref(0)
+const page = ref(1)
+const limit = 100
 const query = ref('')
 const provider = ref('')
 const status = ref('')
@@ -30,15 +33,17 @@ const filtered = computed(() => {
   })
 })
 
+const pages = computed(() => Math.max(1, Math.ceil(total.value / limit)))
+
 const stats = computed(() => ({
-  total: accounts.value.filter((a) => ALLOWED_PROVIDERS.includes(a.provider)).length,
+  total: total.value,
   active: accounts.value.filter((a) => ALLOWED_PROVIDERS.includes(a.provider) && ['active', 'enabled', 'healthy'].includes(a.status)).length,
-  cooldown: accounts.value.filter((a) => a.status === 'cooldown').length,
+  cooldown: accounts.value.filter((a) => ['cooldown', 'quota', 'pending'].includes(a.status)).length,
   disabled: accounts.value.filter((a) => ['disabled', 'auth_error'].includes(a.status)).length,
 }))
 
 function listURL() {
-  const params = new URLSearchParams({ limit: '500' })
+  const params = new URLSearchParams({ page: String(page.value), limit: String(limit) })
   if (provider.value) params.set('provider', provider.value)
   if (status.value) params.set('status', status.value)
   if (query.value.trim()) params.set('q', query.value.trim())
@@ -50,10 +55,14 @@ async function load() {
   const response = await api(listURL())
   if (response.ok) {
     accounts.value = listOf(response.data)
+    total.value = Number(response.data?.total ?? accounts.value.length)
     error.value = ''
   } else error.value = response.error
   loading.value = false
 }
+
+function search() { page.value = 1; load() }
+function go(delta) { page.value = Math.max(1, Math.min(pages.value, page.value + delta)); load() }
 
 function toggleOpen(id) {
   const next = new Set(expanded.value)
@@ -103,7 +112,10 @@ async function refreshQuota(account) {
 async function removeAccount(account) {
   if (!confirm(`确认删除 ${account.label || account.email || account.id}？已产生的日志仍会保留快照。`)) return
   const response = await api(`/accounts/${encodeURIComponent(account.id)}`, { method: 'DELETE' })
-  if (response.ok) accounts.value = accounts.value.filter((a) => a.id !== account.id)
+  if (response.ok) {
+    if (accounts.value.length === 1 && page.value > 1) page.value--
+    await load()
+  }
   else error.value = response.error
 }
 
@@ -140,17 +152,17 @@ onMounted(load)
     <p v-if="error" class="notice">{{ error }}</p>
 
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-      <div v-for="item in [['总账号',stats.total],['可用',stats.active],['冷却',stats.cooldown],['已禁用',stats.disabled]]" :key="item[0]" class="card p-4">
+      <div v-for="item in [['匹配账号',stats.total],['本页可用',stats.active],['本页额度受限',stats.cooldown],['本页已禁用',stats.disabled]]" :key="item[0]" class="card p-4">
         <div class="text-[10px] uppercase tracking-wider text-white/40">{{ item[0] }}</div>
         <div class="mt-1 text-2xl font-semibold tabular-nums">{{ item[1] }}</div>
       </div>
     </div>
 
     <div class="card p-3 flex flex-wrap items-center gap-2">
-      <SelectMenu v-model="provider" class="w-36" :options="[{ value: '', label: '全部 Provider' }, ...PROVIDER_OPTIONS]" />
-      <SelectMenu v-model="status" class="w-32" :options="[{value:'',label:'全部状态'},{value:'active',label:'可用'},{value:'cooldown',label:'冷却'},{value:'disabled',label:'已禁用'},{value:'auth_error',label:'鉴权失效'}]" />
-      <input v-model="query" class="field !py-1.5 text-xs flex-1 min-w-52" placeholder="搜索标签、邮箱或 ID…" @keyup.enter="load" />
-      <button class="btn-soft" @click="load"><Icon name="refresh" class="w-3.5 h-3.5" />查询</button>
+      <SelectMenu v-model="provider" class="w-36" :options="[{ value: '', label: '全部 Provider' }, ...PROVIDER_OPTIONS]" @update:model-value="search" />
+      <SelectMenu v-model="status" class="w-32" :options="[{value:'',label:'全部状态'},{value:'active',label:'可用'},{value:'quota',label:'额度受限'},{value:'pending',label:'待校验'},{value:'disabled',label:'已禁用'}]" @update:model-value="search" />
+      <input v-model="query" class="field !py-1.5 text-xs flex-1 min-w-52" placeholder="搜索标签、邮箱或 ID…" @keyup.enter="search" />
+      <button class="btn-soft" @click="search"><Icon name="refresh" class="w-3.5 h-3.5" />查询</button>
     </div>
 
     <div class="space-y-2">
@@ -200,6 +212,11 @@ onMounted(load)
         </div>
       </article>
       <div v-if="!loading && !filtered.length" class="card py-16 text-center text-xs text-white/35">没有匹配的账号</div>
+    </div>
+
+    <div class="flex items-center justify-between text-xs text-white/35">
+      <span>共 {{ total }} 个账号，本页 {{ accounts.length }} 个</span>
+      <div class="flex items-center gap-2"><button class="btn-soft" :disabled="page <= 1" @click="go(-1)">上一页</button><span>{{ page }} / {{ pages }}</span><button class="btn-soft" :disabled="page >= pages" @click="go(1)">下一页</button></div>
     </div>
 
     <div v-if="importing" class="modal-bg" @click.self="importing = false">
