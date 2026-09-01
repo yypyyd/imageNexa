@@ -5,9 +5,9 @@ import { ALL_MODELS, IMAGE_MODELS, MODEL_KIND, TEXT_MODELS, VIDEO_MODELS, isCano
 test('canonical model catalog is closed and unique', () => {
   assert.equal(TEXT_MODELS.length, 4)
   assert.equal(IMAGE_MODELS.length, 6)
-  assert.equal(VIDEO_MODELS.length, 14)
-  assert.equal(new Set(ALL_MODELS).size, 24)
-  assert.equal(Object.keys(MODEL_KIND).length, 24)
+  assert.equal(VIDEO_MODELS.length, 9)
+  assert.equal(new Set(ALL_MODELS).size, 19)
+  assert.equal(Object.keys(MODEL_KIND).length, 19)
 })
 
 test('only the six approved image ids are accepted', () => {

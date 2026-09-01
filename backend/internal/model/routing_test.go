@@ -10,10 +10,10 @@ func TestCanonicalRoutingCatalogIsClosed(t *testing.T) {
 	want := []string{
 		"firefly-video", "gpt-5-5-mini", "gpt-5-5-thinking", "gpt-image-2",
 		"grok-4.5", "grok-chat-fast", "grok-imagine-image", "grok-imagine-video",
-		"kling-3", "kling-o3", "luma-ray", "nano-banana-2", "nano-banana-pro",
-		"runway-gen-4-turbo", "runway-gen-4.5", "seedance-1.5-pro", "seedance-2.0",
+		"kling-3", "kling-o3", "nano-banana-2", "nano-banana-pro",
+		"seedance-1.5-pro", "seedance-2.0",
 		"seedance-2.0-fast", "seedance-2.0-mini", "seedance-2.5",
-		"seedream-5.0-lite", "seedream-5.0-pro", "veo-3.1", "veo-3.1-lite",
+		"seedream-5.0-lite", "seedream-5.0-pro",
 	}
 
 	definitions := CanonicalRoutingCatalog()
@@ -47,10 +47,13 @@ func TestCanonicalRoutingCatalogIsClosed(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("canonical IDs changed\n got: %v\nwant: %v", got, want)
 	}
-	if kinds["text"] != 4 || kinds["image"] != 6 || kinds["video"] != 14 {
-		t.Fatalf("canonical kind counts = %#v, want text=4 image=6 video=14", kinds)
+	if kinds["text"] != 4 || kinds["image"] != 6 || kinds["video"] != 9 {
+		t.Fatalf("canonical kind counts = %#v, want text=4 image=6 video=9", kinds)
 	}
-	for _, retired := range []string{"lumina-gpt-image-2", "firefly-gpt-image-2", "leonardo-image", "krea-image", "imagine-image"} {
+	for _, retired := range []string{
+		"lumina-gpt-image-2", "firefly-gpt-image-2", "leonardo-image", "krea-image", "imagine-image",
+		"luma-ray", "runway-gen-4-turbo", "runway-gen-4.5", "veo-3.1", "veo-3.1-lite",
+	} {
 		if IsCanonicalModelID(retired) {
 			t.Fatalf("retired provider-specific model %q is public", retired)
 		}

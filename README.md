@@ -65,7 +65,7 @@ Authorization: Bearer sk-your-api-key
 
 ## Canonical 模型闭集
 
-`GET /v1/models` 只返回以下 24 个公共 ID。Provider 的上游模型名和 route ID 仅供内部适配，不能作为 API 的 `model` 值。
+`GET /v1/models` 只返回以下 19 个公共 ID。Provider 的上游模型名和 route ID 仅供内部适配，不能作为 API 的 `model` 值。
 
 ### 文本（4）
 
@@ -83,21 +83,16 @@ Authorization: Bearer sk-your-api-key
 - `nano-banana-pro`
 - `grok-imagine-image`
 
-### 视频（14）
+### 视频（9）
 
-- `veo-3.1`
-- `veo-3.1-lite`
 - `kling-3`
 - `kling-o3`
-- `runway-gen-4.5`
-- `runway-gen-4-turbo`
 - `seedance-2.0`
 - `seedance-2.0-fast`
 - `seedance-2.0-mini`
 - `seedance-1.5-pro`
 - `seedance-2.5`
 - `grok-imagine-video`
-- `luma-ray`
 - `firefly-video`
 
 ## 统一路由与账号调度
@@ -226,7 +221,7 @@ curl https://api.example.com/v1/videos \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: video-order-001" \
-  -d '{"model":"veo-3.1","prompt":"镜头缓慢穿过霓虹街道","seconds":8,"size":"1280x720"}'
+  -d '{"model":"kling-3","prompt":"镜头缓慢穿过霓虹街道","seconds":8,"size":"1280x720"}'
 ```
 
 图片可通过 `Prefer: respond-async` 获得 `202`，再使用响应中的 `request_id` 查询 `/v1/images/tasks`。即使未主动请求异步模式，只要上游已受理而结果仍在处理中，服务也会立即返回 `202`，不会让反向代理超时后丢失恢复句柄。图片编辑仅接受 PNG、JPEG、GIF 或 WebP 参考图；`mask`、`background` 与 `output_format` 当前会被明确拒绝，不会被静默忽略。视频始终按任务方式创建，轮询 `/v1/videos/:id` 到 `completed` 后再请求 `/content`。

@@ -32,7 +32,7 @@ Never commit the real `.env` or any provider credential. The backend imports Byt
 
 ## Database lifecycle
 
-Forward-only, checksummed migrations create administrator/API-credential identity, the 24-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Startup refuses unknown or modified applied migrations. `AutoMigrate` is limited to compatible columns on retained operational tables and does not seed retired models.
+Forward-only, checksummed migrations create administrator/API-credential identity, the 19-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Startup refuses unknown or modified applied migrations. `AutoMigrate` is limited to compatible columns on retained operational tables and does not seed retired models.
 
 ## Verification
 

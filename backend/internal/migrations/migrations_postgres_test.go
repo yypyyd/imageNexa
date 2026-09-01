@@ -31,8 +31,8 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(migrations) != 4 {
-		t.Fatalf("loaded %d migrations, want 4", len(migrations))
+	if len(migrations) != 5 {
+		t.Fatalf("loaded %d migrations, want 5", len(migrations))
 	}
 
 	sqlDB, err := db.DB()
@@ -63,6 +63,9 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err := applyOne(ctx, conn, migrations[3]); err != nil {
 		t.Fatalf("apply migration 000004: %v", err)
 	}
+	if err := applyOne(ctx, conn, migrations[4]); err != nil {
+		t.Fatalf("apply migration 000005: %v", err)
+	}
 
 	assertLegacyIdentity(t, db)
 	assertClosedCatalogAndCustomRoutes(t, db)
@@ -79,8 +82,8 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err := Run(ctx, db); err != nil {
 		t.Fatalf("second migration Run() error = %v", err)
 	}
-	assertInt64(t, db, "SELECT COUNT(*) FROM schema_migrations", 4)
-	assertInt64(t, db, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", 4)
+	assertInt64(t, db, "SELECT COUNT(*) FROM schema_migrations", 5)
+	assertInt64(t, db, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", 5)
 }
 
 func TestPostgresDisabledAdminRemainsBootstrapable(t *testing.T) {
@@ -224,11 +227,11 @@ func assertLegacyIdentity(t *testing.T, db *gorm.DB) {
 
 func assertClosedCatalogAndCustomRoutes(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	assertInt64(t, db, "SELECT COUNT(*) FROM logical_models WHERE enabled", 24)
-	assertInt64(t, db, "SELECT COUNT(*) FROM model_routes WHERE provider IN ('chatgpt','byteplus','adobe','runway','grok','oreate')", 32)
-	assertInt64(t, db, "SELECT COUNT(*) FROM model_routes WHERE provider = 'custom'", 24)
+	assertInt64(t, db, "SELECT COUNT(*) FROM logical_models WHERE enabled", 19)
+	assertInt64(t, db, "SELECT COUNT(*) FROM model_routes WHERE provider IN ('chatgpt','byteplus','adobe','runway','grok','oreate')", 27)
+	assertInt64(t, db, "SELECT COUNT(*) FROM model_routes WHERE provider = 'custom'", 19)
 	assertInt64(t, db, "SELECT COUNT(*) FROM account_model_routes WHERE account_id = 'custom-specified'", 2)
-	assertInt64(t, db, "SELECT COUNT(*) FROM account_model_routes WHERE account_id = 'custom-all'", 24)
+	assertInt64(t, db, "SELECT COUNT(*) FROM account_model_routes WHERE account_id = 'custom-all'", 19)
 	assertInt64(t, db, `
 		SELECT COUNT(*)
 		FROM account_model_routes
@@ -239,7 +242,11 @@ func assertClosedCatalogAndCustomRoutes(t *testing.T, db *gorm.DB) {
 		SELECT COUNT(*)
 		FROM model_routes
 		WHERE provider = 'custom'
-		  AND quota_costs = '{"mode":"unmetered"}'::jsonb`, 24)
+		  AND quota_costs = '{"mode":"unmetered"}'::jsonb`, 19)
+	assertInt64(t, db, `
+		SELECT COUNT(*)
+		FROM logical_models
+		WHERE id IN ('luma-ray','runway-gen-4-turbo','runway-gen-4.5','veo-3.1','veo-3.1-lite')`, 0)
 	assertInt64(t, db, `
 		SELECT COUNT(*)
 		FROM model_routes

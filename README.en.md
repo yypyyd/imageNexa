@@ -65,7 +65,7 @@ Errors use the OpenAI shape:
 
 ## Closed Canonical Model Catalog
 
-`GET /v1/models` returns only these 24 public IDs. Provider model names and route IDs are internal adapter details and are invalid as API `model` values.
+`GET /v1/models` returns only these 19 public IDs. Provider model names and route IDs are internal adapter details and are invalid as API `model` values.
 
 ### Text (4)
 
@@ -83,21 +83,16 @@ Errors use the OpenAI shape:
 - `nano-banana-pro`
 - `grok-imagine-image`
 
-### Video (14)
+### Video (9)
 
-- `veo-3.1`
-- `veo-3.1-lite`
 - `kling-3`
 - `kling-o3`
-- `runway-gen-4.5`
-- `runway-gen-4-turbo`
 - `seedance-2.0`
 - `seedance-2.0-fast`
 - `seedance-2.0-mini`
 - `seedance-1.5-pro`
 - `seedance-2.5`
 - `grok-imagine-video`
-- `luma-ray`
 - `firefly-video`
 
 ## Unified Routing and Account Scheduling
@@ -226,7 +221,7 @@ curl https://api.example.com/v1/videos \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: video-order-001" \
-  -d '{"model":"veo-3.1","prompt":"Slow dolly through a neon alley","seconds":8,"size":"1280x720"}'
+  -d '{"model":"kling-3","prompt":"Slow dolly through a neon alley","seconds":8,"size":"1280x720"}'
 ```
 
 For images, `Prefer: respond-async` returns `202`; poll `/v1/images/tasks` with the returned `request_id`. Even without that preference, an upstream-accepted image that is still processing returns `202` immediately so a reverse-proxy timeout cannot hide its recovery handle. Image edits accept PNG, JPEG, GIF, or WebP references; `mask`, `background`, and `output_format` are explicitly rejected instead of silently ignored. Videos are always task-based: poll `/v1/videos/:id` until `completed`, then request `/content`.

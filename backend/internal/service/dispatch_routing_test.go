@@ -39,10 +39,9 @@ func TestEvaluateRouteCostUsesRequestSpecificProviderRules(t *testing.T) {
 		{name: "seedream pro wide with refs", routeID: "image.seedream-5.0-pro.byteplus", req: model.RouteRequirements{Operation: "edit", Ratio: "16:9", Resolution: "2K", ReferenceImages: 3}, want: 9.6, known: true},
 		{name: "seedream pro square with refs", routeID: "image.seedream-5.0-pro.byteplus", req: model.RouteRequirements{Operation: "edit", Ratio: "1:1", Resolution: "2K", ReferenceImages: 3}, want: 18.6, known: true},
 		{name: "nano 4k", routeID: "image.nano-banana-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "1:1", Resolution: "4K"}, want: 24, known: true},
-		{name: "runway ten seconds", routeID: "video.runway-gen-4-turbo.runway", req: model.RouteRequirements{Operation: "generation", Duration: "10s"}, want: 50, known: true},
 		{name: "oreate tier and audio", routeID: "video.seedance-2.0.oreate", req: model.RouteRequirements{Operation: "generation", Resolution: "720p", Duration: "10s", GenerateAudio: true}, want: 270, known: true},
 		{name: "oreate reference duration remains unknown until decode", routeID: "video.seedance-2.0.oreate", req: model.RouteRequirements{Operation: "generation", Resolution: "720p", Duration: "10s", ReferenceVideos: 1}, want: 0, known: false},
-		{name: "adobe does not invent cost", routeID: "video.veo-3.1.adobe", req: model.RouteRequirements{Operation: "generation", Resolution: "1080p", Duration: "8s", GenerateAudio: true}, want: 0, known: false},
+		{name: "adobe does not invent cost", routeID: "video.kling-3.adobe", req: model.RouteRequirements{Operation: "generation", Resolution: "1080p", Duration: "8s", GenerateAudio: true}, want: 0, known: false},
 	}
 
 	for _, test := range tests {

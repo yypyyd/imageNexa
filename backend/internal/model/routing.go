@@ -239,12 +239,6 @@ func videoProfile(ratios, resolutions, durations []string, maxImages, maxVideos,
 		MaxReferenceMedia: maxMedia, SupportsAudioOutput: audio, ReferenceMode: mode}
 }
 
-func requiredVideoProfile(ratios, resolutions, durations []string, maxImages int) CapabilityProfile {
-	profile := videoProfile(ratios, resolutions, durations, maxImages, 0, 0, 0, false, "frame")
-	profile.RequiresReference = true
-	return profile
-}
-
 func secondsRange(first, last int) []string {
 	out := make([]string, 0, last-first+1)
 	for i := first; i <= last; i++ {
@@ -299,23 +293,11 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 			route("image.grok-imagine-image.grok", "grok-imagine-image", "grok", "grok-imagine-image", "grok-imagine-image", 100, imageProfile([]string{"2:3", "3:2", "1:1", "9:16", "16:9"}, []string{"1K"}, 0)),
 		}},
 
-		{Model: LogicalModel{ID: "veo-3.1", Kind: "video", Name: "Veo 3.1", Enabled: true}, Routes: []ModelRoute{
-			route("video.veo-3.1.adobe", "veo-3.1", "adobe", "gemini-veo31", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"720p", "1080p"}, []string{"4s", "6s", "8s"}, 2, 0, 0, 0, true, "frame")),
-		}},
-		{Model: LogicalModel{ID: "veo-3.1-lite", Kind: "video", Name: "Veo 3.1 Lite", Enabled: true}, Routes: []ModelRoute{
-			route("video.veo-3.1-lite.adobe", "veo-3.1-lite", "adobe", "gemini-veo31-lite", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"720p", "1080p"}, []string{"4s", "6s", "8s"}, 2, 0, 0, 0, false, "frame")),
-		}},
 		{Model: LogicalModel{ID: "kling-3", Kind: "video", Name: "Kling 3", Enabled: true}, Routes: []ModelRoute{
 			route("video.kling-3.adobe", "kling-3", "adobe", "firefly-kling-3", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"720p", "1080p"}, secondsRange(3, 15), 1, 1, 0, 0, true, "frame")),
 		}},
 		{Model: LogicalModel{ID: "kling-o3", Kind: "video", Name: "Kling O3", Enabled: true}, Routes: []ModelRoute{
 			route("video.kling-o3.adobe", "kling-o3", "adobe", "firefly-kling-o3", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"720p", "1080p"}, secondsRange(3, 15), 1, 1, 0, 0, true, "frame")),
-		}},
-		{Model: LogicalModel{ID: "runway-gen-4.5", Kind: "video", Name: "Runway Gen-4.5", Enabled: true}, Routes: []ModelRoute{
-			route("video.runway-gen-4.5.adobe", "runway-gen-4.5", "adobe", "firefly-runway-4.5", "", 100, videoProfile([]string{"16:9"}, []string{"720p"}, []string{"5s", "8s", "10s"}, 1, 0, 0, 0, false, "frame")),
-		}},
-		{Model: LogicalModel{ID: "runway-gen-4-turbo", Kind: "video", Name: "Runway Gen-4 Turbo", Enabled: true}, Routes: []ModelRoute{
-			route("video.runway-gen-4-turbo.runway", "runway-gen-4-turbo", "runway", "runway-gen4-turbo", "gen4_turbo", 100, requiredVideoProfile([]string{"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}, []string{"720p"}, []string{"5s", "10s"}, 1)),
 		}},
 		{Model: LogicalModel{ID: "seedance-2.0", Kind: "video", Name: "Seedance 2.0", Enabled: true}, Routes: []ModelRoute{
 			route("video.seedance-2.0.adobe", "seedance-2.0", "adobe", "firefly-seedance-2", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
@@ -336,9 +318,6 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 		}},
 		{Model: LogicalModel{ID: "grok-imagine-video", Kind: "video", Name: "Grok Imagine Video", Enabled: true}, Routes: []ModelRoute{
 			route("video.grok-imagine-video.grok", "grok-imagine-video", "grok", "grok-video", "grok-imagine-video", 100, videoProfile([]string{"2:3", "3:2", "1:1", "9:16", "16:9"}, []string{"720p"}, []string{"6s", "10s"}, 6, 0, 0, 0, false, "asset")),
-		}},
-		{Model: LogicalModel{ID: "luma-ray", Kind: "video", Name: "Luma Ray", Enabled: true}, Routes: []ModelRoute{
-			route("video.luma-ray.adobe", "luma-ray", "adobe", "firefly-ray", "", 100, videoProfile([]string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "9:21"}, []string{"720p", "1080p", "4K"}, []string{"5s"}, 2, 1, 0, 0, false, "frame")),
 		}},
 		{Model: LogicalModel{ID: "firefly-video", Kind: "video", Name: "Firefly Video", Enabled: true}, Routes: []ModelRoute{
 			route("video.firefly-video.adobe", "firefly-video", "adobe", "firefly-video", "", 100, videoProfile([]string{"16:9", "1:1", "9:16"}, []string{"540p", "720p", "1080p"}, []string{"5s"}, 2, 1, 0, 0, false, "frame")),

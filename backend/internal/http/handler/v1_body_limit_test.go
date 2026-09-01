@@ -20,7 +20,7 @@ func TestCreateVideoRejectsSpoofedJSONInputReference(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
 	spoof := base64.StdEncoding.EncodeToString([]byte("not an image"))
-	body := `{"model":"veo-3.1","prompt":"test","seconds":8,"input_reference":["` + spoof + `"]}`
+	body := `{"model":"kling-3","prompt":"test","seconds":8,"input_reference":["` + spoof + `"]}`
 	context.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(body))
 	context.Request.Header.Set("Content-Type", "application/json")
 

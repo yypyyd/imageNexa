@@ -31,8 +31,8 @@ func TestLoadMigrationsIsOrderedAndChecksummed(t *testing.T) {
 	if len(migrations) == 0 {
 		t.Fatal("Load() returned no migrations")
 	}
-	if len(migrations) != 4 {
-		t.Fatalf("Load() returned %d migrations, want 4", len(migrations))
+	if len(migrations) != 5 {
+		t.Fatalf("Load() returned %d migrations, want 5", len(migrations))
 	}
 	hexChecksum := regexp.MustCompile(`^[0-9a-f]{64}$`)
 	for index, migration := range migrations {
@@ -47,6 +47,20 @@ func TestLoadMigrationsIsOrderedAndChecksummed(t *testing.T) {
 		}
 		if strings.Contains(migration.SQL, "\r") {
 			t.Fatalf("migration %s is not LF-only", migration.Filename)
+		}
+	}
+}
+
+func TestRetiredVideoModelMigrationPreservesHistoryTombstones(t *testing.T) {
+	sql := loadedMigrationSQL(t, 5)
+	for _, required := range []string{
+		"luma-ray", "runway-gen-4-turbo", "runway-gen-4.5", "veo-3.1", "veo-3.1-lite",
+		"UPDATE logical_models", "UPDATE model_routes", "DELETE FROM account_model_routes",
+		"DELETE FROM model_routes AS route", "DELETE FROM logical_models AS logical",
+		"NOT EXISTS", "FROM dispatch_attempts AS attempt",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("retired-video migration missing %q", required)
 		}
 	}
 }
@@ -152,18 +166,33 @@ func TestQuotaCostMigrationClosesCatalogAndMergesAdobeAllowance(t *testing.T) {
 			want[strings.Join([]string{route.ID, route.LogicalModelID, route.Provider, route.RuntimeModel, route.UpstreamModel}, "\x00")] = struct{}{}
 		}
 	}
-	if len(want) != 32 {
-		t.Fatalf("Go catalog contains %d routes, want 32", len(want))
+	if len(want) != 27 {
+		t.Fatalf("Go catalog contains %d routes, want 27", len(want))
+	}
+	retired := map[string]struct{}{
+		strings.Join([]string{"video.veo-3.1.adobe", "veo-3.1", "adobe", "gemini-veo31", ""}, "\x00"):                                        {},
+		strings.Join([]string{"video.veo-3.1-lite.adobe", "veo-3.1-lite", "adobe", "gemini-veo31-lite", ""}, "\x00"):                         {},
+		strings.Join([]string{"video.runway-gen-4.5.adobe", "runway-gen-4.5", "adobe", "firefly-runway-4.5", ""}, "\x00"):                    {},
+		strings.Join([]string{"video.runway-gen-4-turbo.runway", "runway-gen-4-turbo", "runway", "runway-gen4-turbo", "gen4_turbo"}, "\x00"): {},
+		strings.Join([]string{"video.luma-ray.adobe", "luma-ray", "adobe", "firefly-ray", ""}, "\x00"):                                       {},
 	}
 	for _, match := range matches {
 		key := strings.Join(match[1:], "\x00")
-		if _, ok := want[key]; !ok {
-			t.Fatalf("SQL canonical route tuple is absent from Go catalog: %q", match[0])
+		if _, ok := want[key]; ok {
+			delete(want, key)
+			continue
 		}
-		delete(want, key)
+		if _, ok := retired[key]; ok {
+			delete(retired, key)
+			continue
+		}
+		t.Fatalf("SQL canonical route tuple is neither current nor retired: %q", match[0])
 	}
 	if len(want) != 0 {
 		t.Fatalf("SQL canonical route allowlist is missing %d Go catalog routes", len(want))
+	}
+	if len(retired) != 0 {
+		t.Fatalf("historical SQL allowlist is missing %d routes retired by migration 000005", len(retired))
 	}
 	if strings.Contains(sql, "route.enabled = TRUE") {
 		t.Fatal("canonical route allowlist must not classify disabled routes as invalid")

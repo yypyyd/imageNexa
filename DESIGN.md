@@ -101,7 +101,7 @@ The catalog is versioned data, not a user-extensible namespace. Startup settings
 
 ### Video
 
-`veo-3.1`, `veo-3.1-lite`, `kling-3`, `kling-o3`, `runway-gen-4.5`, `runway-gen-4-turbo`, `seedance-2.0`, `seedance-2.0-fast`, `seedance-2.0-mini`, `seedance-1.5-pro`, `seedance-2.5`, `grok-imagine-video`, `luma-ray`, `firefly-video`
+`kling-3`, `kling-o3`, `seedance-2.0`, `seedance-2.0-fast`, `seedance-2.0-mini`, `seedance-1.5-pro`, `seedance-2.5`, `grok-imagine-video`, `firefly-video`
 
 A provider implementation is represented by a `ModelRoute`, not by another public model. For example, `gpt-image-2` may have ChatGPT, BytePlus, and Adobe routes, but clients always request `gpt-image-2`. Likewise, multiple providers can serve `nano-banana-2` without introducing prefixed aliases.
 
@@ -290,7 +290,7 @@ docker compose config
 
 Contract tests must assert:
 
-- the model set is exactly 4 text + 6 image + 14 video IDs;
+- the model set is exactly 4 text + 6 image + 9 video IDs;
 - provider-prefixed and unknown model IDs are rejected;
 - every `/v1` endpoint rejects missing, malformed, disabled, or revoked Bearer keys;
 - one administrator can be initialized and a second cannot;
@@ -312,6 +312,14 @@ Contract tests must assert:
 - Long image/video requests need outer-proxy timeouts compatible with Nginx and should use idempotency or asynchronous task mode.
 
 ## 15. Change record
+
+### 2026-09-01 — Retire five unused video models
+
+**Change**: Removed `luma-ray`, `runway-gen-4-turbo`, `runway-gen-4.5`, `veo-3.1`, and `veo-3.1-lite` from the closed public catalog, request validation, administrator model list, documentation, and account-route bindings. Migration 000005 physically deletes unreferenced routes while retaining disabled tombstones if immutable dispatch history exists.
+
+**Reason**: These models are not part of the product's supported downstream surface and keeping them visible makes model selection and account inventory harder to operate.
+
+**Impact**: The public catalog is now 19 models (4 text, 6 image, 9 video). Requests using a retired ID receive `model_not_found`; historical event rows remain readable.
 
 ### 2026-09-01 — 2API product lock
 

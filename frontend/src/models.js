@@ -15,19 +15,14 @@ export const IMAGE_MODELS = Object.freeze([
 ])
 
 export const VIDEO_MODELS = Object.freeze([
-  'veo-3.1',
-  'veo-3.1-lite',
   'kling-3',
   'kling-o3',
-  'runway-gen-4.5',
-  'runway-gen-4-turbo',
   'seedance-2.0',
   'seedance-2.0-fast',
   'seedance-2.0-mini',
   'seedance-1.5-pro',
   'seedance-2.5',
   'grok-imagine-video',
-  'luma-ray',
   'firefly-video',
 ])
 
