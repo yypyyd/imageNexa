@@ -95,13 +95,46 @@ func TestPartnerSubmitOmitsUnsignedARPSessionHeader(t *testing.T) {
 	token := "e30.eyJ1c2VyX2lkIjoidXNlciJ9.signature"
 
 	t.Run("image", func(t *testing.T) {
-		_, _, err := client.submitImage(context.Background(), sess, token, "prompt", server.URL, map[string]any{"prompt": "prompt"})
+		_, _, err := client.submitImage(context.Background(), sess, token, "", "prompt", server.URL, map[string]any{"prompt": "prompt"})
 		if err != nil {
 			t.Fatal(err)
 		}
 	})
 	t.Run("video", func(t *testing.T) {
-		_, _, err := client.submitVideo(context.Background(), sess, token, server.URL, map[string]any{"prompt": "prompt"})
+		_, _, err := client.submitVideo(context.Background(), sess, token, "", server.URL, map[string]any{"prompt": "prompt"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPartnerSubmitIncludesAdobeARPSessionHeader(t *testing.T) {
+	const arpSessionToken = "adobe-issued-arp-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("x-arp-session-id"); got != arpSessionToken {
+			t.Errorf("x-arp-session-id = %q, want imported Adobe ARP token", got)
+		}
+		w.Header().Set("x-override-status-link", "https://poll.example/result")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client := NewClient("test", "")
+	sess, err := client.newSubmitTLSClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "e30.eyJ1c2VyX2lkIjoidXNlciJ9.signature"
+
+	t.Run("image", func(t *testing.T) {
+		_, _, err := client.submitImage(context.Background(), sess, token, arpSessionToken, "prompt", server.URL, map[string]any{"prompt": "prompt"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("video", func(t *testing.T) {
+		_, _, err := client.submitVideo(context.Background(), sess, token, arpSessionToken, server.URL, map[string]any{"prompt": "prompt"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -131,7 +164,7 @@ func TestSubmitImageHasNoGlobalGateOrPacing(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, submitErr := client.submitImage(context.Background(), sess, "token", "prompt", server.URL, map[string]any{"prompt": "test"})
+			_, _, submitErr := client.submitImage(context.Background(), sess, "token", "", "prompt", server.URL, map[string]any{"prompt": "test"})
 			errs <- submitErr
 		}()
 	}
@@ -169,7 +202,7 @@ func TestSystemUnderLoadRemainsTemporaryWithoutBreaker(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		_, _, submitErr := client.submitImage(context.Background(), sess, "token", "prompt", server.URL, map[string]any{"prompt": "test"})
+		_, _, submitErr := client.submitImage(context.Background(), sess, "token", "", "prompt", server.URL, map[string]any{"prompt": "test"})
 		if !errors.Is(submitErr, ErrTemporaryUpstream) {
 			t.Fatalf("attempt %d error = %v, want ErrTemporaryUpstream", i+1, submitErr)
 		}

@@ -31,8 +31,8 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(migrations) != 5 {
-		t.Fatalf("loaded %d migrations, want 5", len(migrations))
+	if len(migrations) != 7 {
+		t.Fatalf("loaded %d migrations, want 7", len(migrations))
 	}
 
 	sqlDB, err := db.DB()
@@ -66,6 +66,12 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err := applyOne(ctx, conn, migrations[4]); err != nil {
 		t.Fatalf("apply migration 000005: %v", err)
 	}
+	if err := applyOne(ctx, conn, migrations[5]); err != nil {
+		t.Fatalf("apply migration 000006: %v", err)
+	}
+	if err := applyOne(ctx, conn, migrations[6]); err != nil {
+		t.Fatalf("apply migration 000007: %v", err)
+	}
 
 	assertLegacyIdentity(t, db)
 	assertClosedCatalogAndCustomRoutes(t, db)
@@ -74,6 +80,7 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	assertEventIdentityColumns(t, db)
 	assertLegacyIdentityScrubbed(t, db)
 	assertLegacyTablesRemoved(t, db)
+	assertAdobeARPSessionsBackfilled(t, db)
 
 	// A normal second startup must be a checksum-validated no-op.
 	if err := conn.Close(); err != nil {
@@ -82,8 +89,8 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err := Run(ctx, db); err != nil {
 		t.Fatalf("second migration Run() error = %v", err)
 	}
-	assertInt64(t, db, "SELECT COUNT(*) FROM schema_migrations", 5)
-	assertInt64(t, db, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", 5)
+	assertInt64(t, db, "SELECT COUNT(*) FROM schema_migrations", 7)
+	assertInt64(t, db, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", 7)
 }
 
 func TestPostgresDisabledAdminRemainsBootstrapable(t *testing.T) {
@@ -312,6 +319,22 @@ func assertAdobeQuotaMerge(t *testing.T, db *gorm.DB) {
 		SELECT COUNT(*)
 		FROM model_routes
 		WHERE provider = 'adobe' AND quota_bucket_key <> 'adobe.credits'`, 0)
+}
+
+func assertAdobeARPSessionsBackfilled(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, query := range []string{
+		`SELECT arp_session_token FROM provider_accounts WHERE id = 'adobe-main'`,
+		`SELECT arp_session_token FROM refresh_profiles WHERE id = 'keep-adobe'`,
+	} {
+		var token string
+		if err := db.Raw(query).Scan(&token).Error; err != nil {
+			t.Fatalf("read backfilled Adobe ARP token: %v", err)
+		}
+		if !strings.HasPrefix(token, "eyJzaWQiOiI") {
+			t.Fatalf("backfilled Adobe ARP token has unexpected shape: %q", token)
+		}
+	}
 }
 
 func assertRetiredDataScrubbed(t *testing.T, db *gorm.DB) {

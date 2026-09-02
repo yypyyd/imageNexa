@@ -29,6 +29,89 @@ func NewV1Handler(v1 *service.V1Service) *V1Handler {
 	return &V1Handler{v1: v1}
 }
 
+// AdminTest restores the account-row capability probe. It is registered only
+// inside the administrator session + CSRF group, never on the public /v1 API.
+func (h *V1Handler) AdminTest(c *gin.Context) {
+	var body struct {
+		Model      string `json:"model"`
+		Prompt     string `json:"prompt"`
+		Ratio      string `json:"ratio"`
+		Resolution string `json:"resolution"`
+		Duration   string `json:"duration"`
+		AccountID  string `json:"account_id"`
+	}
+	if !bindAdminJSON(c, &body, "invalid request body") {
+		return
+	}
+	result, err := h.v1.PrepareAdminTest(c.Request.Context(), service.AdminTestRequest{
+		Model: body.Model, Prompt: body.Prompt, AspectRatio: body.Ratio,
+		Resolution: body.Resolution, Duration: body.Duration, AccountID: body.AccountID,
+	})
+	if err != nil {
+		adminTestError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// AdminTestArtifact streams only artifacts created by an administrator test.
+// The surrounding router group authenticates the admin session before this
+// handler is reached; event ownership then rejects ordinary API-key artifacts.
+func (h *V1Handler) AdminTestArtifact(c *gin.Context) {
+	principal := &service.APIPrincipal{TokenType: "admin"}
+	body, contentType, imageErr := h.v1.OpenImageContent(c.Request.Context(), principal, c.Param("id"))
+	if imageErr != nil {
+		body, contentType, imageErr = h.v1.OpenVideoContent(c.Request.Context(), principal, c.Param("id"))
+	}
+	if imageErr != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "test artifact not found"})
+		return
+	}
+	defer body.Close()
+	c.Header("Content-Type", contentType)
+	c.Header("Cache-Control", "private, no-store")
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, body)
+}
+
+// AdminArtifact restores the administrator log/gallery preview. The route is
+// session protected and the service resolves the event's original API-key
+// ownership internally, so no downstream bearer credential is exposed to the
+// browser.
+func (h *V1Handler) AdminArtifact(c *gin.Context) {
+	body, contentType, err := h.v1.OpenAdminArtifact(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "artifact not found"})
+		return
+	}
+	defer body.Close()
+	c.Header("Content-Type", contentType)
+	c.Header("Cache-Control", "private, no-store")
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, body)
+}
+
+func adminTestError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, service.ErrUnknownModel):
+		c.JSON(http.StatusNotFound, gin.H{"detail": "测试模型不存在或未启用"})
+	case errors.Is(err, service.ErrUnsupportedParams):
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "测试参数不受该模型支持"})
+	case errors.Is(err, service.ErrContentRejected), errors.Is(err, service.ErrBannedPrompt):
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "测试内容被拒绝"})
+	case errors.Is(err, service.ErrProviderQuota), errors.Is(err, service.ErrInsufficientFunds):
+		c.JSON(http.StatusTooManyRequests, gin.H{"detail": "所选账号额度不足"})
+	case errors.Is(err, service.ErrProviderAuth):
+		c.JSON(http.StatusBadGateway, gin.H{"detail": "所选账号凭据失效"})
+	case errors.Is(err, service.ErrNoProviderAccount):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "所选账号不能执行该模型"})
+	case errors.Is(err, service.ErrProviderDisabled):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "该模型的所有平台均已在系统设置中停用"})
+	default:
+		c.JSON(http.StatusBadGateway, gin.H{"detail": "账号能力测试失败"})
+	}
+}
+
 // apiPrincipal reuses the credential that RequireAPICredential already
 // authenticated. Re-reading and hashing the bearer token in every handler
 // doubled database traffic and created two independent auth decisions for one
@@ -613,6 +696,8 @@ func v1ErrorResponse(err error, payload map[string]any) (int, any) {
 		return http.StatusRequestEntityTooLarge, openaiErrorResponse("invalid_request_error", "request_too_large", "Reference media is too large.")
 	case errors.Is(err, service.ErrNoProviderAccount):
 		return http.StatusServiceUnavailable, openaiErrorResponse("server_error", "", "No upstream provider account is currently available.")
+	case errors.Is(err, service.ErrProviderDisabled):
+		return http.StatusServiceUnavailable, openaiErrorResponse("server_error", "provider_disabled", "All upstream providers for this model are currently disabled.")
 	case errors.Is(err, service.ErrProviderAuth):
 		return http.StatusServiceUnavailable, openaiErrorResponse("server_error", "", "Upstream provider authentication failed.")
 	case errors.Is(err, service.ErrProviderQuota):

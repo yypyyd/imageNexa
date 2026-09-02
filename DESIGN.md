@@ -183,7 +183,8 @@ Outcome rules:
 | Authentication failure | release | disable affected credential or binding | allowed |
 | Quota exhausted | settle/reconcile actual balance | remove affected account/bucket from eligible set | allowed |
 | Accepted and completed | settle with fresh balance | update success and quota snapshot | no further route |
-| Accepted then polling/download error | settle conservatively and refresh | keep original task/account | never resubmit |
+| Accepted then transient polling/download error | settle conservatively and refresh | keep original task/account and resume it | never resubmit |
+| Accepted then explicit terminal provider failure | settle conservatively and refresh | close event/dispatch as failed without permanently disabling the account | never resubmit |
 | Submission outcome unknown | mark uncertain | schedule reconciliation | never resubmit |
 
 The administrator may explicitly refresh an account. Import also performs identity and quota validation before returning success. Background maintenance can refresh due accounts, but it supplements rather than replaces per-generation reconciliation.
@@ -211,6 +212,12 @@ The Cookie must include a non-empty `csrfToken` and valid session data. A standa
 
 The Cookie is stored only in private account credential storage. It must never appear in event logs, model discovery, content URLs, errors, or administrator list responses.
 
+### Adobe credential rule
+
+Adobe continues to accept a Cookie as the refresh credential. When no ARP value is imported, the gateway reproduces SherlockSdk's initial local session token: compact JSON containing a random v4 UUID under `sid`, encoded with standard padded Base64. This initial callback happens before Adobe's optional Forter/BFP browser vendors finish and therefore requires no upstream request. A structured browser export may still carry a richer ARP token under `x-arp-session-id` or a supported field alias; imported values take precedence. The token is stored in dedicated private columns on the provider account and its refresh profile, survives access-token refresh and plain-Cookie re-imports, and is attached only to image/video generation submission requests.
+
+The Cookie and ARP token are administrator-supplied secrets. Neither may be serialized by account/profile models, copied into general JSON metadata, included in event errors, or logged. The trust boundary ends at the Adobe generation endpoint; profile, credits, upload, polling, and artifact-download requests do not receive the ARP header without separate protocol evidence.
+
 ## 9. Administrator control plane
 
 The administrator lifecycle has three public session actions under `/admin/api/auth`: status, one-time initialization, and login. Initialization is serialized by the singleton database constraint. Authenticated actions include logout, password change, API credential management, logical models/routes, accounts, logs/artifacts, settings, banned words, and hit records.
@@ -226,7 +233,11 @@ Security rules:
 - no administrator token, password, or session secret in localStorage;
 - admin CORS is allowlist-based and permits credentials only for configured origins.
 
-The SPA contains only the administrator views: overview, models, accounts, API Key, logs/artifacts, banned words, settings, and API documentation.
+The SPA contains only the administrator views: overview, models, accounts, API Key, logs/artifacts, banned words, settings, and API documentation. The account inventory includes an explicit capability test action: it can run only a canonical model already authorized for that account, pins dispatch to that account, bypasses downstream charging, and serves resulting media only through the authenticated administrator control plane.
+
+### Provider switches
+
+Settings expose one enable switch per provider pool (`provider.<pool>.enabled`, surfaced as `providers_enabled` in the settings API). A pool is enabled unless the administrator stores an explicit false-like value, so existing deployments keep every pool schedulable. The switch is enforced at the single route-matching chokepoint used by text, image, video dispatch and the preflight availability probe: routes whose provider is switched off are removed before any account is read, reserved, or contacted. Routes, account bindings, and account state are left untouched, so re-enabling a pool restores it immediately. When capability matching finds routes but every one of them belongs to a disabled pool, the request fails with `provider_disabled` rather than being misreported as unsupported parameters or spending upstream retries.
 
 ## 10. Data-plane security boundaries
 
@@ -312,6 +323,68 @@ Contract tests must assert:
 - Long image/video requests need outer-proxy timeouts compatible with Nginx and should use idempotency or asynchronous task mode.
 
 ## 15. Change record
+
+### 2026-09-02 — Per-provider scheduling switches
+
+**Change**: The settings page gains one enable switch per provider pool. Disabled pools are filtered out at route matching, the shared entry point for text, image, video dispatch and the availability preflight, so their accounts are never selected. The settings API reads and writes them as `providers_enabled`.
+
+**Reason**: Adobe's third-party image gateway currently rejects every server-originated submission with a disguised `408 system under load`. With Adobe left as a live fallback route, a request whose higher-priority providers were filtered out spent dozens of account retries against Adobe before failing. Operators need a way to take a whole provider out of rotation without deleting routes or accounts.
+
+**Impact**: Default is enabled for every pool, so behaviour is unchanged until an administrator turns a pool off. Turning one off is immediate for new requests and reversible; route definitions, account bindings, cooldowns and quota snapshots are untouched. A model whose every capable route is disabled now returns `provider_disabled` instead of `unsupported parameters`.
+
+**Security decision**: Switch values are plain booleans in the existing settings store. The public API learns only that no provider is available, never which pools exist or their state.
+
+### 2026-09-02 — Preserve Adobe ARP session credentials
+
+**Change**: Structured Adobe imports now retain an Adobe-issued ARP session token in private provider-account and refresh-profile columns. Access-token refresh and later Cookie-only imports preserve it, while image/video generation submissions conditionally send it as `x-arp-session-id`.
+
+**Reason**: The previous smart importer reduced Adobe JSON to a Cookie string, so valid session context was discarded before the provider request. Adobe generation submission now supports this session header even though profile and credit endpoints continue to work without it.
+
+**Impact**: Existing Cookie-only accounts are backfilled with the same base session shape emitted by SherlockSdk, while richer imported ARP values remain intact. No extra proxy request is made; only the negligible generation-request header is added. The value is never returned through the administrator or public API.
+
+**Security decision**: ARP is treated as write-only credential material, stored outside public metadata and sent only to Adobe generation submission endpoints. Empty input never overwrites a previously retained token.
+
+### 2026-09-02 — Generate Adobe's base ARP session locally
+
+**Change**: Reverse-engineering the current UniversalNav `ArpService` and commerce `SherlockSdk` showed that the first ARP callback is not an IMS response or signed server token. SherlockSdk immediately emits padded Base64 of compact `{\"sid\":\"<random-v4-uuid>\"}` JSON, then may asynchronously add Forter/BFP vendor fields. Imports now create and persist that base token when none was supplied, refresh repairs legacy empty rows, and migration 000007 backfills existing Adobe accounts and profiles.
+
+**Reason**: Adobe generation submissions increasingly expect `x-arp-session-id`, but running the full Firefly page or fingerprint vendors merely to obtain the base session would add proxy traffic and operational fragility without changing the initial token semantics.
+
+**Impact**: Basic ARP acquisition is local and effectively traffic-free. Existing structured exports with richer tokens still win and plain-Cookie re-imports preserve the stored session.
+
+**Security decision**: Generated ARP values remain write-only secrets. The implementation does not execute third-party fingerprint scripts, send browser telemetry, or expose session values in logs or APIs.
+
+### 2026-09-01 — Restore retained control-plane operations after the rebuild
+
+**Change**: Restored account inventory details and actions that remain valid in the 2API product: per-account success/failure counters, created/last-used timestamps, batch selection/deletion, dead-account cleanup, expandable quota-bucket and failure details, image/video limit markers, and per-account canonical route authorization switches. Restored custom OpenAI-compatible upstream add/edit, account- and model-level pinned capability testing, retained operational overview analytics, and banned-word batch deletion. Restored log type/source filters, source badges, prompt/error copy actions, successful artifact previews, and corrected model capability rendering for array-backed route profiles.
+
+**Reason**: The compact control-plane rebuild retained the corresponding database fields and administrator APIs but omitted their UI surfaces. The artifact gallery also emitted private object keys as if the retired public `/images` handler still existed, so ordinary API-key artifacts could not be previewed by an administrator.
+
+**Impact**: Operators regain the retained account, model-test, operational-health, blocklist, and audit workflows without reintroducing the deliberately retired public-user, billing, payment, invitation, or playground product. Custom upstream keys are write-only in the browser and their public HTTPS base URL remains SSRF-validated. Artifact bytes are streamed only through the authenticated administrator session and reuse the existing provider-aware ownership and SSRF checks; private object keys and downstream API secrets are not exposed.
+
+### 2026-09-01 — Restore pinned account capability testing
+
+**Change**: Restored the account-row capability-test action and its text/image/video result dialog. Tests use only canonical models already authorized for the selected account and are pinned to that account rather than the normal provider pool.
+
+**Reason**: The 2API control-plane rebuild removed the previous account-test UI even though operators still need to verify one credential independently of scheduler failover.
+
+**Impact**: Administrators can test an individual account again without creating or charging a downstream API credential. The mutation endpoint requires the normal administrator session and CSRF token; generated test artifacts are available only through an administrator-session-protected endpoint and cannot expose ordinary API-key artifacts.
+
+### 2026-09-01 — Restore request intent and dimensions in logs
+
+**Change**: Restored prompt, ratio, resolution, duration, reference count, and DeAI metadata to administrator log and artifact responses and their corresponding table/card views.
+
+**Reason**: The control-plane rebuild kept the fields in durable event storage and search predicates but omitted them from serialized log rows, leaving operators unable to see the user's original request intent or requested output size.
+
+**Impact**: The administrator-only log view again shows the submitted prompt and normalized size parameters. No credential or provider response body is exposed, and existing retention policy remains unchanged.
+
+### 2026-09-01 — Close accepted BytePlus terminal failures
+
+**Change**: BytePlus tasks that have been accepted and later report an explicit terminal failure now close their event and dispatch rows as failed instead of remaining recoverable forever. Transient polling and artifact-download errors still resume the same upstream task, and the artifact gallery now includes only successful rows with an artifact path.
+
+**Reason**: A preallocated object path is not proof of a completed artifact, and an upstream terminal failure cannot succeed through further polling. Treating both as incomplete state produced contradictory administration rows and unbounded downstream status polling.
+
+**Impact**: Failed BytePlus generations stop at a sanitized `provider request failed` result without route/account failover or duplicate resubmission. Pending rows display as processing, failed rows display as failed, and unsuccessful preallocated paths no longer appear as completed artifacts.
 
 ### 2026-09-01 — Retire five unused video models
 

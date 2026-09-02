@@ -54,8 +54,25 @@ func dispatchRouteFromContext(ctx context.Context) string {
 	return strings.TrimSpace(plan.Route.ID)
 }
 
+// matchingRoutes returns the capability-matched routes for a canonical model,
+// minus any whose provider pool an administrator has switched off. Every
+// dispatch path (text, image, video and the preflight availability probe) goes
+// through here, so a disabled provider is never scheduled anywhere.
 func (s *V1Service) matchingRoutes(ctx context.Context, logicalID string, req model.RouteRequirements) ([]model.ModelRoute, error) {
-	return s.models.Routes().MatchRoutes(ctx, logicalID, req)
+	routes, err := s.models.Routes().MatchRoutes(ctx, logicalID, req)
+	if err != nil {
+		return nil, err
+	}
+	enabled, err := filterEnabledProviderRoutes(ctx, s.settings, routes)
+	if err != nil {
+		return nil, err
+	}
+	// Capability matching found routes, but the administrator closed every pool
+	// behind them. Report that precisely instead of blaming the request.
+	if len(routes) > 0 && len(enabled) == 0 {
+		return nil, ErrProviderDisabled
+	}
+	return enabled, nil
 }
 
 func (s *V1Service) routeHasAccount(ctx context.Context, route model.ModelRoute, kind string) (bool, error) {

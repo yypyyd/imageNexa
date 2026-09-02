@@ -70,7 +70,7 @@ func TestV1CORSPreflightDoesNotRequireBearerCredential(t *testing.T) {
 	}
 }
 
-func TestRetiredAccountTestRouteIsNotRegistered(t *testing.T) {
+func TestAdministratorArtifactRoutesAreSessionProtected(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := New(&config.Config{
 		AppEnv:      "development",
@@ -84,9 +84,21 @@ func TestRetiredAccountTestRouteIsNotRegistered(t *testing.T) {
 		BannedWords:    (*handler.BannedWordsHandler)(nil),
 	})
 
+	want := map[string]bool{
+		http.MethodPost + " /admin/api/test":                 false,
+		http.MethodGet + " /admin/api/test/artifacts/:id":    false,
+		http.MethodGet + " /admin/api/artifacts/:id/content": false,
+		http.MethodPost + " /admin/api/accounts/delete-dead": false,
+	}
 	for _, route := range engine.Routes() {
-		if route.Method == http.MethodPost && route.Path == "/admin/api/accounts/:id/test" {
-			t.Fatal("misleading account test route is still registered")
+		key := route.Method + " " + route.Path
+		if _, ok := want[key]; ok {
+			want[key] = true
+		}
+	}
+	for route, found := range want {
+		if !found {
+			t.Fatalf("administrator account test route %s is not registered", route)
 		}
 	}
 }

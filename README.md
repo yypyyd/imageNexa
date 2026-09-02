@@ -32,7 +32,7 @@ Authorization: Bearer sk-your-api-key
 
 不支持 `x-api-key`、Query 参数、Cookie 或自定义鉴权头。超级管理员在控制台创建或轮换 API Key；明文 Key 只显示一次，服务端只持久化哈希和预览。每个 Key 可单独设置并发上限。
 
-管理端使用 HttpOnly、SameSite=Strict 会话 Cookie。写请求还必须携带会话绑定的 `X-CSRF-Token`，管理员密码和会话凭据不会保存在浏览器 localStorage。
+管理端使用 HttpOnly、SameSite=Strict 会话 Cookie。写请求还必须携带会话绑定的 `X-CSRF-Token`，管理员密码和会话凭据不会保存在浏览器 localStorage。账号列表可将一次文本、图片或视频能力测试固定到指定上游账号；测试接口和测试产物同样只允许管理员会话访问。
 
 首次创建超级管理员还必须输入部署环境中的 `ADMIN_BOOTSTRAP_TOKEN`。初始化请求只通过固定的 `X-Admin-Bootstrap-Token` Header 传递它；管理员一旦创建，数据库单例约束会永久关闭再次初始化。
 
@@ -114,6 +114,12 @@ BytePlus 只使用 Lumina 官网的完整 Cookie 作为凭据。可以粘贴 Coo
 Cookie 必须同时包含有效会话信息和非空 `csrfToken`。单独的 CSRF 值、Bearer Token、账号密码或不完整 Cookie 都不能导入。服务端从 Cookie 派生 `X-Csrf-Token`，导入后立即向上游校验身份和真实额度，并按 BytePlus 支持的 canonical route 建立候选绑定；后续调用若得到明确的模型无权限证据，只禁用该账号对应的 route 绑定，不影响同账号的其他模型。
 
 Cookie 是高敏感凭据：不要写入日志、截图、文档、`.env` 或 Git。
+
+## Adobe 账号导入
+
+Adobe 可以继续导入纯 Cookie；系统会按 Adobe SherlockSdk 的当前协议在本地自动创建基础 `x-arp-session-id`（随机 v4 会话 UUID 的紧凑 JSON，再做标准 Base64），不需要额外代理请求。若浏览器导出 JSON 已包含更完整的 Adobe ARP 值（也兼容常见字段别名），则优先保存并沿用该值。ARP 只在图片/视频生成提交时携带，后续只重导纯 Cookie 不会清除或轮换已有会话。
+
+Cookie 和 ARP 都不会出现在账号列表、日志或 API 响应中。升级时会自动为缺失 ARP 的旧 Adobe 账号补齐基础会话，无需重新导入；浏览器侧 Forter/BFP 指纹属于异步增强信息，服务端不会为了获取它们加载整套页面资源。
 
 ## 快速部署
 

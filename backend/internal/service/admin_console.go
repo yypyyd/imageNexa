@@ -37,6 +37,7 @@ type AccountListFilter struct {
 	Query    string
 	Provider string
 	Status   string
+	ModelID  string
 	Limit    int
 	Offset   int
 }
@@ -46,6 +47,7 @@ type LogListFilter struct {
 	Model        string
 	Kind         string
 	Status       string
+	Source       string
 	Query        string
 	Artifacts    bool
 	Limit        int
@@ -53,6 +55,7 @@ type LogListFilter struct {
 }
 
 type AccountImportInput struct {
+	ID         string
 	Provider   string
 	Label      string
 	Credential any
@@ -62,6 +65,112 @@ var adminAccountProviders = []string{"chatgpt", "adobe", "byteplus", "runway", "
 
 func NewAdminConsoleService(cfg *config.Config, db *gorm.DB, models *repo.ModelRepository, tokens *repo.TokenRepository, tokenSvc *TokenService, settings *repo.SiteSettingRepository) *AdminConsoleService {
 	return &AdminConsoleService{cfg: cfg, db: db, models: models, tokens: tokens, tokenSvc: tokenSvc, settings: settings}
+}
+
+// Overview restores the retained operational dashboard without bringing back
+// the retired customer, billing, invite, or payment analytics. Aggregation is
+// performed in SQL so log retention volume does not silently truncate charts.
+func (s *AdminConsoleService) Overview(ctx context.Context) (map[string]any, error) {
+	cutoff := time.Now().Add(-24 * time.Hour)
+	type groupedCount struct {
+		Name  string `gorm:"column:name"`
+		Count int64  `gorm:"column:count"`
+	}
+	var statuses, kinds []groupedCount
+	if err := s.db.WithContext(ctx).Model(&model.EventLog{}).
+		Select("status AS name, COUNT(*) AS count").Where("ts >= ?", cutoff).Group("status").Scan(&statuses).Error; err != nil {
+		return nil, err
+	}
+	if err := s.db.WithContext(ctx).Model(&model.EventLog{}).
+		Select("kind AS name, COUNT(*) AS count").Where("ts >= ?", cutoff).Group("kind").Scan(&kinds).Error; err != nil {
+		return nil, err
+	}
+	window := map[string]any{"total": int64(0), "success": int64(0), "failed": int64(0), "pending": int64(0), "text": int64(0), "image": int64(0), "video": int64(0), "avg_elapsed_ms": float64(0)}
+	for _, row := range statuses {
+		window["total"] = window["total"].(int64) + row.Count
+		switch row.Name {
+		case "success", "succeeded":
+			window["success"] = window["success"].(int64) + row.Count
+		case "failed":
+			window["failed"] = window["failed"].(int64) + row.Count
+		default:
+			window["pending"] = window["pending"].(int64) + row.Count
+		}
+	}
+	for _, row := range kinds {
+		if _, ok := window[row.Name]; ok {
+			window[row.Name] = row.Count
+		}
+	}
+	var average struct {
+		Value float64 `gorm:"column:value"`
+	}
+	if err := s.db.WithContext(ctx).Model(&model.EventLog{}).
+		Select("COALESCE(AVG(elapsed_ms), 0) AS value").
+		Where("ts >= ? AND status IN ? AND elapsed_ms > 0", cutoff, []string{"success", "succeeded"}).Scan(&average).Error; err != nil {
+		return nil, err
+	}
+	window["avg_elapsed_ms"] = average.Value
+
+	type modelUsage struct {
+		Model string  `json:"model" gorm:"column:model"`
+		Count int64   `json:"count" gorm:"column:count"`
+		AvgMS float64 `json:"avg_ms" gorm:"column:avg_ms"`
+	}
+	var topModels []modelUsage
+	if err := s.db.WithContext(ctx).Model(&model.EventLog{}).
+		Select("model, COUNT(*) AS count, COALESCE(AVG(NULLIF(elapsed_ms, 0)), 0) AS avg_ms").
+		Where("ts >= ? AND model <> ''", cutoff).Group("model").Order("count DESC").Limit(8).Scan(&topModels).Error; err != nil {
+		return nil, err
+	}
+	type failureUsage struct {
+		Reason string `json:"reason" gorm:"column:reason"`
+		Count  int64  `json:"count" gorm:"column:count"`
+	}
+	var failures []failureUsage
+	if err := s.db.WithContext(ctx).Model(&model.EventLog{}).
+		Select("error AS reason, COUNT(*) AS count").
+		Where("ts >= ? AND status = ? AND error <> ''", cutoff, "failed").Group("error").Order("count DESC").Limit(8).Scan(&failures).Error; err != nil {
+		return nil, err
+	}
+
+	type hourlyCount struct {
+		Hour  time.Time `gorm:"column:hour"`
+		Kind  string    `gorm:"column:kind"`
+		Count int64     `gorm:"column:count"`
+	}
+	var hourlyRows []hourlyCount
+	if err := s.db.WithContext(ctx).Model(&model.EventLog{}).
+		Select("date_trunc('hour', ts) AS hour, kind, COUNT(*) AS count").
+		Where("ts >= ?", cutoff).Group("hour, kind").Order("hour ASC").Scan(&hourlyRows).Error; err != nil {
+		return nil, err
+	}
+	nowHour := time.Now().UTC().Truncate(time.Hour)
+	hourly := make([]map[string]any, 24)
+	byHour := make(map[string]map[string]any, 24)
+	for index := 0; index < 24; index++ {
+		hour := nowHour.Add(time.Duration(index-23) * time.Hour)
+		key := hour.Format(time.RFC3339)
+		bucket := map[string]any{"hour": key, "text": int64(0), "image": int64(0), "video": int64(0)}
+		hourly[index] = bucket
+		byHour[key] = bucket
+	}
+	for _, row := range hourlyRows {
+		key := row.Hour.UTC().Truncate(time.Hour).Format(time.RFC3339)
+		if bucket := byHour[key]; bucket != nil {
+			if _, ok := bucket[row.Kind]; ok {
+				bucket[row.Kind] = row.Count
+			}
+		}
+	}
+	providerHealth, err := s.CountAccountHealthByProvider(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"last_24h": window, "hourly": hourly, "top_models": topModels,
+		"failures": failures, "provider_health": providerHealth,
+	}, nil
 }
 
 func (s *AdminConsoleService) ListLogicalModels(ctx context.Context) ([]map[string]any, error) {
@@ -133,6 +242,15 @@ func (s *AdminConsoleService) UpdateLogicalRoute(ctx context.Context, logicalID,
 
 func (s *AdminConsoleService) ListAccounts(ctx context.Context, filter AccountListFilter) ([]map[string]any, int64, error) {
 	query := s.db.WithContext(ctx).Model(&model.TokenAccount{}).Where("pool IN ?", adminAccountProviders)
+	if modelID := strings.TrimSpace(filter.ModelID); modelID != "" {
+		query = query.Where(`EXISTS (
+			SELECT 1 FROM account_model_routes filter_amr
+			JOIN model_routes filter_mr ON filter_mr.id = filter_amr.model_route_id
+			WHERE filter_amr.account_id = provider_accounts.id
+			  AND filter_mr.logical_model_id = ? AND filter_mr.enabled = ?
+			  AND filter_amr.enabled = ? AND filter_amr.entitled = ?
+		)`, modelID, true, true, true)
+	}
 	if requested := strings.TrimSpace(filter.Provider); requested != "" {
 		provider := normalizeAdminProvider(requested)
 		if provider == "" {
@@ -185,6 +303,37 @@ func (s *AdminConsoleService) CountAccountsByProvider(ctx context.Context) (map[
 	}
 	for _, row := range rows {
 		counts[row.Provider] = row.Count
+	}
+	return counts, nil
+}
+
+func (s *AdminConsoleService) CountAccountHealthByProvider(ctx context.Context) (map[string]map[string]int64, error) {
+	type healthCount struct {
+		Provider string `gorm:"column:provider"`
+		Status   string `gorm:"column:status"`
+		Dead     bool   `gorm:"column:dead"`
+		Count    int64  `gorm:"column:count"`
+	}
+	var rows []healthCount
+	if err := s.db.WithContext(ctx).Model(&model.TokenAccount{}).
+		Select("pool AS provider, status, dead, COUNT(*) AS count").
+		Where("pool IN ?", adminAccountProviders).
+		Group("pool, status, dead").Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	counts := make(map[string]map[string]int64, len(adminAccountProviders))
+	for _, provider := range adminAccountProviders {
+		counts[provider] = map[string]int64{"active": 0, "quota": 0, "disabled": 0, "dead": 0, "pending": 0}
+	}
+	for _, row := range rows {
+		bucket := row.Status
+		if row.Dead || row.Status == "auth_error" {
+			bucket = "dead"
+		}
+		if _, ok := counts[row.Provider][bucket]; !ok {
+			bucket = "pending"
+		}
+		counts[row.Provider][bucket] += row.Count
 	}
 	return counts, nil
 }
@@ -244,8 +393,19 @@ func (s *AdminConsoleService) accountRow(ctx context.Context, account model.Toke
 		"id": account.ID, "provider": account.Pool, "label": label, "email": account.AccountEmail,
 		"status": account.Status, "weight": account.Weight, "max_concurrency": account.Concurrency,
 		"active_jobs": activeJobs, "health": health, "routes": routeRows, "quota_buckets": quotaRows,
+		"success_total": account.SuccessTotal, "fail_total": account.FailTotal,
+		"consecutive_failures": account.Fails, "upstream_failures": account.UpstreamFails,
+		"image_limited": account.ImageLimited, "video_limited": account.VideoLimited,
 		"last_used_at": account.LastUsedAt, "created_at": account.CreatedAt,
+		"base_url": safeCustomMeta(account, "base_url"), "models": safeCustomMeta(account, "models"),
 	}, nil
+}
+
+func safeCustomMeta(account model.TokenAccount, key string) string {
+	if account.Pool != "custom" || account.Meta == nil || (key != "base_url" && key != "models") {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(account.Meta[key]))
 }
 
 func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountImportInput) (map[string]any, error) {
@@ -261,7 +421,7 @@ func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountIm
 	case "chatgpt":
 		account, err = s.tokenSvc.ImportChatGPTToken(ctx, secret, "")
 	case "adobe":
-		account, _, err = s.tokenSvc.ImportAdobeCookie(ctx, secret, "")
+		account, _, err = s.tokenSvc.ImportAdobeCookie(ctx, secret, adobeARPSessionToken(credential), "")
 	case "byteplus":
 		// BytePlus browser exports contain a large amount of untrusted profile,
 		// tenant, storage and balance metadata. Only the actual Cookie header is
@@ -280,7 +440,7 @@ func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountIm
 		if len(models) == 0 {
 			return nil, errors.New("custom accounts must bind at least one existing canonical model")
 		}
-		account, err = s.tokenSvc.ImportCustomAccount(ctx, stringFromMap(credential, "base_url"), firstMapString(credential, "api_key", "key", "token"), strings.Join(models, ","), input.Label, intFromMap(credential, "weight"), intFromMap(credential, "max_concurrency"), "")
+		account, err = s.tokenSvc.ImportCustomAccount(ctx, stringFromMap(credential, "base_url"), firstMapString(credential, "api_key", "key", "token"), strings.Join(models, ","), input.Label, intFromMap(credential, "weight"), intFromMap(credential, "max_concurrency"), strings.TrimSpace(input.ID))
 	}
 	if err != nil {
 		return nil, err
@@ -314,6 +474,22 @@ func (s *AdminConsoleService) bindAccountRoutes(ctx context.Context, account mod
 	allowed := make(map[string]bool, len(allowModels))
 	for _, id := range allowModels {
 		allowed[id] = true
+	}
+	if account.Pool == "custom" && s.db.Migrator().HasTable(&model.AccountModelRoute{}) {
+		var existing []model.AccountModelRoute
+		if err := s.db.WithContext(ctx).Where("account_id = ?", account.ID).Find(&existing).Error; err != nil {
+			return err
+		}
+		for _, binding := range existing {
+			var route model.ModelRoute
+			if err := s.db.WithContext(ctx).First(&route, "id = ?", binding.ModelRouteID).Error; err != nil || route.Provider != "custom" || allowed[route.LogicalModelID] {
+				continue
+			}
+			binding.Enabled = false
+			if err := s.models.Routes().SetAccountRoute(ctx, &binding); err != nil {
+				return err
+			}
+		}
 	}
 	for _, definition := range model.CanonicalRoutingCatalog() {
 		if account.Pool == "custom" && !allowed[definition.Model.ID] {
@@ -425,6 +601,23 @@ func (s *AdminConsoleService) DeleteAccount(ctx context.Context, accountID strin
 	return s.tokenSvc.Delete(ctx, account.Pool, account.ID)
 }
 
+func (s *AdminConsoleService) DeleteDeadAccounts(ctx context.Context) (int, error) {
+	var accounts []model.TokenAccount
+	if err := s.db.WithContext(ctx).
+		Where("pool IN ? AND (dead = ? OR status = ?)", adminAccountProviders, true, "auth_error").
+		Find(&accounts).Error; err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for _, account := range accounts {
+		if err := s.tokenSvc.Delete(ctx, account.Pool, account.ID); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
 func (s *AdminConsoleService) SetAccountRoute(ctx context.Context, accountID, bindingID string, enabled bool) error {
 	account, err := s.accountByID(ctx, accountID)
 	if err != nil {
@@ -496,7 +689,10 @@ func (s *AdminConsoleService) accountByID(ctx context.Context, id string) (*mode
 func (s *AdminConsoleService) ListLogs(ctx context.Context, filter LogListFilter) ([]map[string]any, int64, error) {
 	query := s.db.WithContext(ctx).Model(&model.EventLog{})
 	if filter.Artifacts {
-		query = query.Where("file <> ''")
+		// Image rows reserve an object key before provider execution. A non-empty
+		// file column is therefore not proof that an artifact exists; only terminal
+		// successful events belong in the artifact gallery.
+		query = query.Where("status = ? AND file <> ''", "success")
 	}
 	if value := strings.TrimSpace(filter.CredentialID); value != "" && s.db.Migrator().HasColumn(&model.EventLog{}, "api_credential_id") {
 		query = query.Where("api_credential_id = ?", value)
@@ -509,6 +705,9 @@ func (s *AdminConsoleService) ListLogs(ctx context.Context, filter LogListFilter
 	}
 	if value := strings.TrimSpace(filter.Status); value != "" {
 		query = query.Where("status = ?", value)
+	}
+	if value := strings.TrimSpace(filter.Source); value != "" {
+		query = query.Where("source = ?", value)
 	}
 	if value := strings.TrimSpace(filter.Query); value != "" {
 		like := "%" + value + "%"
@@ -549,14 +748,19 @@ func (s *AdminConsoleService) ListLogs(ctx context.Context, filter LogListFilter
 		}
 		row := map[string]any{
 			"id": event.ID, "request_id": event.RequestID, "model": event.Model, "kind": event.Kind,
-			"status": event.Status, "provider": event.Provider, "account_label": event.AccountEmail,
+			"status": event.Status, "provider": event.Provider, "account_id": event.AccountID, "account_label": event.AccountEmail,
 			"duration_ms": event.ElapsedMS, "error": safeStoredGenerationError(event.Error), "created_at": event.TS,
 			"api_credential_id": event.APICredentialID, "credential": credential,
+			"prompt": event.Prompt, "ratio": event.Ratio, "resolution": event.Resolution,
+			"duration": event.Duration, "refs": event.Refs, "deai": event.DeAI, "source": event.Source,
+			"cost": event.Cost, "mime_type": eventMimeType(event),
+		}
+		if event.Status == "success" && strings.TrimSpace(event.File) != "" && (event.Kind == "image" || event.Kind == "video") {
+			contentURL := "/admin/api/artifacts/" + event.ID + "/content"
+			row["content_url"] = contentURL
+			row["thumbnail_url"] = contentURL
 		}
 		if filter.Artifacts {
-			row["content_url"] = event.File
-			row["thumbnail_url"] = event.File
-			row["mime_type"] = eventMimeType(event)
 			row["size_bytes"] = nil
 		}
 		rows = append(rows, row)
@@ -588,6 +792,15 @@ func (s *AdminConsoleService) GetSettings(ctx context.Context) (map[string]any, 
 			values[responseKey] = value
 		}
 	}
+	providers := map[string]bool{}
+	for _, pool := range SchedulableProviders() {
+		enabled, err := providerEnabled(ctx, s.settings, pool)
+		if err != nil {
+			return nil, err
+		}
+		providers[pool] = enabled
+	}
+	values["providers_enabled"] = providers
 	return values, nil
 }
 
@@ -618,6 +831,23 @@ func (s *AdminConsoleService) UpdateSettings(ctx context.Context, input map[stri
 			return nil, err
 		}
 		updates["public.base_url"] = baseURL
+	}
+	if raw, ok := input["providers_enabled"]; ok {
+		switches, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("providers_enabled must be an object of pool => boolean")
+		}
+		for pool, flag := range switches {
+			normalized := normalizePool(pool)
+			if normalized == "" {
+				return nil, fmt.Errorf("providers_enabled contains unknown provider %q", pool)
+			}
+			enabled, ok := flag.(bool)
+			if !ok {
+				return nil, fmt.Errorf("providers_enabled.%s must be a boolean", pool)
+			}
+			updates[providerSettingKey(normalized)] = strconv.FormatBool(enabled)
+		}
 	}
 	if err := s.settings.UpsertValues(ctx, updates); err != nil {
 		return nil, err
@@ -770,6 +1000,34 @@ func bytePlusCredentialSecret(value any, values map[string]any) string {
 		}
 	}
 	return strings.Join(parts, "; ")
+}
+
+func adobeARPSessionToken(values map[string]any) string {
+	aliases := map[string]struct{}{
+		"x-arp-session-id":  {},
+		"x_arp_session_id":  {},
+		"arp_session_id":    {},
+		"arp_session_token": {},
+		"arpsessiontoken":   {},
+	}
+	find := func(source map[string]any) string {
+		for key, raw := range source {
+			if _, ok := aliases[strings.ToLower(strings.TrimSpace(key))]; !ok || raw == nil {
+				continue
+			}
+			if token := strings.TrimSpace(fmt.Sprint(raw)); token != "" && token != "<nil>" {
+				return token
+			}
+		}
+		return ""
+	}
+	if token := find(values); token != "" {
+		return token
+	}
+	if headers, ok := values["headers"].(map[string]any); ok {
+		return find(headers)
+	}
+	return ""
 }
 
 func cookieFromCredential(values map[string]any) string {

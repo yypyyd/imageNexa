@@ -47,6 +47,8 @@ func TestSafeAdminValidationMessagesCoverImportAndSettingsInputs(t *testing.T) {
 		"not an OreateAI cookie",
 		"base_url required",
 		"base_url and key required",
+		"invalid base_url: public HTTPS on port 443 is required: unsafe asset URL",
+		"invalid base_url: query and fragment are not allowed: unsafe asset URL",
 		"logs_retention_days must be between 1 and 3650",
 		"artifacts_retention_days must be between 1 and 3650",
 	} {

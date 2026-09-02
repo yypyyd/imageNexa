@@ -59,6 +59,36 @@ func TestAccountCoolingExpires(t *testing.T) {
 	}
 }
 
+func TestAdminArtifactOwnershipIsLimitedToAdminTestEvents(t *testing.T) {
+	admin := &APIPrincipal{TokenType: "admin"}
+	if !eventOwnedByPrincipal(&model.EventLog{Kind: "image", Source: "admin"}, admin, "image") {
+		t.Fatal("administrator could not read its test artifact")
+	}
+	for _, event := range []*model.EventLog{
+		{Kind: "image", Source: "v1"},
+		{Kind: "video", Source: "admin"},
+		{Kind: "image", Source: "admin", APICredentialID: "key-1"},
+	} {
+		if eventOwnedByPrincipal(event, admin, "image") {
+			t.Fatalf("administrator test artifact boundary accepted %#v", event)
+		}
+	}
+}
+
+func TestAdminArtifactPrincipalContainsOnlyOwnershipIdentity(t *testing.T) {
+	admin := adminArtifactPrincipal(&model.EventLog{Source: "admin"})
+	if admin.TokenType != "admin" || admin.Credential != nil {
+		t.Fatalf("admin test principal = %#v", admin)
+	}
+	credential := adminArtifactPrincipal(&model.EventLog{APICredentialID: "key-1"})
+	if credential.TokenType != "" || credential.Credential == nil || credential.Credential.ID != "key-1" {
+		t.Fatalf("credential principal = %#v", credential)
+	}
+	if credential.Credential.KeyHash != "" {
+		t.Fatal("administrator artifact principal loaded credential secret material")
+	}
+}
+
 // Without Redis the cursor still advances per pick, so consecutive requests
 // start on different accounts instead of hammering the head of the list.
 func TestRotateRoundRobinCursorAdvances(t *testing.T) {

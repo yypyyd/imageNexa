@@ -305,7 +305,7 @@ func defaultMediaContentType(kind string) string {
 
 const generatedImageSafetyMaxAttempts = 3
 
-func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
+func (c *Client) GenerateImage(ctx context.Context, token, arpSessionToken, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
 	submitSess, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -334,7 +334,7 @@ generationAttempts:
 			candidates = BuildImagePayloadCandidates(modelID, prompt, aspectRatio, resolution, blobIDs)
 		}
 		for _, payload := range candidates {
-			respBody, pollURL, submitErr := c.submitImage(ctx, submitSess, token, prompt, endpoint, payload)
+			respBody, pollURL, submitErr := c.submitImage(ctx, submitSess, token, arpSessionToken, prompt, endpoint, payload)
 			if submitErr == nil {
 				meta, data, pollErr := c.pollImage(ctx, pollSess, downloadSess, token, pollURL, downloadResult)
 				if isRetryableGeneratedImageRejection(pollErr) {
@@ -375,7 +375,7 @@ generationAttempts:
 // With downloadResult=false it returns nil bytes and the upstream presigned URL
 // in meta["video_url"] — used by the async /v1/videos job, which proxies that URL
 // on /content instead of persisting the file.
-func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, inputs VideoInputs, downloadResult bool) ([]byte, map[string]any, error) {
+func (c *Client) GenerateVideo(ctx context.Context, token, arpSessionToken, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, inputs VideoInputs, downloadResult bool) ([]byte, map[string]any, error) {
 	submitSess, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -394,7 +394,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspec
 	if engine == "firefly-video" {
 		endpoint = fireflyVideoSubmitURL
 	}
-	respBody, pollURL, err := c.submitVideo(ctx, submitSess, token, endpoint, payload)
+	respBody, pollURL, err := c.submitVideo(ctx, submitSess, token, arpSessionToken, endpoint, payload)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -577,7 +577,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 	}, nil
 }
 
-func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, prompt, endpoint string, payload map[string]any) ([]byte, string, error) {
+func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, arpSessionToken, prompt, endpoint string, payload map[string]any) ([]byte, string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err
@@ -619,8 +619,12 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 			"sec-fetch-mode",
 			"sec-fetch-dest",
 			"user-agent",
+			"x-arp-session-id",
 			"x-nonce",
 		},
+	}
+	if arpSessionToken = strings.TrimSpace(arpSessionToken); arpSessionToken != "" {
+		req.Header.Set("x-arp-session-id", arpSessionToken)
 	}
 	if nonce := buildSubmitNonce(token, prompt); nonce != "" {
 		req.Header.Set("x-nonce", nonce)
@@ -758,7 +762,7 @@ func (c *Client) pollImage(ctx context.Context, sess, downloadSess *tlsSession, 
 	}
 }
 
-func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpoint string, payload map[string]any) ([]byte, string, error) {
+func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, arpSessionToken, endpoint string, payload map[string]any) ([]byte, string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err
@@ -800,8 +804,12 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 			"sec-fetch-mode",
 			"sec-fetch-dest",
 			"user-agent",
+			"x-arp-session-id",
 			"x-nonce",
 		},
+	}
+	if arpSessionToken = strings.TrimSpace(arpSessionToken); arpSessionToken != "" {
+		req.Header.Set("x-arp-session-id", arpSessionToken)
 	}
 	// The working video submit (HAR) carries x-nonce just like the image submit.
 	if prompt, _ := payload["prompt"].(string); prompt != "" {

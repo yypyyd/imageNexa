@@ -525,9 +525,10 @@ func firstString(values map[string]any, keys ...string) string {
 	return ""
 }
 
-func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, *model.RefreshProfile, error) {
+func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, arpSessionToken, tokenID string) (*model.TokenAccount, *model.RefreshProfile, error) {
 	s.applyProxy(ctx)
 	cookie = cleanAdobeCookie(cookie)
+	arpSessionToken = strings.TrimSpace(arpSessionToken)
 	if cookie == "" {
 		return nil, nil, errors.New("cookie required")
 	}
@@ -545,6 +546,7 @@ func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID st
 		Pool:            "adobe",
 		Kind:            "adobe_cookie",
 		Cookie:          cookie,
+		ARPSessionToken: arpSessionToken,
 		Enabled:         true,
 		IntervalSeconds: 54000,
 		ImportedAt:      &now,
@@ -552,8 +554,38 @@ func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID st
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	if err := s.refresh.Create(ctx, profile); err != nil && !errors.Is(err, gorm.ErrDuplicatedKey) {
-		return nil, nil, err
+	if err := s.refresh.Create(ctx, profile); err != nil {
+		if !errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil, nil, err
+		}
+		profilePatch := map[string]any{
+			"cookie":        cookie,
+			"enabled":       true,
+			"imported_at":   now,
+			"next_retry_at": nextRetry,
+		}
+		// A plain-Cookie re-import must not rotate an existing browser-compatible
+		// ARP session or erase a richer token captured from a structured export.
+		if arpSessionToken != "" {
+			profilePatch["arp_session_token"] = arpSessionToken
+		}
+		profile, err = s.refresh.Update(ctx, tokenID, profilePatch)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	// Adobe's SherlockSdk emits this base sid token immediately, before its
+	// optional Forter/BFP vendors complete. Generate the same local session shape
+	// when the import did not provide one; this performs no network request and
+	// preserves an existing stored value on plain-Cookie re-imports.
+	arpSessionToken = strings.TrimSpace(profile.ARPSessionToken)
+	if arpSessionToken == "" {
+		arpSessionToken = adobe.NewARPSessionToken()
+		updatedProfile, updateErr := s.refresh.Update(ctx, tokenID, map[string]any{"arp_session_token": arpSessionToken})
+		if updateErr != nil {
+			return nil, nil, updateErr
+		}
+		profile = updatedProfile
 	}
 	// Land a placeholder pending token (value filled in by the worker). NOT
 	// schedulable — the pool only hands out status=="active". The import returns
@@ -563,14 +595,22 @@ func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID st
 	item, err := s.createToken(ctx, "adobe", tokenID, "", "pending", meta)
 	if err != nil {
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			item, err = s.tokens.Update(ctx, "adobe", tokenID, map[string]any{
-				"status": "pending",
-				"meta":   meta,
-			})
+			accountPatch := map[string]any{
+				"status":            "pending",
+				"meta":              meta,
+				"arp_session_token": arpSessionToken,
+			}
+			item, err = s.tokens.Update(ctx, "adobe", tokenID, accountPatch)
 			if err != nil {
 				return nil, nil, err
 			}
 		} else {
+			return nil, nil, err
+		}
+	}
+	if arpSessionToken != "" && item.ARPSessionToken != arpSessionToken {
+		item, err = s.tokens.Update(ctx, "adobe", tokenID, map[string]any{"arp_session_token": arpSessionToken})
+		if err != nil {
 			return nil, nil, err
 		}
 	}

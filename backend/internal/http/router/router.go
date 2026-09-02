@@ -91,16 +91,21 @@ func New(cfg *config.Config, auth *service.AuthService, credentials *service.API
 		authed.GET("/logical-models", handlers.Admin.LogicalModels)
 		authed.PATCH("/logical-models/:id", handlers.Admin.UpdateLogicalModel)
 		authed.PATCH("/logical-models/:id/routes/:route_id", handlers.Admin.UpdateLogicalRoute)
+		authed.GET("/overview", handlers.Admin.Overview)
 
 		authed.GET("/accounts", handlers.Admin.Accounts)
 		authed.POST("/accounts/import", handlers.Admin.ImportAccount)
+		authed.POST("/accounts/delete-dead", handlers.Admin.DeleteDeadAccounts)
 		authed.PATCH("/accounts/:id", handlers.Admin.UpdateAccount)
 		authed.DELETE("/accounts/:id", handlers.Admin.DeleteAccount)
 		authed.PATCH("/accounts/:id/routes/:binding_id", handlers.Admin.SetAccountRoute)
 		authed.POST("/accounts/:id/refresh-quota", handlers.Admin.RefreshAccountQuota)
+		authed.POST("/test", handlers.V1.AdminTest)
+		authed.GET("/test/artifacts/:id", handlers.V1.AdminTestArtifact)
 
 		authed.GET("/logs", handlers.Admin.Logs)
 		authed.GET("/artifacts", handlers.Admin.Artifacts)
+		authed.GET("/artifacts/:id/content", handlers.V1.AdminArtifact)
 		authed.GET("/settings", handlers.Admin.Settings)
 		authed.PUT("/settings", handlers.Admin.UpdateSettings)
 

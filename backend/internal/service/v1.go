@@ -55,6 +55,10 @@ var (
 	ErrGenerationAccepted     = errors.New("image generation accepted; poll the task URL")
 	ErrProviderAuth           = errors.New("provider token invalid or expired")
 	ErrNoProviderAccount      = errors.New("no provider account available, please ask an admin to configure one")
+	// ErrProviderDisabled means every provider capable of serving the request
+	// has been switched off by an administrator. It is distinct from
+	// ErrUnsupportedParams: the parameters are valid, the pools are just closed.
+	ErrProviderDisabled = errors.New("all providers for this model are disabled by the administrator")
 	ErrProviderQuota          = errors.New("provider quota exhausted")
 	ErrProviderTemporary      = errors.New("provider temporary unavailable")
 	ErrProviderExecution      = errors.New("provider request failed")
@@ -765,6 +769,70 @@ func (s *V1Service) PrepareAdminChatTest(ctx context.Context, modelName, prompt,
 		return "", fmt.Errorf("%w: empty chat test response", ErrProviderTemporary)
 	}
 	return result.Choices[0].Message.Content, nil
+}
+
+// AdminTestRequest is the administrator-only account capability probe. The
+// account id is mandatory: a test must never silently fall back to another
+// account in the provider pool.
+type AdminTestRequest struct {
+	Model       string
+	Prompt      string
+	AspectRatio string
+	Resolution  string
+	Duration    string
+	AccountID   string
+}
+
+// PrepareAdminTest runs a canonical text, image, or video model through one
+// explicitly selected provider account without charging a downstream API key.
+func (s *V1Service) PrepareAdminTest(ctx context.Context, in AdminTestRequest) (map[string]any, error) {
+	in.Model = strings.TrimSpace(in.Model)
+	in.Prompt = strings.TrimSpace(in.Prompt)
+	in.AccountID = strings.TrimSpace(in.AccountID)
+	if in.Model == "" || in.Prompt == "" || in.AccountID == "" {
+		return nil, fmt.Errorf("%w: model, prompt and account_id are required", ErrUnsupportedParams)
+	}
+	modelItem, err := s.models.Get(ctx, in.Model)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUnknownModel
+		}
+		return nil, err
+	}
+	if !modelItem.Enabled {
+		return nil, ErrUnknownModel
+	}
+	startedAt := time.Now()
+	switch modelItem.Type {
+	case "text":
+		content, err := s.PrepareAdminChatTest(ctx, in.Model, in.Prompt, in.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"kind": "text", "content": content,
+			"elapsed_ms": time.Since(startedAt).Milliseconds(),
+		}, nil
+	case "image":
+		result, err := s.prepareImageExecution(ctx, nil, V1ImageRequest{
+			Model: in.Model, Prompt: in.Prompt, AspectRatio: in.AspectRatio,
+			Resolution: in.Resolution, AccountID: in.AccountID,
+		}, "admin", false)
+		if err != nil {
+			return nil, err
+		}
+		if eventID, _ := result["event_id"].(string); eventID != "" {
+			result["url"] = "/admin/api/test/artifacts/" + eventID
+		}
+		return result, nil
+	case "video":
+		return s.prepareAdminVideoTest(ctx, V1VideoRequest{
+			Model: in.Model, Prompt: in.Prompt, AspectRatio: in.AspectRatio,
+			Resolution: in.Resolution, Duration: in.Duration, AccountID: in.AccountID,
+		})
+	default:
+		return nil, ErrUnknownModel
+	}
 }
 
 func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPrincipal, payload []byte, accountID, source string) (*V1ChatResponse, error) {
@@ -1609,6 +1677,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		"model":      modelItem.EffectiveName(),
 		"kind":       "image",
 		"url":        fileURL,
+		"event_id":   eventID,
 		"elapsed_ms": elapsedMS,
 		"charged":    price,
 		"credits":    principalCredits(principal),
@@ -1758,8 +1827,11 @@ func (s *V1Service) startAcceptedImageRecovery(parent context.Context, event *mo
 		if resumeErr != nil {
 			// A transient poll/download failure keeps the accepted task recoverable.
 			// Explicit terminal provider outcomes can safely close the event.
-			if errors.Is(resumeErr, byteplus.ErrQuotaExhausted) || errors.Is(resumeErr, byteplus.ErrRiskControl) || errors.Is(resumeErr, byteplus.ErrInvalidParams) {
+			if errors.Is(resumeErr, byteplus.ErrQuotaExhausted) || errors.Is(resumeErr, byteplus.ErrRiskControl) || errors.Is(resumeErr, byteplus.ErrInvalidParams) || errors.Is(resumeErr, byteplus.ErrTaskFailed) {
 				publicErr := publicGenerationError(resumeErr)
+				if errors.Is(resumeErr, byteplus.ErrTaskFailed) {
+					publicErr = ErrProviderExecution
+				}
 				recordBookkeepingError("finish accepted image event", s.events.UpdateStatus(ctx, event.ID, "failed", publicErr.Error(), 0))
 				recordBookkeepingError("finish accepted image dispatch", s.models.Dispatch().Finish(ctx, attempt.ID, "failed", dispatchFailureClassName(resumeErr), attempt.UpstreamTaskID, publicErr))
 			}
@@ -1814,6 +1886,47 @@ func mustDispatchRoute(ctx context.Context, models *repo.ModelRepository, routeI
 // POST /v1/videos charges + creates a pending event and renders in the
 // background; the render captures only the UPSTREAM video URL (no download, no
 // RustFS). GET /v1/videos/{id} polls status; /content proxies the upstream URL.
+
+// prepareAdminVideoTest executes one synchronous video capability test through
+// the selected account. The artifact stays behind the administrator session and
+// the upstream URL is never returned to the browser.
+func (s *V1Service) prepareAdminVideoTest(ctx context.Context, in V1VideoRequest) (map[string]any, error) {
+	s.applyGlobalProxy(ctx)
+	ctx = context.WithoutCancel(ctx)
+	modelItem, resolution, aspectRatio, duration, price, err := s.prepareVideo(ctx, nil, in, false)
+	if err != nil {
+		return nil, err
+	}
+	eventID, err := s.logPendingEvent(ctx, "video", modelItem, nil, in.Prompt, aspectRatio, resolution, duration,
+		0, price, "", "admin", nil, false, "", "")
+	if err != nil {
+		return nil, err
+	}
+	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
+	defer cancel()
+	s.inflight.Add(eventID, cancel)
+	defer s.inflight.Done(eventID)
+	startedAt := time.Now()
+
+	_, videoURL, execErr := s.dispatchVideoRoutes(genCtx, eventID, modelItem, in, aspectRatio, resolution, duration, false)
+	if execErr != nil {
+		recordBookkeepingError("update failed admin video test", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
+		return nil, publicGenerationError(execErr)
+	}
+	if strings.TrimSpace(videoURL) == "" {
+		recordBookkeepingError("update empty admin video test", s.events.UpdateStatus(ctx, eventID, "failed", ErrProviderExecution.Error(), 0))
+		return nil, ErrProviderExecution
+	}
+	elapsedMS := int(time.Since(startedAt).Milliseconds())
+	if err := s.events.MarkVideoReady(ctx, eventID, videoURL, elapsedMS); err != nil {
+		return nil, err
+	}
+	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
+	return map[string]any{
+		"kind": "video", "model": modelItem.EffectiveName(), "event_id": eventID,
+		"url": "/admin/api/test/artifacts/" + eventID, "elapsed_ms": elapsedMS,
+	}, nil
+}
 
 // StartVideoJob validates+charges, creates the job event, kicks the render off in
 // the background, and returns the OpenAI video object (status "queued").
@@ -2048,6 +2161,39 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 		return nil, "", fmt.Errorf("%w: invalid upstream video", ErrProviderTemporary)
 	}
 	return body, ct, nil
+}
+
+// OpenAdminArtifact streams a successful event artifact through the same
+// provider-aware, SSRF-hardened path used by the public API. The administrator
+// session is checked by the router; this method derives the historical API-key
+// principal solely to reuse the event ownership guard without sending that key
+// to the browser.
+func (s *V1Service) OpenAdminArtifact(ctx context.Context, id string) (io.ReadCloser, string, error) {
+	event, err := s.events.GetByID(ctx, strings.TrimSpace(id))
+	if err != nil || event == nil || event.Status != "success" || strings.TrimSpace(event.File) == "" {
+		if err != nil {
+			return nil, "", err
+		}
+		return nil, "", ErrNotFound
+	}
+	principal := adminArtifactPrincipal(event)
+	switch event.Kind {
+	case "image":
+		return s.OpenImageContent(ctx, principal, event.ID)
+	case "video":
+		return s.OpenVideoContent(ctx, principal, event.ID)
+	default:
+		return nil, "", ErrNotFound
+	}
+}
+
+func adminArtifactPrincipal(event *model.EventLog) *APIPrincipal {
+	if event != nil && strings.TrimSpace(event.APICredentialID) != "" {
+		// Ownership checks need only the immutable credential id. Never load or
+		// propagate its secret while serving the administrator preview.
+		return &APIPrincipal{Credential: &model.APICredential{ID: event.APICredentialID}}
+	}
+	return &APIPrincipal{TokenType: "admin"}
 }
 
 // OpenImageContent streams a no-store image by proxying the stored upstream URL.
@@ -2384,8 +2530,13 @@ func (s *V1Service) videoEventForUser(ctx context.Context, principal *APIPrincip
 }
 
 func eventOwnedByPrincipal(ev *model.EventLog, principal *APIPrincipal, kind string) bool {
-	return ev != nil && ev.Kind == kind && principal != nil && principal.Credential != nil &&
-		strings.TrimSpace(ev.APICredentialID) != "" && ev.APICredentialID == principal.Credential.ID
+	if ev == nil || ev.Kind != kind || principal == nil {
+		return false
+	}
+	if principal.TokenType == "admin" {
+		return ev.Source == "admin" && strings.TrimSpace(ev.APICredentialID) == ""
+	}
+	return principal.Credential != nil && strings.TrimSpace(ev.APICredentialID) != "" && ev.APICredentialID == principal.Credential.ID
 }
 
 // videoJobStatus maps our event status → OpenAI's (queued|in_progress|completed|
@@ -3204,7 +3355,8 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 			}
 			blobIDs = append(blobIDs, id)
 		}
-		d, meta, genErr := s.adobe.GenerateImage(ctx, token.Value, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, false)
+		submitARP := adobe.SubmissionARPSessionToken(token.ARPSessionToken)
+		d, meta, genErr := s.adobe.GenerateImage(ctx, token.Value, submitARP, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, false)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
 			if !urlOnly {
@@ -3217,7 +3369,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 		return d, genErr
 	}, adobeErrClass, func(id string) (model.TokenAccount, bool) {
 		return s.refreshAdobeToken(ctx, id)
-	}, true, true)
+	}, true, strings.TrimSpace(in.AccountID) == "")
 	return data, imageURL, err
 }
 
@@ -3261,7 +3413,7 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	// capped at maxTempFailoverAccounts). videoURL is
 	// captured from the successful attempt's meta (the upstream presigned URL).
 	var videoURL string
-	data, err := s.runPoolWithFailover(ctx, eventID, "adobe", active, "video", func(token model.TokenAccount) ([]byte, error) {
+	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "adobe", active, "video", func(token model.TokenAccount) ([]byte, error) {
 		inputs := adobe.VideoInputs{GenerateAudio: in.GenerateAudio}
 		for _, ref := range refs {
 			id, upErr := s.adobe.UploadImage(ctx, token.Value, ref, "image/png", engine)
@@ -3284,7 +3436,8 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 			}
 			inputs.AudioBlobIDs = append(inputs.AudioBlobIDs, id)
 		}
-		bytes, meta, genErr := s.adobe.GenerateVideo(ctx, token.Value, engine, in.Prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, inputs, false)
+		submitARP := adobe.SubmissionARPSessionToken(token.ARPSessionToken)
+		bytes, meta, genErr := s.adobe.GenerateVideo(ctx, token.Value, submitARP, engine, in.Prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, inputs, false)
 		if genErr == nil {
 			videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
 			if downloadResult {
@@ -3297,7 +3450,7 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 		return bytes, genErr
 	}, adobeErrClass, func(id string) (model.TokenAccount, bool) {
 		return s.refreshAdobeToken(ctx, id)
-	}, true)
+	}, true, strings.TrimSpace(in.AccountID) == "")
 	return data, videoURL, err
 }
 

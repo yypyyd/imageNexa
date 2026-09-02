@@ -73,13 +73,21 @@ func (s *RefreshProfileService) RefreshNow(ctx context.Context, id string) error
 		}
 		return err
 	}
+	arpSessionToken := strings.TrimSpace(profile.ARPSessionToken)
+	if arpSessionToken == "" {
+		// Backward-compatible repair for profiles created before ARP persistence.
+		// This mirrors SherlockSdk's initial local sid token and costs no proxy
+		// request; the migration normally fills these rows before refresh runs.
+		arpSessionToken = adobe.NewARPSessionToken()
+	}
 
 	tokenPatch := map[string]any{
-		"value":      result.AccessToken,
-		"status":     "active",
-		"dead":       false,
-		"fails":      0,
-		"updated_at": now,
+		"value":             result.AccessToken,
+		"arp_session_token": arpSessionToken,
+		"status":            "active",
+		"dead":              false,
+		"fails":             0,
+		"updated_at":        now,
 	}
 	email, exp := parseJWTEmailExpiry(result.AccessToken)
 	if email != "" {
@@ -127,6 +135,7 @@ func (s *RefreshProfileService) RefreshNow(ctx context.Context, id string) error
 		"next_retry_at":        now.Add(time.Duration(interval) * time.Second),
 		"last_error":           "",
 		"consecutive_failures": 0,
+		"arp_session_token":    arpSessionToken,
 	})
 	return err
 }

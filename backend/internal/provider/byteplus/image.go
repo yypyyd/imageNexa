@@ -242,7 +242,7 @@ func acceptedTaskError(taskID, stage string, cause error) error {
 	// terminal business outcomes retain their class for account state and public
 	// error mapping, while ErrTaskAccepted still prevents any resubmission.
 	var business error
-	for _, candidate := range []error{ErrQuotaExhausted, ErrRiskControl, ErrInvalidParams} {
+	for _, candidate := range []error{ErrQuotaExhausted, ErrRiskControl, ErrInvalidParams, ErrTaskFailed} {
 		if errors.Is(cause, candidate) {
 			business = candidate
 			break
@@ -892,7 +892,7 @@ func taskFailureText(task map[string]any) string {
 
 func taskStatusError(status, reason string) error {
 	status = strings.ToLower(strings.TrimSpace(status))
-	base := ErrTemporaryUpstream
+	base := ErrTaskFailed
 	switch status {
 	case "limit":
 		base = ErrQuotaExhausted

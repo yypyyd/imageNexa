@@ -118,12 +118,13 @@ func (m ModelConfig) EffectiveName() string {
 }
 
 type TokenAccount struct {
-	ID        string `gorm:"primaryKey;size:64"`
-	Pool      string `gorm:"size:64;index;not null"`
-	Value     string `gorm:"type:text;not null;default:''"`
-	Status    string `gorm:"size:32;index;not null"`
-	Fails     int    `gorm:"not null;default:0"`
-	FailTotal int    `gorm:"not null;default:0"`
+	ID              string `gorm:"primaryKey;size:64"`
+	Pool            string `gorm:"size:64;index;not null"`
+	Value           string `gorm:"type:text;not null;default:''"`
+	ARPSessionToken string `gorm:"column:arp_session_token;type:text;not null;default:''" json:"-"`
+	Status          string `gorm:"size:32;index;not null"`
+	Fails           int    `gorm:"not null;default:0"`
+	FailTotal       int    `gorm:"not null;default:0"`
 	// Provider-side failures (overload / 5xx) are tracked apart
 	// from Fails/FailTotal: every account fails the same way during an upstream
 	// outage, so they say nothing about this account's health.
@@ -160,6 +161,7 @@ type RefreshProfile struct {
 	Pool                string `gorm:"size:64;index;not null"`
 	Kind                string `gorm:"size:64;index;not null"`
 	Cookie              string `gorm:"type:text"`
+	ARPSessionToken     string `gorm:"column:arp_session_token;type:text;not null;default:''" json:"-"`
 	Enabled             bool   `gorm:"not null;default:true"`
 	IntervalSeconds     int    `gorm:"not null;default:54000"`
 	ImportedAt          *time.Time

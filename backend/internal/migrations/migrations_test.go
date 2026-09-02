@@ -31,8 +31,8 @@ func TestLoadMigrationsIsOrderedAndChecksummed(t *testing.T) {
 	if len(migrations) == 0 {
 		t.Fatal("Load() returned no migrations")
 	}
-	if len(migrations) != 5 {
-		t.Fatalf("Load() returned %d migrations, want 5", len(migrations))
+	if len(migrations) != 7 {
+		t.Fatalf("Load() returned %d migrations, want 7", len(migrations))
 	}
 	hexChecksum := regexp.MustCompile(`^[0-9a-f]{64}$`)
 	for index, migration := range migrations {
@@ -47,6 +47,21 @@ func TestLoadMigrationsIsOrderedAndChecksummed(t *testing.T) {
 		}
 		if strings.Contains(migration.SQL, "\r") {
 			t.Fatalf("migration %s is not LF-only", migration.Filename)
+		}
+	}
+}
+
+func TestAdobeARPSessionBackfillMatchesSherlockShape(t *testing.T) {
+	sql := loadedMigrationSQL(t, 7)
+	for _, required := range []string{
+		"UPDATE refresh_profiles",
+		"UPDATE provider_accounts AS account",
+		"format('{\"sid\":\"%s\"}', gen_random_uuid()::text)",
+		"encode(",
+		"account.id = profile.id",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("Adobe ARP backfill migration missing %q", required)
 		}
 	}
 }

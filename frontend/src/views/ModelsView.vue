@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import Icon from '../components/Icon.vue'
+import ModelTestModal from '../components/ModelTestModal.vue'
 import { api, jsonBody, listOf } from '../api'
 import { ALL_MODELS, IMAGE_MODELS, MODEL_KIND } from '../models'
 
@@ -11,6 +12,7 @@ const models = ref([])
 const kind = ref('')
 const query = ref('')
 const expanded = ref(new Set())
+const testingModel = ref(null)
 
 const visibleModels = computed(() => models.value.filter((m) => MODEL_KIND[m.id]))
 const unknownCount = computed(() => models.value.filter((m) => !MODEL_KIND[m.id]).length)
@@ -74,17 +76,20 @@ async function toggleRoute(model, route) {
 }
 
 function capabilityText(route) {
-  const c = route.capabilities || {}
+  const profiles = Array.isArray(route.capabilities) ? route.capabilities : [route.capabilities || {}]
   const parts = []
-  const ratios = c.ratios || c.supported_ratios || []
-  const resolutions = c.resolutions || c.supported_resolutions || []
-  const durations = c.durations || c.supported_durations || []
+  const values = (names) => [...new Set(profiles.flatMap((profile) => names.flatMap((name) => Array.isArray(profile?.[name]) ? profile[name] : [])))]
+  const ratios = values(['ratios', 'supported_ratios'])
+  const resolutions = values(['resolutions', 'supported_resolutions'])
+  const durations = values(['durations', 'supported_durations'])
   if (ratios.length) parts.push(ratios.join(' / '))
   if (resolutions.length) parts.push(resolutions.join(' / '))
   if (durations.length) parts.push(durations.join(' / '))
-  if (c.max_reference_images) parts.push(`参考图 ≤ ${c.max_reference_images}`)
-  if (c.max_reference_videos) parts.push(`参考视频 ≤ ${c.max_reference_videos}`)
-  if (c.supports_audio_output) parts.push('音频输出')
+  const maxImages = Math.max(0, ...profiles.map((profile) => Number(profile?.max_reference_images || 0)))
+  const maxVideos = Math.max(0, ...profiles.map((profile) => Number(profile?.max_reference_videos || 0)))
+  if (maxImages) parts.push(`参考图 ≤ ${maxImages}`)
+  if (maxVideos) parts.push(`参考视频 ≤ ${maxVideos}`)
+  if (profiles.some((profile) => profile?.supports_audio_output)) parts.push('音频输出')
   return parts.join(' · ') || '无额外限制'
 }
 
@@ -129,6 +134,7 @@ onMounted(load)
             <div class="font-mono text-xs text-white/90 truncate">{{ model.id }}</div>
             <div class="mt-1 text-[10px] text-white/35">{{ (model.routes || []).filter((r) => r.enabled !== false).length }} / {{ (model.routes || []).length }} 路由已启用</div>
           </div>
+          <button class="test-action" title="测试生成（选择具体账号）" @click="testingModel = model"><Icon name="test" class="w-3.5 h-3.5" /></button>
           <button class="switch" :class="model.enabled !== false && 'on'" :disabled="saving === `model:${model.id}`" @click="toggleModel(model)"><span></span></button>
         </div>
 
@@ -141,13 +147,14 @@ onMounted(load)
               <div class="mt-1 text-[10px] text-white/35 truncate" :title="capabilityText(route)">{{ capabilityText(route) }}</div>
             </div>
             <div class="text-[10px] text-white/40"><span class="text-white/75">{{ route.healthy_accounts ?? 0 }}</span> / {{ route.account_count ?? 0 }} 账号</div>
-            <div class="text-[10px] text-white/40">优先级 <span class="text-white/75">{{ route.priority ?? 0 }}</span></div>
+            <div class="text-[10px] text-white/40">优先级 <span class="text-white/75">{{ route.priority ?? 0 }}</span><br />权重 <span class="text-white/75">{{ route.weight ?? 0 }}</span></div>
             <button class="switch" :class="route.enabled !== false && 'on'" :disabled="saving === `route:${route.id}`" @click="toggleRoute(model, route)"><span></span></button>
           </div>
         </div>
       </article>
       <div v-if="!loading && !filtered.length" class="card py-16 text-center text-xs text-white/35">没有匹配的 canonical 模型</div>
     </div>
+    <ModelTestModal v-if="testingModel" :model="testingModel" :models="models" @close="testingModel = null" />
   </section>
 </template>
 
@@ -165,4 +172,5 @@ onMounted(load)
 .switch span { position: absolute; width: .95rem; height: .95rem; left: .15rem; top: .15rem; border-radius: 999px; background: white; transition: transform .15s; }
 .switch.on { background: rgb(16 185 129 / .7); }
 .switch.on span { transform: translateX(.95rem); }
+.test-action{width:1.9rem;height:1.9rem;display:grid;place-items:center;flex:none;border-radius:.5rem;color:rgb(196 181 253);background:rgb(139 92 246 / .1);box-shadow:inset 0 0 0 1px rgb(167 139 250 / .2)}.test-action:hover{color:white;background:rgb(139 92 246 / .22)}
 </style>

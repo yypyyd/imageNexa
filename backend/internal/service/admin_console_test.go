@@ -4,7 +4,25 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"backend/internal/model"
+	"gorm.io/datatypes"
 )
+
+func TestSafeCustomMetaCannotExposeCredential(t *testing.T) {
+	account := model.TokenAccount{Pool: "custom", Meta: datatypes.JSONMap{
+		"base_url": "https://api.example.test", "models": "gpt-image-2", "api_key": "secret",
+	}}
+	if got := safeCustomMeta(account, "base_url"); got != "https://api.example.test" {
+		t.Fatalf("base_url = %q", got)
+	}
+	if got := safeCustomMeta(account, "models"); got != "gpt-image-2" {
+		t.Fatalf("models = %q", got)
+	}
+	if got := safeCustomMeta(account, "api_key"); got != "" {
+		t.Fatalf("credential leaked: %q", got)
+	}
+}
 
 func TestBytePlusCredentialSecretAcceptsOnlyCookieMaterial(t *testing.T) {
 	tests := []struct {
@@ -44,6 +62,24 @@ func TestBytePlusCredentialSecretAcceptsOnlyCookieMaterial(t *testing.T) {
 			got := bytePlusCredentialSecret(value, credentialMap(value))
 			if got != test.want {
 				t.Fatalf("bytePlusCredentialSecret() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAdobeARPSessionTokenAcceptsExportAliases(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		values map[string]any
+		want   string
+	}{
+		{name: "canonical field", values: map[string]any{"arp_session_token": "arp-one"}, want: "arp-one"},
+		{name: "camel case alias", values: map[string]any{"arpSessionToken": "arp-two"}, want: "arp-two"},
+		{name: "nested header", values: map[string]any{"headers": map[string]any{"X-ARP-Session-ID": "arp-three"}}, want: "arp-three"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := adobeARPSessionToken(test.values); got != test.want {
+				t.Fatalf("adobeARPSessionToken() = %q, want %q", got, test.want)
 			}
 		})
 	}

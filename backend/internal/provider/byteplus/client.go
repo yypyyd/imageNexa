@@ -44,6 +44,11 @@ var (
 	ErrRiskControl       = errors.New("byteplus risk control")
 	ErrInvalidParams     = errors.New("byteplus invalid parameters")
 	ErrTemporaryUpstream = errors.New("byteplus upstream temporary error")
+	// ErrTaskFailed means an already accepted provider task reached an explicit
+	// terminal failure. It remains in the temporary provider class for account
+	// health, but recovery callers must close the durable event instead of polling
+	// the same failed parent forever.
+	ErrTaskFailed = fmt.Errorf("%w: accepted task failed", ErrTemporaryUpstream)
 	// ErrTaskAccepted marks failures that happened after create_task returned a
 	// parent task id. It remains a temporary-upstream error for API mapping, but
 	// callers must not retry the whole generation because create_task is not

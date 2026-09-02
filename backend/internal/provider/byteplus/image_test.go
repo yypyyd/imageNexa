@@ -622,7 +622,7 @@ func TestPollHandlesMultiOutputAndTerminalErrors(t *testing.T) {
 		want   error
 	}{
 		{"limit", ErrQuotaExhausted}, {"risk", ErrRiskControl}, {"invalid_param", ErrInvalidParams},
-		{"no_face_detected", ErrInvalidParams}, {"failed", ErrTemporaryUpstream},
+		{"no_face_detected", ErrInvalidParams}, {"failed", ErrTaskFailed},
 	} {
 		if err := taskStatusError(tc.status, "failure"); !errors.Is(err, tc.want) {
 			t.Errorf("status %q error = %v, want %v", tc.status, err, tc.want)
@@ -865,6 +865,7 @@ func TestAcceptedTerminalBusinessErrorsRetainClass(t *testing.T) {
 		{status: "limit", want: ErrQuotaExhausted},
 		{status: "risk", want: ErrRiskControl},
 		{status: "invalid_param", want: ErrInvalidParams},
+		{status: "failed", want: ErrTaskFailed},
 	} {
 		t.Run(tc.status, func(t *testing.T) {
 			var createCalls atomic.Int32

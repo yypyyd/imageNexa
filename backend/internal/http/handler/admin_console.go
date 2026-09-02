@@ -69,7 +69,7 @@ func (h *AdminConsoleHandler) UpdateLogicalRoute(c *gin.Context) {
 func (h *AdminConsoleHandler) Accounts(c *gin.Context) {
 	limit, offset, page := adminPage(c)
 	items, total, err := h.console.ListAccounts(c.Request.Context(), service.AccountListFilter{
-		Query: c.Query("q"), Provider: c.Query("provider"), Status: c.Query("status"), Limit: limit, Offset: offset,
+		Query: c.Query("q"), Provider: c.Query("provider"), Status: c.Query("status"), ModelID: c.Query("model_id"), Limit: limit, Offset: offset,
 	})
 	if err != nil {
 		adminConsoleError(c, err)
@@ -80,7 +80,21 @@ func (h *AdminConsoleHandler) Accounts(c *gin.Context) {
 		adminConsoleError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": items, "total": total, "page": page, "limit": limit, "provider_counts": providerCounts})
+	providerHealth, err := h.console.CountAccountHealthByProvider(c.Request.Context())
+	if err != nil {
+		adminConsoleError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": items, "total": total, "page": page, "limit": limit, "provider_counts": providerCounts, "provider_health": providerHealth})
+}
+
+func (h *AdminConsoleHandler) Overview(c *gin.Context) {
+	item, err := h.console.Overview(c.Request.Context())
+	if err != nil {
+		adminConsoleError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, item)
 }
 
 func (h *AdminConsoleHandler) ImportAccount(c *gin.Context) {
@@ -115,6 +129,15 @@ func (h *AdminConsoleHandler) DeleteAccount(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+func (h *AdminConsoleHandler) DeleteDeadAccounts(c *gin.Context) {
+	deleted, err := h.console.DeleteDeadAccounts(c.Request.Context())
+	if err != nil {
+		adminConsoleError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": deleted})
 }
 
 func (h *AdminConsoleHandler) SetAccountRoute(c *gin.Context) {
@@ -156,7 +179,7 @@ func (h *AdminConsoleHandler) listEvents(c *gin.Context, artifacts bool) {
 	limit, offset, page := adminPage(c)
 	items, total, err := h.console.ListLogs(c.Request.Context(), service.LogListFilter{
 		CredentialID: c.Query("credential_id"), Model: c.Query("model"), Kind: c.Query("kind"),
-		Status: c.Query("status"), Query: c.Query("q"), Artifacts: artifacts, Limit: limit, Offset: offset,
+		Status: c.Query("status"), Source: c.Query("source"), Query: c.Query("q"), Artifacts: artifacts, Limit: limit, Offset: offset,
 	})
 	if err != nil {
 		adminConsoleError(c, err)
@@ -249,6 +272,10 @@ func safeAdminValidationMessage(err error) (string, bool) {
 		if message == setting+" must be between 1 and 3650" {
 			return message, true
 		}
+	}
+	if strings.HasPrefix(message, "invalid base_url: public HTTPS on port 443 is required") ||
+		strings.HasPrefix(message, "invalid base_url: query and fragment are not allowed") {
+		return message, true
 	}
 	return "", false
 }
