@@ -44,6 +44,17 @@ func (r *TokenRepository) ListByPool(ctx context.Context, pool string) ([]model.
 	return items, nil
 }
 
+// ListByIDs refreshes a queued request's candidates in one query. The caller
+// preserves its scheduling order; database row order is deliberately irrelevant.
+func (r *TokenRepository) ListByIDs(ctx context.Context, pool string, ids []string) ([]model.TokenAccount, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var items []model.TokenAccount
+	err := r.db.WithContext(ctx).Where("pool = ? AND id IN ?", pool, ids).Find(&items).Error
+	return items, err
+}
+
 func (r *TokenRepository) Get(ctx context.Context, pool, id string) (*model.TokenAccount, error) {
 	var item model.TokenAccount
 	if err := r.db.WithContext(ctx).

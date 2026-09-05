@@ -68,6 +68,35 @@ func QuotaSnapshotKey(accountID, bucketKey string) string {
 	return strings.TrimSpace(accountID) + "\x00" + strings.TrimSpace(bucketKey)
 }
 
+// ClaimRefreshDue schedules bounded background probes without changing the
+// last authoritative RefreshedAt. UpdatedAt provides a five-minute probe retry
+// delay, including failures, and row locks prevent two workers claiming a row.
+func (r *QuotaRepository) ClaimRefreshDue(ctx context.Context, now time.Time, limit int) ([]model.AccountQuotaBucket, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	var items []model.AccountQuotaBucket
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("updated_at <= ?", now.Add(-5*time.Minute)).
+			Where("refreshed_at IS NULL OR refreshed_at <= ? OR (reset_at <= ? AND refreshed_at < reset_at)", now.Add(-15*time.Minute), now).
+			Where(`EXISTS (SELECT 1 FROM provider_accounts a WHERE a.id = account_quota_buckets.account_id
+				AND a.dead = false AND a.status IN ('active', 'quota') AND a.value <> '' AND a.pool <> 'custom')`).
+			Order("updated_at ASC, id ASC").Limit(limit).Find(&items).Error; err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		ids := make([]string, 0, len(items))
+		for _, item := range items {
+			ids = append(ids, item.ID)
+		}
+		return tx.Model(&model.AccountQuotaBucket{}).Where("id IN ?", ids).UpdateColumn("updated_at", now).Error
+	})
+	return items, err
+}
+
 func (r *QuotaRepository) ListByAccount(ctx context.Context, accountID string) ([]model.AccountQuotaBucket, error) {
 	var items []model.AccountQuotaBucket
 	if err := r.db.WithContext(ctx).Where("account_id = ?", accountID).Order("bucket_key asc").Find(&items).Error; err != nil {

@@ -76,19 +76,20 @@ func (s *V1Service) matchingRoutes(ctx context.Context, logicalID string, req mo
 }
 
 func (s *V1Service) routeHasAccount(ctx context.Context, route model.ModelRoute, kind string) (bool, error) {
-	var items []model.TokenAccount
-	var err error
-	if route.Provider == "custom" {
-		items, err = s.customActive(ctx, route.LogicalModelID)
-	} else {
-		items, err = s.tokens.ListByPool(ctx, route.Provider)
-	}
+	items, err := s.tokens.ListByPool(ctx, route.Provider)
 	if err != nil {
 		return false, err
 	}
 	active := make([]model.TokenAccount, 0, len(items))
+	now := time.Now()
 	for _, item := range items {
+		if route.Provider == "custom" && !customAccountServes(item, route.LogicalModelID) {
+			continue
+		}
 		if item.Dead || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		if route.Provider == "byteplus" && !bytePlusAccountSessionUsable(item, now) {
 			continue
 		}
 		if kind == "text" && (route.Provider == "chatgpt" || route.Provider == "grok") {
@@ -213,23 +214,30 @@ func (s *V1Service) routeAccounts(ctx context.Context, route model.ModelRoute, a
 	}
 	activeCounts, slotsSeen := s.conc.ActiveCounts(ctx, concurrencyKeys)
 	if slotsSeen {
-		slotEligible := candidates[:0]
-		for _, item := range candidates {
+		for index := range candidates {
+			item := &candidates[index]
 			maximum := int64(poolAccountConcurrency(route.Provider, item.account))
 			active := activeCounts["conc:a:"+item.account.ID]
 			item.available, item.slotsSeen = maximum-active, true
-			if item.available <= 0 {
-				continue
-			}
-			slotEligible = append(slotEligible, item)
 		}
-		candidates = slotEligible
+	}
+	if slotsSeen && len(candidates) > 0 && poolPolicy(ctx).fastFailover {
+		available := false
+		for _, item := range candidates {
+			available = available || item.available > 0
+		}
+		if !available {
+			return nil, ErrConcurrencyFull
+		}
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
 		// Administrator weight is the primary scheduling preference. Within the
-		// same weight, prefer accounts that can absorb more concurrent work, then
-		// authoritative quota snapshots and best-fit remaining allowance.
+		// same weight, prefer accounts that can absorb more concurrent work, while
+		// retaining busy accounts at the tail. Final admission is atomic in
+		// runPoolWithFailoverPolicy; keeping the full eligible set lets a queued or
+		// beta-retrying request use an account that becomes free moments later.
+		// Then prefer authoritative quota snapshots and best-fit allowance.
 		if left.account.Weight != right.account.Weight {
 			return left.account.Weight > right.account.Weight
 		}
@@ -245,13 +253,9 @@ func (s *V1Service) routeAccounts(ctx context.Context, route model.ModelRoute, a
 		if left.known && left.remaining != right.remaining {
 			return left.remaining < right.remaining
 		}
-		if left.account.LastUsedAt == nil || right.account.LastUsedAt == nil {
-			return left.account.LastUsedAt == nil && right.account.LastUsedAt != nil
-		}
-		if !left.account.LastUsedAt.Equal(*right.account.LastUsedAt) {
-			return left.account.LastUsedAt.Before(*right.account.LastUsedAt)
-		}
-		return left.account.ID < right.account.ID
+		// Incoming order has already been rotated. Stable ties preserve that
+		// distributed cursor instead of concentrating equivalent requests on ID.
+		return false
 	})
 	out := make([]model.TokenAccount, 0, len(candidates))
 	for _, item := range candidates {
@@ -282,7 +286,7 @@ func (s *V1Service) dispatchImageRoutes(ctx context.Context, eventID string, log
 	if len(in.ReferenceImages) > 0 {
 		operation = "edit"
 	}
-	requirements := model.RouteRequirements{Operation: operation, Ratio: ratio, Resolution: resolution, ReferenceImages: len(in.ReferenceImages)}
+	requirements := model.RouteRequirements{Operation: operation, Ratio: ratio, Resolution: resolution, Quality: in.Quality, ReferenceImages: len(in.ReferenceImages)}
 	routes, err := s.matchingRoutes(ctx, logical.ID, requirements)
 	if err != nil {
 		return nil, "", err
@@ -290,22 +294,21 @@ func (s *V1Service) dispatchImageRoutes(ctx context.Context, eventID string, log
 	if len(routes) == 0 {
 		return nil, "", ErrUnsupportedParams
 	}
-	var lastErr error
-	for _, route := range routes {
+	return runMediaRouteFailover(ctx, routes, strings.TrimSpace(in.AccountID), func(ctx context.Context, route model.ModelRoute) ([]byte, string, error) {
 		routeCtx := withDispatchRoute(ctx, route, defaultRouteCost(route, requirements))
 		available, accountErr := s.routeHasAccount(routeCtx, route, "image")
 		if accountErr != nil {
 			return nil, "", accountErr
 		}
 		if !available {
-			lastErr = ErrNoProviderAccount
-			continue
+			return nil, "", ErrNoProviderAccount
 		}
 		item, configErr := s.models.Routes().RouteConfig(ctx, route)
 		if configErr != nil {
 			return nil, "", configErr
 		}
 		_ = s.events.SetProvider(context.WithoutCancel(ctx), eventID, route.Provider)
+		var lastErr error
 		var data []byte
 		var url string
 		switch route.Provider {
@@ -324,20 +327,8 @@ func (s *V1Service) dispatchImageRoutes(ctx context.Context, eventID string, log
 		default:
 			lastErr = ErrProviderUnsupported
 		}
-		if lastErr == nil {
-			return data, url, nil
-		}
-		if noRouteFailover(lastErr) {
-			return nil, "", lastErr
-		}
-		if !routeFailoverSafe(lastErr) {
-			return nil, "", lastErr
-		}
-	}
-	if lastErr == nil {
-		lastErr = ErrNoProviderAccount
-	}
-	return nil, "", lastErr
+		return data, url, lastErr
+	})
 }
 
 func (s *V1Service) dispatchVideoRoutes(ctx context.Context, eventID string, logical *model.ModelConfig, in V1VideoRequest, ratio, resolution, duration string, download bool) ([]byte, string, error) {
@@ -350,16 +341,14 @@ func (s *V1Service) dispatchVideoRoutes(ctx context.Context, eventID string, log
 	if len(routes) == 0 {
 		return nil, "", ErrUnsupportedParams
 	}
-	var lastErr error
-	for _, route := range routes {
+	return runMediaRouteFailover(ctx, routes, strings.TrimSpace(in.AccountID), func(ctx context.Context, route model.ModelRoute) ([]byte, string, error) {
 		routeCtx := withDispatchRoute(ctx, route, defaultRouteCost(route, requirements))
 		available, accountErr := s.routeHasAccount(routeCtx, route, "video")
 		if accountErr != nil {
 			return nil, "", accountErr
 		}
 		if !available {
-			lastErr = ErrNoProviderAccount
-			continue
+			return nil, "", ErrNoProviderAccount
 		}
 		item, configErr := s.models.Routes().RouteConfig(ctx, route)
 		if configErr != nil {
@@ -367,6 +356,7 @@ func (s *V1Service) dispatchVideoRoutes(ctx context.Context, eventID string, log
 		}
 		_ = s.events.SetProvider(context.WithoutCancel(ctx), eventID, route.Provider)
 		seconds := parseDurationSeconds(duration)
+		var lastErr error
 		var data []byte
 		var url string
 		switch route.Provider {
@@ -383,20 +373,8 @@ func (s *V1Service) dispatchVideoRoutes(ctx context.Context, eventID string, log
 		default:
 			lastErr = ErrProviderUnsupported
 		}
-		if lastErr == nil {
-			return data, url, nil
-		}
-		if noRouteFailover(lastErr) {
-			return nil, "", lastErr
-		}
-		if !routeFailoverSafe(lastErr) {
-			return nil, "", lastErr
-		}
-	}
-	if lastErr == nil {
-		lastErr = ErrNoProviderAccount
-	}
-	return nil, "", lastErr
+		return data, url, lastErr
+	})
 }
 
 func defaultRouteCost(route model.ModelRoute, req model.RouteRequirements) float64 {
@@ -436,7 +414,7 @@ func evaluateRouteCost(route model.ModelRoute, req model.RouteRequirements) (flo
 		}
 		credits, err := byteplus.RequiredCredits(byteplus.ImageRequest{
 			Model: providerModel, Resolution: req.Resolution, Size: req.Resolution,
-			AspectRatio: req.Ratio, Quality: upstreamQuality(req.Resolution),
+			AspectRatio: req.Ratio, Quality: upstreamImageQuality(req.Quality, req.Resolution),
 			References: make([][]byte, max(0, req.ReferenceImages)),
 		})
 		if err != nil || credits < 0 {
@@ -465,10 +443,14 @@ func evaluateRouteCost(route model.ModelRoute, req model.RouteRequirements) (flo
 }
 
 func noRouteFailover(err error) bool {
-	return errors.Is(err, byteplus.ErrTaskAccepted) || errors.Is(err, byteplus.ErrTaskSubmissionUnknown)
+	return errors.Is(err, byteplus.ErrTaskAccepted) || errors.Is(err, byteplus.ErrTaskSubmissionUnknown) ||
+		errors.Is(err, byteplus.ErrRetryableTaskFailed) || errors.Is(err, errBytePlusRetryBudgetExhausted)
 }
 
 func routeFailoverSafe(err error) bool {
+	if errors.Is(err, errGeneratedArtifactUnavailable) {
+		return false
+	}
 	return errors.Is(err, ErrNoProviderAccount) || errors.Is(err, ErrConcurrencyFull) ||
 		errors.Is(err, adobe.ErrEntitlement) || errors.Is(err, adobe.ErrAuth) || errors.Is(err, adobe.ErrQuotaExhausted) || errors.Is(err, adobe.ErrTemporaryUpstream) ||
 		errors.Is(err, byteplus.ErrAuth) || errors.Is(err, byteplus.ErrQuotaExhausted) || errors.Is(err, byteplus.ErrTemporaryUpstream) ||
@@ -506,6 +488,11 @@ func dispatchFailureClass(err error) (state, class string) {
 	switch {
 	case err == nil:
 		return "succeeded", ""
+	case errors.Is(err, byteplus.ErrRetryableTaskFailed):
+		// The parent task is known and terminal. Reservation handling separately
+		// decides whether a verified uncharged attempt is released or conservatively
+		// settled, while this failed dispatch always retains its upstream task ID.
+		return "failed", "temporary"
 	case errors.Is(err, byteplus.ErrTaskAccepted):
 		return "accepted", "temporary"
 	case errors.Is(err, byteplus.ErrTaskSubmissionUnknown):

@@ -6,7 +6,28 @@ import (
 
 	"backend/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// UpsertBytePlusLogin stores the password-login material used only by 2API's
+// internal renewal worker. It never exposes these fields through admin JSON.
+func (r *RefreshProfileRepository) UpsertBytePlusLogin(ctx context.Context, accountID, identity, secret string, nextRetryAt time.Time) error {
+	now := time.Now()
+	item := model.RefreshProfile{
+		ID: accountID, Name: "Lumina " + identity, Pool: "byteplus", Kind: "byteplus_password",
+		LoginIdentity: identity, LoginSecret: secret, Enabled: true, IntervalSeconds: 3600,
+		NextRetryAt: &nextRetryAt, CreatedAt: now, UpdatedAt: now,
+	}
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"name": identity, "pool": "byteplus", "kind": "byteplus_password",
+			"login_identity": identity, "login_secret": secret, "enabled": true,
+			"interval_seconds": 3600, "next_retry_at": nextRetryAt, "last_error": "",
+			"consecutive_failures": 0, "updated_at": now,
+		}),
+	}).Create(&item).Error
+}
 
 type RefreshProfileRepository struct {
 	db *gorm.DB

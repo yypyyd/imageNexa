@@ -31,8 +31,8 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(migrations) != 7 {
-		t.Fatalf("loaded %d migrations, want 7", len(migrations))
+	if len(migrations) != 9 {
+		t.Fatalf("loaded %d migrations, want 9", len(migrations))
 	}
 
 	sqlDB, err := db.DB()
@@ -72,6 +72,12 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err := applyOne(ctx, conn, migrations[6]); err != nil {
 		t.Fatalf("apply migration 000007: %v", err)
 	}
+	if err := applyOne(ctx, conn, migrations[7]); err != nil {
+		t.Fatalf("apply migration 000008: %v", err)
+	}
+	if err := applyOne(ctx, conn, migrations[8]); err != nil {
+		t.Fatalf("apply migration 000009: %v", err)
+	}
 
 	assertLegacyIdentity(t, db)
 	assertClosedCatalogAndCustomRoutes(t, db)
@@ -81,6 +87,7 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	assertLegacyIdentityScrubbed(t, db)
 	assertLegacyTablesRemoved(t, db)
 	assertAdobeARPSessionsBackfilled(t, db)
+	assertQuotaReservationsCascadeOnAccountDelete(t, db)
 
 	// A normal second startup must be a checksum-validated no-op.
 	if err := conn.Close(); err != nil {
@@ -89,8 +96,8 @@ func TestPostgresLegacyUpgrade(t *testing.T) {
 	if err := Run(ctx, db); err != nil {
 		t.Fatalf("second migration Run() error = %v", err)
 	}
-	assertInt64(t, db, "SELECT COUNT(*) FROM schema_migrations", 7)
-	assertInt64(t, db, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", 7)
+	assertInt64(t, db, "SELECT COUNT(*) FROM schema_migrations", 9)
+	assertInt64(t, db, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", 9)
 }
 
 func TestPostgresDisabledAdminRemainsBootstrapable(t *testing.T) {
@@ -335,6 +342,22 @@ func assertAdobeARPSessionsBackfilled(t *testing.T, db *gorm.DB) {
 			t.Fatalf("backfilled Adobe ARP token has unexpected shape: %q", token)
 		}
 	}
+}
+
+func assertQuotaReservationsCascadeOnAccountDelete(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	assertInt64(t, db, `
+		SELECT COUNT(*)
+		FROM quota_reservations reservation
+		JOIN account_quota_buckets bucket ON bucket.id = reservation.quota_bucket_id
+		WHERE bucket.account_id = 'adobe-main'`, 3)
+	if err := db.Exec("DELETE FROM provider_accounts WHERE id = ?", "adobe-main").Error; err != nil {
+		t.Fatalf("delete account with quota reservation history: %v", err)
+	}
+	assertInt64(t, db, `
+		SELECT COUNT(*)
+		FROM quota_reservations
+		WHERE id IN ('adobe-hold-image','adobe-hold-video','adobe-hold-shared')`, 0)
 }
 
 func assertRetiredDataScrubbed(t *testing.T, db *gorm.DB) {

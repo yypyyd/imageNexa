@@ -62,6 +62,7 @@ type RouteRequirements struct {
 	Operation       string
 	Ratio           string
 	Resolution      string
+	Quality         string
 	Duration        string
 	ReferenceImages int
 	ReferenceVideos int

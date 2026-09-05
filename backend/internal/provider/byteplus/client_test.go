@@ -348,6 +348,121 @@ func TestFetchCreditsBalancePreservesFractionalComputingPoints(t *testing.T) {
 	}
 }
 
+func TestFetchCreditsBalanceReportsNoActivePlanAsKnownZero(t *testing.T) {
+	// Observed 2026-09-02 on 119 pool accounts: get_user_resources answers code 0
+	// with an empty combos list and a null quota_list, and get_user_quota answers
+	// code 200402 "No Active Combos." with is_country_blocked=true.
+	t.Run("empty combos payload", func(t *testing.T) {
+		var quotaCalls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/user/get_user_resources":
+				writeEnvelope(t, w, map[string]any{"quota_list": nil, "uris": []any{}, "combos": []any{}})
+			case "/api/inference/get_user_quota":
+				quotaCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200402, "message": "No Active Combos.", "data": map[string]any{"is_country_blocked": true}})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		withAPIBase(t, server.URL+"/api")
+		got, err := NewClient("").FetchCreditsBalance(context.Background(), "csrfToken=x; sessionid=y")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unknown, _ := got["unknown"].(bool); unknown || got["remaining"] != 0 || got["error"] != nil {
+			t.Fatalf("no-plan balance = %#v, want known zero", got)
+		}
+		if quotaCalls != 0 {
+			t.Fatalf("empty combos payload should be conclusive without the fallback probe, got %d fallback calls", quotaCalls)
+		}
+	})
+
+	t.Run("fallback verdict", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/user/get_user_resources":
+				// No combos field at all: inconclusive on its own.
+				writeEnvelope(t, w, map[string]any{"uris": []any{}})
+			case "/api/inference/get_user_quota":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200402, "message": "No Active Combos."})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		withAPIBase(t, server.URL+"/api")
+		got, err := NewClient("").FetchCreditsBalance(context.Background(), "csrfToken=x; sessionid=y")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unknown, _ := got["unknown"].(bool); unknown || got["remaining"] != 0 {
+			t.Fatalf("no-plan fallback balance = %#v, want known zero", got)
+		}
+	})
+
+	t.Run("active plan still reads real balance", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/user/get_user_resources" {
+				http.NotFound(w, r)
+				return
+			}
+			writeEnvelope(t, w, map[string]any{
+				"quota_list": []any{map[string]any{"resource_id": "lumi/computing_points", "used": 1, "total": 68}},
+				"combos":     []any{map[string]any{"id": 17, "name": "Free"}},
+			})
+		}))
+		defer server.Close()
+		withAPIBase(t, server.URL+"/api")
+		got, err := NewClient("").FetchCreditsBalance(context.Background(), "csrfToken=x; sessionid=y")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["remaining"] != 67 || got["total"] != 68 {
+			t.Fatalf("free plan balance = %#v", got)
+		}
+	})
+}
+
+func TestAPIDataMarksDefinitiveRejections(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantClass  error
+		rejected   bool
+	}{
+		{name: "business code in 200 envelope", statusCode: http.StatusOK, body: `{"code":1500,"message":"internal error"}`, wantClass: ErrTemporaryUpstream, rejected: true},
+		{name: "no active combos", statusCode: http.StatusOK, body: `{"code":200402,"message":"No Active Combos."}`, wantClass: ErrNoActivePlan, rejected: true},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, body: `{"message":"too many requests"}`, wantClass: ErrTemporaryUpstream, rejected: true},
+		{name: "gateway error", statusCode: http.StatusBadGateway, body: `bad gateway`, wantClass: ErrTemporaryUpstream, rejected: false},
+		{name: "non-json success", statusCode: http.StatusOK, body: `<html>challenge</html>`, wantClass: ErrTemporaryUpstream, rejected: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			withAPIBase(t, server.URL+"/api")
+			_, err := NewClient("").apiData(context.Background(), http.MethodPost, "/inference/v2/create_task", "csrfToken=x; sessionid=y", map[string]any{})
+			if !errors.Is(err, tc.wantClass) {
+				t.Fatalf("error = %v, want %v", err, tc.wantClass)
+			}
+			if errors.Is(err, ErrUpstreamRejected) != tc.rejected {
+				t.Fatalf("error = %v, rejected marker = %v, want %v", err, !tc.rejected, tc.rejected)
+			}
+		})
+	}
+	if !errors.Is(ErrNoActivePlan, ErrQuotaExhausted) {
+		t.Fatal("ErrNoActivePlan must remain a quota-class error for scheduling and API mapping")
+	}
+}
+
 func TestFetchCreditsBalanceKeepsTransientFailureUnknown(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "maintenance", http.StatusServiceUnavailable)

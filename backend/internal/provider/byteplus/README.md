@@ -26,13 +26,32 @@ scrape login credentials, or create browser sessions.
 `Client` receives a complete Lumina browser Cookie. The Cookie must contain a
 non-empty `csrfToken`; JSON/control-plane calls mirror it in `X-Csrf-Token`.
 Credentials must stay in private account storage and must never be logged.
+Lumina login sessions currently expire after approximately 48 hours. The
+service layer reads `digest.exp` as a scheduling deadline and identifies Cookie
+rotations with a SHA-256 fingerprint of the stable `AccountID`; re-importing a
+fresh Cookie therefore updates the same account rather than creating another
+row. Passwords are optional. When supplied with the import, the login identity
+and secret are stored only in the private refresh profile used by 2API's local
+renewal worker and are never returned by the control plane.
 
 Task creation is non-idempotent. Once submission may have reached
 `create_task`, the package returns a no-resubmit sentinel on an ambiguous
 response. After a parent task ID is known, polling retries only that task and
 artifact retries use only the returned URL. Callers must honor
 `ErrTaskSubmissionUnknown` and `ErrTaskAccepted` and must not replay the whole
-generation.
+generation. The sole account-level exception requires GPT Image 2's fixed
+inference ID plus an exact parent `failed` / child `downstream_execute` verdict
+whose child `fail_reason` is Lumina's known beta-instability message. It
+additionally returns `ErrRetryableTaskFailed`, retains `ErrTaskAccepted` and the
+failed parent ID for audit, and lets 2API consider a bounded chain of at most six
+distinct accounts on the same route. 2API only advances when that failed
+account's live pre-submit balance and three fresh post-failure balances all prove
+that no points were consumed. Every failed account must pass this proof
+independently. An unknown, changed, or unavailable balance stops the chain. It
+never returns to an attempted account, enters the ordinary 300-second temporary
+retry loop, or switches provider routes. Busy eligible accounts stay at the end
+of the candidate list so the bounded account wait can admit them after a slot is
+released.
 
 ## Internal use
 
@@ -84,6 +103,14 @@ smallest sufficient known balance is preferred so larger balances remain for
 expensive requests. Every successful or possibly accepted generation refreshes
 the upstream balance. In-flight holds are tracked separately so concurrent
 refreshes cannot erase one another.
+
+Known-expired Lumina sessions are also excluded from normal dispatch. The admin
+account list reports the expiry and highlights the final six hours; an explicit
+per-account test remains available for diagnosis. When a private refresh
+profile contains the account's login identity and secret, 2API itself performs
+the narrow password-login protocol six hours before expiry, verifies stable
+`AccountID`, and rotates the existing Cookie. Imports without login material
+remain manual-renewal accounts.
 
 ## Files
 

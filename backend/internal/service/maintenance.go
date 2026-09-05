@@ -6,9 +6,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/internal/model"
+	"backend/internal/provider/byteplus"
 	"backend/internal/repo"
 	"backend/internal/storage"
 )
@@ -33,6 +35,7 @@ type MaintenanceService struct {
 	mediaPruneEvery time.Duration
 	lastMediaPrune  time.Time
 	quotaRecoverAge time.Duration
+	quotaRefreshing atomic.Bool
 }
 
 func NewMaintenanceService(tokens *repo.TokenRepository, tokenSvc *TokenService, events *repo.EventRepository, refresh *RefreshProfileService, settings *repo.SiteSettingRepository, models *repo.ModelRepository, store *storage.Client, recovery *V1Service) *MaintenanceService {
@@ -70,24 +73,26 @@ func (m *MaintenanceService) Run(ctx context.Context) {
 	}
 }
 
-// syncRecoveredQuota re-probes recovered ChatGPT accounts so their displayed
-// image balance reflects the post-reset value. Bounded concurrency avoids a
-// thundering herd at the daily reset.
-func (m *MaintenanceService) syncRecoveredQuota(accs []model.TokenAccount) {
+// syncRecoveredQuota refreshes both display metadata and the authoritative
+// scheduling bucket after recovery. Bounded concurrency absorbs reset bursts.
+func (m *MaintenanceService) syncRecoveredQuota(parent context.Context, accs []model.TokenAccount) {
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for _, acc := range accs {
-		switch acc.Pool {
-		case "chatgpt":
-		default:
+		if _, _, scoped := providerSnapshotScope(acc.Pool); !scoped {
 			continue
 		}
+		select {
+		case sem <- struct{}{}:
+		case <-parent.Done():
+			wg.Wait()
+			return
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(a model.TokenAccount) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 			defer cancel()
 			_, _ = m.tokenSvc.Quota(ctx, a.Pool, a.ID)
 		}(acc)
@@ -95,9 +100,47 @@ func (m *MaintenanceService) syncRecoveredQuota(accs []model.TokenAccount) {
 	wg.Wait()
 }
 
+// refreshDueQuota repairs zero/old buckets even when no request can select the
+// account. The database claim also throttles failed probes across processes.
+func (m *MaintenanceService) refreshDueQuota(ctx context.Context) {
+	if m.models == nil || m.tokenSvc == nil || !m.quotaRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer m.quotaRefreshing.Store(false)
+		buckets, err := m.models.Quotas().ClaimRefreshDue(ctx, time.Now(), 20)
+		if err != nil {
+			recordBookkeepingError("claim quota refresh", err)
+			return
+		}
+		accounts := make([]model.TokenAccount, 0, len(buckets))
+		seen := make(map[string]bool, len(buckets))
+		for _, bucket := range buckets {
+			if seen[bucket.AccountID] {
+				continue
+			}
+			// The scoped probe is account-wide; never probe an obsolete text bucket
+			// with an image/media endpoint.
+			for _, pool := range SchedulableProviders() {
+				key, _, ok := providerSnapshotScope(pool)
+				if ok && key == bucket.BucketKey {
+					seen[bucket.AccountID] = true
+					accounts = append(accounts, model.TokenAccount{ID: bucket.AccountID, Pool: pool})
+					break
+				}
+			}
+		}
+		m.syncRecoveredQuota(ctx, accounts)
+	}()
+}
+
 func (m *MaintenanceService) tick(ctx context.Context) {
 	m.resumeAcceptedImages(ctx)
+	// Verified-absent submissions flip to failed here so the reservation sweep
+	// below releases their hold in the same tick.
+	m.reconcileUnknownSubmissions(ctx)
 	m.reconcileOpenQuotaReservations(ctx)
+	m.refreshDueQuota(ctx)
 	// 1. Re-activate quota-exhausted tokens whose reset time has passed, then
 	//    auto-sync their real balance where the provider exposes a cheap probe.
 	if recovered, err := m.tokens.RecoverQuota(ctx); err != nil {
@@ -105,7 +148,7 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	} else if len(recovered) > 0 {
 		log.Printf("maintenance: recovered %d quota token(s)", len(recovered))
 		if m.tokenSvc != nil {
-			go m.syncRecoveredQuota(recovered)
+			go m.syncRecoveredQuota(ctx, recovered)
 		}
 	}
 
@@ -224,6 +267,161 @@ func (m *MaintenanceService) resumeAcceptedImages(ctx context.Context) {
 	}
 }
 
+// Ambiguous create_task outcomes are verified against the provider's own task
+// history only after the create timeout has fully elapsed, so a slowly accepted
+// task cannot be missed. Past the hard cap an event whose account can no longer
+// be read (dead cookie, persistent upstream failure) is closed anyway: BytePlus
+// finishes image tasks within minutes, and pinning a downstream client on
+// "in_progress" forever is worse than a rare lost image.
+const (
+	unknownSubmissionVerifyAfter = 2 * time.Minute
+	unknownSubmissionHardCap     = time.Hour
+	unknownSubmissionSlack       = time.Minute
+)
+
+// reconcileUnknownSubmissions closes the loop on BytePlus create_task calls whose
+// response was lost. A task found in the account's history is adopted and then
+// resumed like any accepted task; a verified absence fails the event without
+// ever replaying the non-idempotent submission.
+func (m *MaintenanceService) reconcileUnknownSubmissions(ctx context.Context) {
+	if m.recovery == nil || m.models == nil || m.events == nil || m.tokens == nil {
+		return
+	}
+	attempts, err := m.models.Dispatch().ListUnknown(ctx, time.Now().Add(-unknownSubmissionVerifyAfter), 100)
+	if err != nil {
+		log.Printf("maintenance: list unknown submissions failed")
+		return
+	}
+	if len(attempts) == 0 {
+		return
+	}
+	m.recovery.applyGlobalProxy(ctx)
+	adopted, closed := 0, 0
+	for _, attempt := range attempts {
+		event, eventErr := m.events.GetByID(ctx, attempt.EventID)
+		if eventErr != nil {
+			log.Printf("maintenance: load unknown submission event failed")
+			continue
+		}
+		if event == nil || event.Status != "pending" {
+			// The event was closed by another path; the attempt row is historical.
+			// Mark it so the reservation sweep can release the hold.
+			m.finishUnknownSubmission(ctx, attempt, event)
+			continue
+		}
+		verdict, taskID := m.verifyUnknownSubmission(ctx, attempt, event)
+		switch decideUnknownSubmission(verdict, attempt.StartedAt, time.Now()) {
+		case adoptUnknownSubmission:
+			if err := m.models.Dispatch().Adopt(ctx, attempt.ID, taskID); err != nil {
+				log.Printf("maintenance: adopt verified submission failed")
+				continue
+			}
+			m.recovery.startAcceptedImageRecovery(ctx, event)
+			adopted++
+		case closeUnknownSubmission:
+			m.finishUnknownSubmission(ctx, attempt, event)
+			closed++
+		}
+	}
+	if adopted > 0 || closed > 0 {
+		log.Printf("maintenance: reconciled unknown submissions: adopted %d, closed %d", adopted, closed)
+	}
+}
+
+type unknownSubmissionVerdict int
+
+const (
+	unknownSubmissionUnverified unknownSubmissionVerdict = iota
+	unknownSubmissionAccepted
+	unknownSubmissionAbsent
+)
+
+type unknownSubmissionAction int
+
+const (
+	keepUnknownSubmission unknownSubmissionAction = iota
+	adoptUnknownSubmission
+	closeUnknownSubmission
+)
+
+// decideUnknownSubmission turns a history verdict into a state transition. A
+// provider verdict always wins; only the hard cap may close an attempt whose
+// history could not be read.
+func decideUnknownSubmission(verdict unknownSubmissionVerdict, startedAt, now time.Time) unknownSubmissionAction {
+	switch verdict {
+	case unknownSubmissionAccepted:
+		return adoptUnknownSubmission
+	case unknownSubmissionAbsent:
+		return closeUnknownSubmission
+	}
+	if now.Sub(startedAt) > unknownSubmissionHardCap {
+		return closeUnknownSubmission
+	}
+	return keepUnknownSubmission
+}
+
+// verifyUnknownSubmission consults the account's task history. The returned task
+// id is only meaningful for unknownSubmissionAccepted.
+func (m *MaintenanceService) verifyUnknownSubmission(ctx context.Context, attempt model.DispatchAttempt, event *model.EventLog) (unknownSubmissionVerdict, string) {
+	if event.Provider != "byteplus" || m.recovery.byteplus == nil {
+		// Only BytePlus produces ambiguous submissions today; anything else has no
+		// history to consult and can only age out.
+		return unknownSubmissionUnverified, ""
+	}
+	account, err := m.tokens.Get(ctx, "byteplus", attempt.AccountID)
+	if err != nil || account == nil || strings.TrimSpace(account.Value) == "" {
+		return unknownSubmissionUnverified, ""
+	}
+	providerModel := event.Model
+	if route, routeErr := m.models.Routes().GetRoute(ctx, attempt.ModelRouteID); routeErr == nil && route != nil {
+		if upstream := strings.TrimSpace(route.UpstreamModel); upstream != "" {
+			providerModel = upstream
+		}
+	}
+	finished := attempt.StartedAt
+	if attempt.FinishedAt != nil {
+		finished = *attempt.FinishedAt
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	taskID, err := m.recovery.byteplus.FindSubmittedTask(probeCtx, account.Value, byteplus.SubmittedTaskQuery{
+		Model:  providerModel,
+		Prompt: event.Prompt,
+		From:   attempt.StartedAt.Add(-unknownSubmissionSlack),
+		To:     finished.Add(unknownSubmissionSlack),
+	})
+	if err != nil {
+		return unknownSubmissionUnverified, ""
+	}
+	if taskID == "" {
+		return unknownSubmissionAbsent, ""
+	}
+	return unknownSubmissionAccepted, taskID
+}
+
+// finishUnknownSubmission records the terminal verdict. The attempt becomes a
+// plain temporary failure (the reservation sweep releases its hold), the event
+// leaves pending, and the account/route binding learns about the failure.
+func (m *MaintenanceService) finishUnknownSubmission(ctx context.Context, attempt model.DispatchAttempt, event *model.EventLog) {
+	if err := m.models.Dispatch().Finish(ctx, attempt.ID, "failed", "temporary", "", ErrProviderTemporary); err != nil {
+		log.Printf("maintenance: close unknown submission failed")
+		return
+	}
+	if event != nil && event.Status == "pending" {
+		if err := m.events.UpdateStatus(ctx, event.ID, "failed", ErrProviderTemporary.Error(), 0); err != nil {
+			log.Printf("maintenance: fail unverified pending event failed")
+		}
+		if m.inflight != nil {
+			m.inflight.Cancel(event.ID)
+		}
+	}
+	if attempt.AccountID != "" && attempt.ModelRouteID != "" {
+		if err := m.models.Routes().RecordAccountRouteResult(ctx, attempt.AccountID, attempt.ModelRouteID, "temporary", false); err != nil {
+			log.Printf("maintenance: record unknown submission route result failed")
+		}
+	}
+}
+
 func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context) {
 	if m.models == nil || m.tokenSvc == nil {
 		return
@@ -285,7 +483,7 @@ func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context)
 }
 
 func (m *MaintenanceService) refreshRecoveredQuota(ctx context.Context, account model.TokenAccount, bucketKey string) *float64 {
-	authoritativeBucket, unit, scoped := providerSnapshotScope(account.Pool)
+	authoritativeBucket, _, scoped := providerSnapshotScope(account.Pool)
 	if !scoped || strings.TrimSpace(bucketKey) != authoritativeBucket {
 		return nil
 	}
@@ -297,14 +495,6 @@ func (m *MaintenanceService) refreshRecoveredQuota(ctx context.Context, account 
 	}
 	remaining, ok := anyFloat(snapshot["remaining"])
 	if !ok {
-		return nil
-	}
-	var total *float64
-	if value, exists := anyFloat(snapshot["total"]); exists {
-		total = &value
-	}
-	if _, err := m.models.Quotas().UpsertSnapshot(ctx, account.ID, bucketKey, unit, total, &remaining, parseResetTime(snapshot["reset_after"])); err != nil {
-		log.Printf("maintenance: refresh recovered quota snapshot failed")
 		return nil
 	}
 	return &remaining

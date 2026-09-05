@@ -1,7 +1,7 @@
 # 2API Design
 
 Status: locked product architecture
-Last updated: 2026-09-01
+Last updated: 2026-09-03
 
 ## 1. Goals and boundaries
 
@@ -155,9 +155,11 @@ For each request, the scheduler performs these steps in order:
 3. Query enabled routes for the logical model and retain only routes whose single capability profile satisfies the complete requirement set.
 4. Order routes by configured priority and weight.
 5. For each route, load only accounts with an enabled and entitled `AccountModelRoute` binding.
-6. Remove accounts that are disabled, authentication-invalid, cooling down, at their concurrency limit, or known to have less than the model's required quota.
+6. Remove accounts that are disabled, authentication-invalid, cooling down, or known to have less than the model's required quota. Busy accounts remain queue candidates; batched Redis observations avoid acquiring their full gates individually.
 7. Within the remaining group, apply account weight, available concurrency, health, and quota best-fit ordering. Round-robin state breaks equivalent choices without starving peers.
-8. Atomically acquire concurrency and create the dispatch/quota reservations before provider submission.
+8. Atomically acquire concurrency, revalidate the current credential, account state, account binding, model/provider/route switches and quota, and create dispatch/quota reservations before provider submission. A queued first admission respects cooldown; a bounded retry already admitted on that account can continue through its own cooldown.
+
+When a model has multiple routes, make a non-waiting pass across them before queueing on capacity. Only full routes are revisited within one shared 90-second wait; failed routes do not enter a repeated cross-route submit loop. Single-route requests retain their bounded temporary retry, and the verified BytePlus beta chain retains its separate six-distinct-account budget. Queue polling uses jitter and batches capacity reads; per-request account snapshots refresh at most once per second, while each actual admission is revalidated. Equal ranked accounts preserve the distributed round-robin order. Concurrency cleanup uses an independent three-second context so cancelled work cannot leak a slot until its 15-minute lease expires. Capacity observation uses Redis time and never deletes leases.
 
 Provider names are never client-selectable. A Custom provider account may implement an existing canonical route, but it must bind at least one catalog model and cannot create a new public ID.
 
@@ -172,6 +174,8 @@ Before submission:
 - reserve the amount transactionally and increment the account's in-flight usage;
 - permit an unknown balance while still recording a reservation, so the first later snapshot cannot erase concurrent work.
 
+All trusted manual and automatic balance probes update the same scheduling quota bucket, preserving outstanding holds. Account reset recovery probes every supported provider. Maintenance also claims up to 20 stale/reset-due quota buckets with PostgreSQL `FOR UPDATE SKIP LOCKED` and probes with four workers; successful snapshots expire for probing after 15 minutes, and `updated_at` supplies a five-minute retry delay for failed claims without pretending the balance was refreshed. Unknown/auth-failed probes never replace a balance with zero.
+
 After every generation, 2API refreshes or reconciles the selected account's upstream quota. Reconciliation releases only that request's reservation and writes `upstream remaining - other active reservations`. Concurrent completions therefore cannot overwrite each other's holds.
 
 Outcome rules:
@@ -182,10 +186,25 @@ Outcome rules:
 | Definite pre-acceptance temporary error | release | cooldown/failure counter as configured | safe route/account retry allowed |
 | Authentication failure | release | disable affected credential or binding | allowed |
 | Quota exhausted | settle/reconcile actual balance | remove affected account/bucket from eligible set | allowed |
+| Adobe image completed, then artifact download failed | already settled at generation completion | retain the result URL; retry that download up to three times | never regenerate or switch routes for download failure |
 | Accepted and completed | settle with fresh balance | update success and quota snapshot | no further route |
 | Accepted then transient polling/download error | settle conservatively and refresh | keep original task/account and resume it | never resubmit |
 | Accepted then explicit terminal provider failure | settle conservatively and refresh | close event/dispatch as failed without permanently disabling the account | never resubmit |
+| BytePlus GPT Image 2 exact beta-instability terminal failure, with unchanged live pre-submit and three post-failure balances | release that account's confirmed-unconsumed reservation | retain task ID and cool the failed account | up to six distinct BytePlus accounts on the same route; never revisit an attempted account, enter the ordinary temporary loop, or fail over routes |
 | Submission outcome unknown | mark uncertain | schedule reconciliation | never resubmit |
+
+An unknown submission is one whose provider answer was lost (transport failure, timeout, 5xx, undecodable body). A parsed refusal — HTTP 4xx or a business error code such as BytePlus 200402 "No Active Combos." — is definite and follows the matching row above instead. Maintenance reconciles unknown submissions two minutes after they finish by reading the account's authenticated task history for the same model, prompt, and window: a matching task is adopted and resumed as an accepted task; a verified absence fails the event and releases the reservation. If the history cannot be read (for example an expired session), the event is closed after a one-hour hard cap so a downstream client is never left polling `in_progress` indefinitely.
+
+The BytePlus exception is deliberately fail-closed: the fixed GPT Image 2
+inference ID, parent/child statuses, and exact failure text must all match, and
+each failed account's four balance snapshots must be known and identical. The
+bounded chain can submit to at most six distinct accounts, never revisits one,
+never enters the ordinary 300-second temporary retry loop, and never crosses the
+selected route. Any mismatch, changed/unknown balance, failed probe, or ambiguous
+submission stops account switching and falls back to the ordinary accepted-task
+rule. Accounts that are merely at their concurrency limit remain at the end of
+the candidate set and can be admitted if a slot becomes free during the bounded
+account wait.
 
 The administrator may explicitly refresh an account. Import also performs identity and quota validation before returning success. Background maintenance can refresh due accounts, but it supplements rather than replaces per-generation reconciliation.
 
@@ -208,7 +227,11 @@ Destructive account health transitions require affirmative provider-specific evi
 
 BytePlus accepts only the complete Lumina website Cookie. The administrator may submit a raw Cookie Header or a structured browser export; `cookie_string`, `cookie_header`, or `cookies[]` are reduced to one normalized Cookie before persistence.
 
-The Cookie must include a non-empty `csrfToken` and valid session data. A standalone CSRF token is insufficient. The server derives `X-Csrf-Token` from the same Cookie for write requests. Profile, avatar, tenant, cached quota, and other exported metadata are ignored and fetched again from BytePlus.
+The Cookie must include a non-empty `csrfToken` and valid session data. A standalone CSRF token is insufficient. The server derives `X-Csrf-Token` from the same Cookie for write requests. Profile, avatar, tenant, cached quota, and other exported metadata are ignored and fetched again from BytePlus. An optional email/password pair is persisted only in the private refresh profile for local renewal and never copied into provider metadata or API responses.
+
+The observed Lumina login contract gives `digest` JWTs a fixed 48-hour lifetime while keeping `AccountID` stable across logins. The service hashes `AccountID` to form a non-secret identity fingerprint, uses it to update the existing provider-account row on Cookie rotation, and reads the unverified `digest.exp` claim only as a local scheduling deadline. A known-expired session is excluded from ordinary dispatch; legacy credentials whose expiry cannot be parsed remain probeable so an unknown claim format does not destroy an otherwise valid account. An explicit administrator account test may still select an expired row for diagnosis.
+
+Optional Lumina password-login material lives in private `refresh_profiles` columns and is never serialized by the control plane. The 2API maintenance worker owns renewal end to end: a profile becomes due six hours before `digest.exp`, performs the narrow BytePlus `getLoginCredential` + `mixtureLogin` protocol, verifies that the new Cookie hashes to the same stable `AccountID`, and atomically rotates the existing credential generation. Failures use bounded backoff without killing a still-valid old session. Imports without email/password remain valid but cannot auto-renew.
 
 The Cookie is stored only in private account credential storage. It must never appear in event logs, model discovery, content URLs, errors, or administrator list responses.
 
@@ -253,7 +276,7 @@ Settings expose one enable switch per provider pool (`provider.<pool>.enabled`, 
 
 ## 11. Persistence and migrations
 
-PostgreSQL is authoritative for the administrator, API credentials, canonical models, routes, provider accounts, route bindings, quota buckets, reservations, dispatch attempts, event logs, and settings.
+PostgreSQL is authoritative for the administrator, API credentials, canonical models, routes, provider accounts, route bindings, quota buckets, reservations, dispatch attempts, event logs, and settings. Deleting a provider account removes its route bindings, quota buckets, and bucket-owned reservation ledger entries transactionally; immutable event logs and dispatch history retain their account snapshots/nullable references.
 
 Redis owns ephemeral concurrency and coordination. It must not be the sole source of truth for quota, dispatch acceptance, or key status. RustFS stores private generated artifacts; metadata and ownership remain in PostgreSQL.
 
@@ -323,6 +346,20 @@ Contract tests must assert:
 - Long image/video requests need outer-proxy timeouts compatible with Nginx and should use idempotency or asynchronous task mode.
 
 ## 15. Change record
+
+### 2026-09-05 — Revalidate queued accounts and recover scheduling capacity
+
+**Change**: Detached concurrency cleanup from cancelled work, used Redis-time batched lease observations, unified trusted balance probes with scheduling buckets, and added bounded stale/reset quota refresh. Every actual media/text admission now revalidates account and route/model/provider state. Requests exclude their failed auth/quota candidates, preserve round-robin ties, and try alternate routes before waiting for capacity. Adobe artifact downloads run after generation settlement and cannot trigger a second generation.
+
+**Validation**: Regression tests exercise cancellation cleanup, atomic concurrency under contention, skewed worker clocks, full-pool batch admission, disabled accounts during queueing, auth failure followed by temporary retry, quota recovery with outstanding reservations, equivalent-account rotation, alternate-route capacity, and the accepted-task/download no-resubmit boundary. Existing BytePlus beta retry tests remain part of the suite.
+
+### 2026-09-03 — Make abnormal-account cleanup atomic and FK-safe
+
+**Change**: Migration 000008 makes quota reservations cascade with their account-owned quota bucket. The administrator's abnormal-account cleanup now deletes all selected dead accounts in one database statement, and manual disablement no longer marks a valid credential dead.
+
+**Reason**: A used account could not be deleted because its quota bucket was cascade-deleted while historical reservation rows still held a restrictive foreign key. The handler hid that database error behind `administrator operation failed`; per-row bulk cleanup could also stop after deleting only part of the batch.
+
+**Impact**: Dead-account cleanup no longer fails on accounts with quota history and is all-or-nothing at the provider-account deletion step. Route bindings, quota buckets, and their reservation ledger entries are removed; immutable event logs remain, dispatch account references become null, and manually disabled credentials are excluded from dead-account cleanup.
 
 ### 2026-09-02 — Per-provider scheduling switches
 

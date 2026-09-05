@@ -52,13 +52,13 @@ var (
 	// ErrGenerationAccepted means a synchronous image request has durable state
 	// and must be continued through its poll URL. HTTP handlers map the attached
 	// task payload to 202 instead of holding the connection past proxy timeouts.
-	ErrGenerationAccepted     = errors.New("image generation accepted; poll the task URL")
-	ErrProviderAuth           = errors.New("provider token invalid or expired")
-	ErrNoProviderAccount      = errors.New("no provider account available, please ask an admin to configure one")
+	ErrGenerationAccepted = errors.New("image generation accepted; poll the task URL")
+	ErrProviderAuth       = errors.New("provider token invalid or expired")
+	ErrNoProviderAccount  = errors.New("no provider account available, please ask an admin to configure one")
 	// ErrProviderDisabled means every provider capable of serving the request
 	// has been switched off by an administrator. It is distinct from
 	// ErrUnsupportedParams: the parameters are valid, the pools are just closed.
-	ErrProviderDisabled = errors.New("all providers for this model are disabled by the administrator")
+	ErrProviderDisabled       = errors.New("all providers for this model are disabled by the administrator")
 	ErrProviderQuota          = errors.New("provider quota exhausted")
 	ErrProviderTemporary      = errors.New("provider temporary unavailable")
 	ErrProviderExecution      = errors.New("provider request failed")
@@ -84,7 +84,47 @@ var (
 	// remaining valid for cheaper work. It participates in quota failover but
 	// must not be moved to the pool-wide quota state.
 	errAccountTaskQuota = errors.New("provider account balance below current task cost")
+	// Private scheduler markers: the provider's exact terminal beta verdict may
+	// switch accounts only after live probes verify that it consumed no points,
+	// and the bounded distinct-account retry chain must never fan out to another
+	// route.
+	errBytePlusRetryVerified        = errors.New("byteplus beta failure verified uncharged")
+	errBytePlusRetryBudgetExhausted = errors.New("byteplus beta account retry budget exhausted")
 )
+
+type verifiedBytePlusRetryFailure struct {
+	cause    error
+	baseline float64
+}
+
+func (failure *verifiedBytePlusRetryFailure) Error() string { return failure.cause.Error() }
+
+func (failure *verifiedBytePlusRetryFailure) Unwrap() []error {
+	return []error{failure.cause, errBytePlusRetryVerified}
+}
+
+func verifiedBytePlusRetry(cause error, baseline float64) error {
+	return &verifiedBytePlusRetryFailure{cause: cause, baseline: baseline}
+}
+
+func bytePlusRetryVerification(err error) (*verifiedBytePlusRetryFailure, bool) {
+	var failure *verifiedBytePlusRetryFailure
+	if !errors.As(err, &failure) {
+		return nil, false
+	}
+	return failure, true
+}
+
+func finalizeBytePlusRetryVerification(err error, remaining *float64) error {
+	verification, ok := bytePlusRetryVerification(err)
+	if !ok {
+		return err
+	}
+	if remaining == nil || math.Abs(*remaining-verification.baseline) > 1e-9 {
+		return verification.cause
+	}
+	return err
+}
 
 // maxReferenceImageBytes bounds a single decoded reference image. 20 MB
 // comfortably covers real photos/screenshots; anything larger is almost
@@ -123,9 +163,9 @@ type V1Service struct {
 	// tokenCursors holds one strict round-robin cursor per pool (key: pool name,
 	// value: *uint64). Each pick advances the pool's cursor by one so accounts
 	// are used in a fixed, even rotation (acct1→acct2→acct3→acct1…) independent
-	// of fails/last_used. The atomic counter also serializes concurrent picks so
-	// two simultaneous requests never start on the same account. It is only the
-	// fallback for a missing/unreachable Redis — see nextCursor.
+	// of fails/last_used. The cursor distributes equivalent candidates, while
+	// the atomic Redis gate remains the final authority for admission. This
+	// counter is the fallback for missing/unreachable Redis — see nextCursor.
 	tokenCursors sync.Map
 	// acctCooldowns holds "pool:accountID" → time.Time until which an account that
 	// just failed upstream is demoted to the back of its pool's rotation, so the
@@ -158,7 +198,7 @@ type V1Service struct {
 
 	// conc is the Redis-backed concurrency limiter for BOTH the per-account
 	// upstream gate (1+ jobs per account) and the per-user gate (画图台 + API key,
-	// capped by the user's concurrency group). Self-healing + fail-open.
+	// capped by the user's concurrency group). Bounded gates fail closed.
 	conc *ConcurrencyService
 }
 
@@ -240,10 +280,8 @@ type V1ImageRequest struct {
 	Prompt    string
 	RequestID string
 	Size      string
-	// Quality is OpenAI's image quality (low|medium|high|auto). Only the GPT Image
-	// 2 family uses it to select a resolution tier; other models keep their own
-	// size/resolution behavior. An explicit internal Resolution always remains
-	// authoritative.
+	// Quality is OpenAI's image quality (low|medium|high|auto). Providers that
+	// expose it independently from image dimensions receive it unchanged.
 	Quality string
 	// Background and OutputFormat are part of the GPT Image request surface, but
 	// this multi-provider gateway cannot currently guarantee them. Explicit
@@ -965,6 +1003,16 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 				busy++
 				continue
 			}
+			current, admissionErr := s.revalidateDispatchAccount(routeCtx, pool, token.ID, "text", false)
+			if admissionErr != nil {
+				s.acctRelease(bookCtx, token.ID, eventID)
+				if errors.Is(admissionErr, ErrNoProviderAccount) || routeFailoverSafe(admissionErr) {
+					lastErr = admissionErr
+					continue
+				}
+				return nil, admissionErr
+			}
+			token = current
 			recordBookkeepingError("set chat account", s.events.SetAccount(bookCtx, eventID, token.ID, token.AccountEmail))
 			recordBookkeepingError("touch chat account", s.tokens.TouchLastUsed(bookCtx, token.ID))
 			dispatch, dispatchErr := s.models.Dispatch().Start(bookCtx, eventID, route.ID, token.ID)
@@ -1546,6 +1594,13 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			// create_task is non-idempotent. Accepted and submission-unknown
 			// outcomes stay pending so task lookup can resume a known task id or
 			// conservatively await maintenance without ever resubmitting.
+			if errors.Is(execErr, byteplus.ErrRetryableTaskFailed) || errors.Is(execErr, errBytePlusRetryBudgetExhausted) {
+				// The beta-instability exception has exhausted its bounded distinct-account
+				// chain (or no alternate existed). Every accepted parent represented by
+				// this error is terminal, so close the event instead of starting recovery.
+				recordBookkeepingError("update failed beta image event", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
+				return nil, publicGenerationError(execErr)
+			}
 			if errors.Is(execErr, byteplus.ErrTaskAccepted) {
 				if event, lookupErr := s.events.GetByID(ctx, eventID); lookupErr == nil {
 					s.startAcceptedImageRecovery(ctx, event)
@@ -2642,22 +2697,12 @@ func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, i
 		return nil, "", "", 0, err
 	}
 	aspectRatio, resolution := resolveImageSize(modelItem, in)
-	if strings.TrimSpace(in.Resolution) == "" && strings.TrimSpace(in.Quality) != "" {
-		switch strings.ToLower(strings.TrimSpace(in.Quality)) {
-		case "low":
-			resolution = "1K"
-		case "medium":
-			resolution = "2K"
-		case "high":
-			resolution = "4K"
-		}
-	}
 	operation := "generation"
 	if len(in.ReferenceImages) > 0 {
 		operation = "edit"
 	}
 	if _, err := s.firstAvailableRoute(ctx, modelItem.ID, "image", model.RouteRequirements{Operation: operation,
-		Ratio: aspectRatio, Resolution: resolution, ReferenceImages: len(in.ReferenceImages)}); err != nil {
+		Ratio: aspectRatio, Resolution: resolution, Quality: in.Quality, ReferenceImages: len(in.ReferenceImages)}); err != nil {
 		return nil, "", "", 0, err
 	}
 	return modelItem, resolution, aspectRatio, 0, nil
@@ -2869,6 +2914,52 @@ const oreateSpamQuarantine = 30 * time.Minute
 const providerAccountQueueWait = 90 * time.Second
 const providerAccountQueuePoll = 300 * time.Millisecond
 
+// A real 10-way production burst on 2026-09-05 saw seven first-account beta
+// failures and three requests whose second account hit the same verdict. Six
+// distinct accounts keeps the retry bounded while making a repeated beta blip
+// very unlikely to escape to the caller. Every failed task must independently
+// pass the four-snapshot no-charge proof before it consumes another slot in
+// this budget.
+const maxBytePlusBetaAccountAttempts = 6
+
+type bytePlusBetaRetryBudget struct {
+	active              bool
+	attempts            int
+	lastErr             error
+	nextAccountDeadline time.Time
+}
+
+// handle consumes one completed account result after the special retry chain
+// has started (or starts it for the first verified beta failure). retry=true
+// means the caller may select another, not-yet-attempted BytePlus account.
+// A non-beta result ends the chain: accepted/ambiguous work keeps its native
+// no-resubmit error, while a definite pre-acceptance failure receives the
+// private exhausted marker solely to prevent cross-route fan-out.
+func (budget *bytePlusBetaRetryBudget) handle(err error, now time.Time) (retry bool, terminal error) {
+	verified := bytePlusBetaRetryVerified(err)
+	if !budget.active && !verified {
+		return false, err
+	}
+	if !verified {
+		if byteplusNoResubmit(err) {
+			return false, err
+		}
+		return false, errors.Join(err, errBytePlusRetryBudgetExhausted)
+	}
+
+	budget.active = true
+	budget.attempts++
+	budget.lastErr = err
+	// Provider execution can itself take longer than the ordinary queue window.
+	// Start a fresh bounded wait after each verified terminal result so a free
+	// alternate is not rejected merely because the previous task ran slowly.
+	budget.nextAccountDeadline = now.Add(providerAccountQueueWait)
+	if budget.attempts >= maxBytePlusBetaAccountAttempts {
+		return false, errors.Join(err, errBytePlusRetryBudgetExhausted)
+	}
+	return true, nil
+}
+
 // Bound temporary failover so a shared-egress outage cannot fan one downstream
 // request across the entire account pool. This is retry/failover accounting,
 // not a submit rate limiter or circuit breaker.
@@ -2935,10 +3026,21 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 			return nil, ErrNoProviderAccount
 		}
 	}
+	policy := poolPolicy(ctx)
+	retryTemporary = retryTemporary && !policy.fastFailover
+	requestState := policy.accountRequest(ctx, pool)
+	excludedAccounts := requestState.excluded
+	var refreshedAt time.Time
 	tempDeadCount := 0
 	queueDeadline := time.Now().Add(providerAccountQueueWait)
 	tempRetryDeadline := time.Now().Add(tempRetryWindow)
 	tempRetryBackoff := tempRetryInitialBackoff
+	// A verified terminal BytePlus beta-instability verdict may walk a bounded
+	// set of different accounts. The attempted set prevents cycling back to any
+	// account already used by this request; the special budget also bypasses the
+	// ordinary 300-second temporary retry loop and never crosses provider routes.
+	var bytePlusBetaRetry bytePlusBetaRetryBudget
+	attemptedAccounts := requestState.attempted
 	// waitTempRetry pauses before re-running the pool after a temporary
 	// upstream failure. It reports false once the retry window is spent or the
 	// caller has gone away, at which point the error is surfaced.
@@ -2961,34 +3063,85 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 		return true
 	}
 	for {
+		var refreshErr error
+		if time.Since(refreshedAt) >= time.Second {
+			active, refreshErr = s.refreshPoolAccounts(ctx, pool, kind, active, excludedAccounts)
+			refreshedAt = time.Now()
+		}
+		if refreshErr != nil || len(active) == 0 {
+			if bytePlusBetaRetry.active {
+				return nil, errors.Join(bytePlusBetaRetry.lastErr, refreshErr)
+			}
+			if refreshErr != nil {
+				return nil, refreshErr
+			}
+			return nil, ErrNoProviderAccount
+		}
+		counts, observed := s.conc.ActiveCounts(ctx, accountGateKeys(active))
 		var lastErr error
 		lastTempDead := false
 		retrying := false
 		busy := 0
 		for _, token := range active {
+			if excludedAccounts[token.ID] {
+				continue
+			}
+			if bytePlusBetaRetry.active {
+				if _, alreadyTried := attemptedAccounts[token.ID]; alreadyTried {
+					continue
+				}
+			}
 			slots := poolAccountConcurrency(pool, token)
+			if observed && counts["conc:a:"+token.ID] >= int64(slots) {
+				busy++
+				continue
+			}
 			admitted, gateErr := s.acctAcquire(ctx, token.ID, eventID, slots)
 			if gateErr != nil {
+				if bytePlusBetaRetry.active {
+					return nil, errors.Join(bytePlusBetaRetry.lastErr, gateErr)
+				}
 				return nil, gateErr
 			}
 			if !admitted {
 				busy++
 				continue
 			}
+			_, retry := attemptedAccounts[token.ID]
+			attemptedAccounts[token.ID] = struct{}{}
 			// release via defer so a panic in tryAccount can't leak the job slot.
 			data, failover, tempDead, err := func() ([]byte, bool, bool, error) {
 				defer s.acctRelease(ctx, token.ID, eventID)
-				return s.tryAccount(ctx, eventID, pool, token, kind, attempt, classify, refreshOnAuth, tempFailover)
+				return s.tryAccount(ctx, eventID, pool, token, kind, attempt, classify, refreshOnAuth, tempFailover, retry)
 			}()
 			if err == nil {
 				return data, nil
 			}
 			lastErr = err
 			lastTempDead = tempDead
+			isAuth, isQuota, _, isDead := classify(err)
+			if isAuth || isQuota || (isDead && !tempDead) || errors.Is(err, ErrNoProviderAccount) {
+				excludedAccounts[token.ID] = true
+			}
 			// Once the job's deadline is spent, another account can only fail on
 			// the expired context and would mask the failure that consumed it.
 			if ctx.Err() != nil {
+				if bytePlusBetaRetry.active {
+					// Preserve the verified-beta marker even when an alternate's final
+					// bookkeeping races the generation deadline. Returning only the
+					// alternate error here could incorrectly authorize route failover.
+					return nil, errors.Join(bytePlusBetaRetry.lastErr, lastErr, ctx.Err())
+				}
 				return nil, lastErr
+			}
+			if bytePlusBetaRetry.active || (pool == "byteplus" && bytePlusBetaRetryVerified(err)) {
+				retry, terminal := bytePlusBetaRetry.handle(err, time.Now())
+				if terminal != nil {
+					return nil, terminal
+				}
+				if retry {
+					continue
+				}
 			}
 			if tempDead {
 				// temp-failover policy: this account hit a temporary upstream error.
@@ -3013,7 +3166,10 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 		if retrying {
 			continue
 		}
-		if lastErr != nil {
+		if bytePlusBetaRetry.active && busy == 0 {
+			return nil, bytePlusBetaRetry.lastErr
+		}
+		if lastErr != nil && busy == 0 && !bytePlusBetaRetry.active {
 			// The whole pool was tried and the last failure was a temporary
 			// upstream error → wait and retry within the window; anything else
 			// (auth/quota exhaustion across the pool) is surfaced immediately.
@@ -3025,16 +3181,25 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 		if busy == 0 {
 			return nil, ErrProviderExecution
 		}
-		if time.Now().After(queueDeadline) {
+		if policy.fastFailover && !bytePlusBetaRetry.active {
+			return nil, ErrConcurrencyFull
+		}
+		accountQueueDeadline := queueDeadline
+		if bytePlusBetaRetry.active {
+			accountQueueDeadline = bytePlusBetaRetry.nextAccountDeadline
+		}
+		if time.Now().After(accountQueueDeadline) {
+			if bytePlusBetaRetry.active {
+				return nil, bytePlusBetaRetry.lastErr
+			}
 			return nil, ErrConcurrencyFull
 		}
 
-		timer := time.NewTimer(providerAccountQueuePoll)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, fmt.Errorf("%w: %v", ErrConcurrencyFull, ctx.Err())
-		case <-timer.C:
+		if !waitAccountQueue(ctx, accountQueueDeadline) {
+			if bytePlusBetaRetry.active {
+				return nil, errors.Join(bytePlusBetaRetry.lastErr, ctx.Err())
+			}
+			return nil, ErrConcurrencyFull
 		}
 	}
 }
@@ -3049,21 +3214,25 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 	classify func(error) (isAuth, isQuota, isTemporary, isDead bool),
 	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
 	tempFailover bool,
+	retry bool,
 ) ([]byte, bool, bool, error) {
 	routeID := dispatchRouteFromContext(ctx)
-	if routeID != "" {
-		allowed, routeErr := s.models.Routes().AccountAllowsRouteInFlight(ctx, token.ID, routeID)
-		if routeErr != nil {
-			return nil, false, false, routeErr
-		}
-		if !allowed {
-			return nil, true, false, ErrProviderUnsupported
-		}
+	fresh, validationErr := s.revalidateDispatchAccount(ctx, pool, token.ID, kind, retry)
+	if validationErr != nil {
+		return nil, errors.Is(validationErr, ErrNoProviderAccount) || routeFailoverSafe(validationErr), false, validationErr
 	}
+	token = fresh
 	recordBookkeepingError("set generation account", s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail))
 	recordBookkeepingError("touch generation account", s.tokens.TouchLastUsed(ctx, token.ID))
 	authRefreshed := false
 	for {
+		if authRefreshed {
+			fresh, err := s.revalidateDispatchAccount(ctx, pool, token.ID, kind, true)
+			if err != nil {
+				return nil, errors.Is(err, ErrNoProviderAccount) || routeFailoverSafe(err), false, err
+			}
+			token = fresh
+		}
 		var dispatchID string
 		var reservation *model.QuotaReservation
 		if routeID != "" {
@@ -3091,30 +3260,43 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			}
 		}
 		data, err := attempt(token)
-		state, failureClass := dispatchFailureClass(err)
 		var upstreamRemaining *float64
 		if routeID != "" {
 			upstreamRemaining = s.refreshDispatchQuota(ctx, pool, token, kind)
 		}
+		finalizedErr := finalizeBytePlusRetryVerification(err, upstreamRemaining)
+		if finalizedErr != err {
+			// The final quota refresh is newer than the closure's two confirmations.
+			// A delayed debit or unavailable snapshot revokes retry permission while
+			// preserving the provider's accepted terminal error and task ID.
+			err = finalizedErr
+		}
+		state, failureClass := dispatchFailureClass(err)
 		if reservation != nil {
 			quotaCtx := context.WithoutCancel(ctx)
-			switch state {
-			case "succeeded", "accepted":
-				recordBookkeepingError("settle dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
-			case "unknown":
-				recordBookkeepingError("mark dispatch quota uncertain", s.models.Quotas().MarkUncertain(quotaCtx, reservation.ID))
-			default:
-				if failureClass == "quota" {
-					// An explicit provider quota verdict is authoritative. Releasing the
-					// hold after a refreshed zero would add the request cost back and make
-					// the exhausted bucket immediately schedulable again.
-					if upstreamRemaining == nil {
-						zero := 0.0
-						upstreamRemaining = &zero
+			if errors.Is(err, byteplus.ErrRetryableTaskFailed) && !bytePlusBetaRetryVerified(err) {
+				// The task is definitely terminal, so close its dispatch; without a
+				// no-charge proof, settle rather than refund the reservation.
+				recordBookkeepingError("settle unverified beta dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
+			} else {
+				switch state {
+				case "succeeded", "accepted":
+					recordBookkeepingError("settle dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
+				case "unknown":
+					recordBookkeepingError("mark dispatch quota uncertain", s.models.Quotas().MarkUncertain(quotaCtx, reservation.ID))
+				default:
+					if failureClass == "quota" {
+						// An explicit provider quota verdict is authoritative. Releasing the
+						// hold after a refreshed zero would add the request cost back and make
+						// the exhausted bucket immediately schedulable again.
+						if upstreamRemaining == nil {
+							zero := 0.0
+							upstreamRemaining = &zero
+						}
+						recordBookkeepingError("settle exhausted dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
+					} else {
+						recordBookkeepingError("release dispatch quota", s.models.Quotas().Release(quotaCtx, reservation.ID))
 					}
-					recordBookkeepingError("settle exhausted dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
-				} else {
-					recordBookkeepingError("release dispatch quota", s.models.Quotas().Release(quotaCtx, reservation.ID))
 				}
 			}
 		}
@@ -3359,17 +3541,21 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 		d, meta, genErr := s.adobe.GenerateImage(ctx, token.Value, submitARP, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, false)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
-			if !urlOnly {
-				d, _, genErr = downloadPublicArtifact(ctx, imageURL, staticAssetHosts("adobe"), "", netguard.MediaImage, netguard.MaxImageBytes)
-				if genErr != nil {
-					genErr = fmt.Errorf("%w: invalid image artifact", adobe.ErrTemporaryUpstream)
-				}
-			}
+
 		}
 		return d, genErr
 	}, adobeErrClass, func(id string) (model.TokenAccount, bool) {
 		return s.refreshAdobeToken(ctx, id)
 	}, true, strings.TrimSpace(in.AccountID) == "")
+	if err == nil && !urlOnly {
+		// Generation and quota settlement have already completed. Keep the URL
+		// for diagnostics/recovery and retry only this download, never submission.
+		recordBookkeepingError("retain generated image URL", s.events.SetFile(context.WithoutCancel(ctx), eventID, imageURL))
+		data, err = downloadGeneratedArtifact(ctx, imageURL, func(ctx context.Context, url string) ([]byte, error) {
+			data, _, err := downloadPublicArtifact(ctx, url, staticAssetHosts("adobe"), "", netguard.MediaImage, netguard.MaxImageBytes)
+			return data, err
+		})
+	}
 	return data, imageURL, err
 }
 
@@ -3592,7 +3778,7 @@ func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, mod
 		return nil, "", ErrNoProviderAccount
 	}
 	size := upstreamSize(aspectRatio, resolution)
-	quality := upstreamQualityForModel(modelItem.ID, resolution)
+	quality := upstreamQualityForModel(modelItem.ID, in.Quality, resolution)
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "custom", active, "image", func(token model.TokenAccount) ([]byte, error) {
 		baseURL := stringValue(token.Meta["base_url"])
@@ -3724,24 +3910,20 @@ func upstreamVideoSize(aspectRatio, resolution string) string {
 	return fmt.Sprintf("%dx%d", short, short*h/w)
 }
 
-// upstreamQuality maps a resolution tier to the OpenAI quality enum.
-func upstreamQuality(resolution string) string {
-	switch strings.ToUpper(strings.TrimSpace(resolution)) {
-	case "2K":
-		return "medium"
-	case "4K":
-		return "high"
-	case "1K":
+func upstreamImageQuality(quality, _ string) string {
+	switch normalized := strings.ToLower(strings.TrimSpace(quality)); normalized {
+	case "low", "medium", "high":
+		return normalized
+	default:
 		return "low"
 	}
-	return ""
 }
 
-func upstreamQualityForModel(modelID, resolution string) string {
+func upstreamQualityForModel(modelID, quality, resolution string) string {
 	if !supportsQualityResolutionModel(modelID) {
 		return ""
 	}
-	return upstreamQuality(resolution)
+	return upstreamImageQuality(quality, resolution)
 }
 
 // generateOreateVideo runs OreateAI's Seedance video flow. Oreate's
@@ -4286,7 +4468,7 @@ func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, m
 		Prompt:      in.Prompt,
 		Size:        resolution,
 		AspectRatio: aspectRatio,
-		Quality:     upstreamQualityForModel(modelItem.ID, resolution),
+		Quality:     upstreamQualityForModel(modelItem.ID, in.Quality, resolution),
 		References:  refs,
 	}
 	requiredCredits, err := byteplus.RequiredCredits(request)
@@ -4299,8 +4481,9 @@ func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, m
 		return nil, "", err
 	}
 	active := make([]model.TokenAccount, 0, len(items))
+	now := time.Now()
 	for _, item := range items {
-		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
+		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" && bytePlusAccountSessionUsable(item, now) {
 			active = append(active, item)
 		}
 	}
@@ -4314,24 +4497,69 @@ func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, m
 	}
 	s.rotateRoundRobin("byteplus", active)
 	s.prioritizeBytePlusAccounts(active)
+	providerModel, providerModelOK := byteplus.LookupModel(request.Model)
+	verifyBetaNoCharge := providerModelOK && providerModel.Key == byteplus.ModelGPTImage2
 
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "byteplus", active, "image", func(token model.TokenAccount) ([]byte, error) {
+		beforeBalance, beforeBalanceKnown := 0.0, false
+		if verifyBetaNoCharge {
+			beforeBalance, beforeBalanceKnown = s.probeBytePlusRemaining(ctx, token.Value)
+		}
 		request.DownloadResult = !noStore
 		result, meta, genErr := s.byteplus.GenerateImage(ctx, token.Value, request)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
 			return result, nil
 		}
+		if errors.Is(genErr, byteplus.ErrRetryableTaskFailed) && beforeBalanceKnown &&
+			s.bytePlusBetaFailureUncharged(ctx, token.Value, beforeBalance) {
+			genErr = verifiedBytePlusRetry(genErr, beforeBalance)
+		}
 
-		// Accepted or submission-ambiguous requests may already be billed. Never
-		// refund their hold or replay create_task on a different account.
+		// Accepted or submission-ambiguous requests remain non-replayable unless the
+		// exact GPT Image 2 beta verdict also carries the private no-charge proof.
 		if byteplusNoResubmit(genErr) {
 			return nil, genErr
 		}
 		return result, genErr
 	}, byteplusErrClass, nil, true)
 	return data, imageURL, err
+}
+
+const bytePlusBillingConfirmationDelay = 2 * time.Second
+
+func (s *V1Service) probeBytePlusRemaining(parent context.Context, cookie string) (float64, bool) {
+	if s.byteplus == nil || strings.TrimSpace(cookie) == "" || parent.Err() != nil {
+		return 0, false
+	}
+	probeCtx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	data, err := s.byteplus.FetchCreditsBalance(probeCtx, cookie)
+	if err != nil || data == nil || boolValueWithDefault(data["unknown"], false) || boolValueWithDefault(data["auth_failed"], false) {
+		return 0, false
+	}
+	remaining, ok := anyFloat(data["remaining"])
+	return remaining, ok && remaining >= 0
+}
+
+// bytePlusBetaFailureUncharged requires two fresh post-failure snapshots. A
+// delayed or unknown billing result fails closed and keeps ErrTaskAccepted's
+// no-resubmit behavior.
+func (s *V1Service) bytePlusBetaFailureUncharged(ctx context.Context, cookie string, before float64) bool {
+	after, ok := s.probeBytePlusRemaining(ctx, cookie)
+	if !ok || math.Abs(after-before) > 1e-9 {
+		return false
+	}
+	timer := time.NewTimer(bytePlusBillingConfirmationDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+	}
+	confirmed, ok := s.probeBytePlusRemaining(ctx, cookie)
+	return ok && math.Abs(confirmed-before) <= 1e-9
 }
 
 // filterBytePlusAccountsByCredits keeps legacy accounts with an unknown balance
@@ -4379,12 +4607,21 @@ func (s *V1Service) prioritizeBytePlusAccounts(items []model.TokenAccount) {
 }
 
 func byteplusErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	// The provider still exposes ErrTaskAccepted for audit and conservative
+	// callers. This one exact terminal failure is the account-level exception.
+	if bytePlusBetaRetryVerified(err) {
+		return false, false, true, false
+	}
 	// An accepted task or an ambiguous create response may both already represent
 	// a paid task. Neither may move to another account or replay create_task.
 	if byteplusNoResubmit(err) {
 		return false, false, false, false
 	}
 	return errors.Is(err, byteplus.ErrAuth), errors.Is(err, byteplus.ErrQuotaExhausted), errors.Is(err, byteplus.ErrTemporaryUpstream), false
+}
+
+func bytePlusBetaRetryVerified(err error) bool {
+	return errors.Is(err, byteplus.ErrRetryableTaskFailed) && errors.Is(err, errBytePlusRetryVerified)
 }
 
 func byteplusNoResubmit(err error) bool {
@@ -4596,11 +4833,7 @@ func parseImageSize(size, aspectRatio, resolution string) (string, string) {
 }
 
 func resolveImageSize(item *model.ModelConfig, in V1ImageRequest) (string, string) {
-	ar, resolution := parseImageSize(in.Size, in.AspectRatio, in.Resolution)
-	if supportsQualityResolutionModel(item.ID) && strings.TrimSpace(in.Resolution) == "" && strings.TrimSpace(in.Quality) != "" {
-		resolution = resolutionForQuality(item, in.Quality)
-	}
-	return ar, resolution
+	return parseImageSize(in.Size, in.AspectRatio, in.Resolution)
 }
 
 func supportsQualityResolutionModel(modelID string) bool {
@@ -4639,9 +4872,6 @@ func guessRatio(w, h int) string {
 	return fmt.Sprintf("%d:%d", best.W, best.H)
 }
 
-// firstPricedResolution returns the model's lowest priced image tier (1K/2K/4K
-// order), or "" if none is priced. Used to rescue a request whose resolution
-// the model doesn't support.
 // deaiEnabled reports whether the 去AI特征 feature is switched on in system
 // settings (default off). When off, an incoming deai flag is ignored entirely.
 func (s *V1Service) deaiEnabled(ctx context.Context) bool {
@@ -4653,58 +4883,6 @@ func (s *V1Service) deaiEnabled(ctx context.Context) bool {
 		return false
 	}
 	return parseBoolSetting(raw, false)
-}
-
-func firstPricedResolution(item *model.ModelConfig) string {
-	if item == nil {
-		return ""
-	}
-	for _, r := range []string{"1K", "2K", "4K"} {
-		if _, ok := jsonMapFloat(item.Prices, r); ok {
-			return r
-		}
-	}
-	return ""
-}
-
-// resolutionForQuality maps GPT Image 2's `quality` to one of its priced
-// resolution tiers: low→1K, medium→2K, high→4K, auto/blank→the model's lowest
-// priced tier. Other models must not call this helper.
-func resolutionForQuality(item *model.ModelConfig, quality string) string {
-	order := []string{"1K", "2K", "4K"}
-	var priced []string
-	for _, r := range order {
-		if _, ok := jsonMapFloat(item.Prices, r); ok {
-			priced = append(priced, r)
-		}
-	}
-	if len(priced) == 0 {
-		return firstPricedResolution(item)
-	}
-	rank := map[string]int{"low": 0, "medium": 1, "high": 2}
-	want, ok := rank[strings.ToLower(strings.TrimSpace(quality))]
-	if !ok {
-		return priced[0] // auto / unknown → model default (lowest priced)
-	}
-	idxOf := func(r string) int {
-		for i, v := range order {
-			if v == r {
-				return i
-			}
-		}
-		return 0
-	}
-	best, bestDist := priced[0], 99
-	for _, r := range priced {
-		d := idxOf(r) - want
-		if d < 0 {
-			d = -d
-		}
-		if d < bestDist {
-			best, bestDist = r, d
-		}
-	}
-	return best
 }
 
 // modelPrice returns the charge for (kind, resolution, duration). The set of
@@ -4955,8 +5133,8 @@ func (s *V1Service) markTokenDead(ctx context.Context, pool string, token model.
 }
 
 // nextCursor returns the pool's current round-robin position and advances it by
-// one. Concurrent callers each get a distinct value, so parallel picks land on
-// different accounts instead of racing onto the same one.
+// one. Concurrent callers get different cursor values; changing candidate
+// groups can still overlap, so the atomic account gate enforces capacity.
 //
 // The counter lives in Redis so the rotation survives restarts: with a
 // per-process counter every deploy reset it to 0 and the scheduler kept

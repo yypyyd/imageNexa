@@ -283,6 +283,7 @@ func TestRequiredCreditsMatchesLuminaBillingRules(t *testing.T) {
 		{name: "Seedream Pro 2K square", request: ImageRequest{Model: "lumina-seedream-5.0-pro", Resolution: "2K", AspectRatio: "1:1"}, want: 18},
 		{name: "Seedream Pro extra references", request: ImageRequest{Model: "lumina-seedream-5.0-pro", Resolution: "1K", AspectRatio: "1:1", References: make([][]byte, 4)}, want: 9.9},
 		{name: "GPT low 1K", request: ImageRequest{Model: "lumina-gpt-image-2", Resolution: "1K", AspectRatio: "1:1", Quality: "low"}, want: 1},
+		{name: "GPT low 4K square compatibility canvas", request: ImageRequest{Model: "lumina-gpt-image-2", Resolution: "4K", AspectRatio: "1:1", Quality: "low"}, want: 3},
 		{name: "GPT medium small compatibility canvas", request: ImageRequest{Model: "lumina-gpt-image-2", Resolution: "2K", AspectRatio: "4:3", Quality: "medium"}, want: 8},
 		{name: "GPT medium 2K square", request: ImageRequest{Model: "lumina-gpt-image-2", Resolution: "2K", AspectRatio: "1:1", Quality: "medium"}, want: 25},
 		{name: "GPT high 4K landscape", request: ImageRequest{Model: "lumina-gpt-image-2", Resolution: "4K", AspectRatio: "16:9", Quality: "high"}, want: 230},
@@ -743,6 +744,13 @@ func TestExplicitCreateTaskErrorsRetainTheirClass(t *testing.T) {
 		{name: "quota", httpStatus: http.StatusForbidden, code: 100000007, message: "credits exhausted", want: ErrQuotaExhausted},
 		{name: "risk", httpStatus: http.StatusForbidden, code: 100000008, message: "risk rejected", want: ErrRiskControl},
 		{name: "invalid", httpStatus: http.StatusBadRequest, code: 1000000023, message: "invalid parameter", want: ErrInvalidParams},
+		// Production 2026-09-02: accounts without a plan answer HTTP 200 with a
+		// business code. That is a refusal, not a lost response, and it is a
+		// quota verdict so the scheduler can move to another account or route.
+		{name: "no active plan", httpStatus: http.StatusOK, code: 200402, message: "No Active Combos.", want: ErrQuotaExhausted},
+		// An unrecognized business code stays temporary but is still definitive.
+		{name: "unrecognized business code", httpStatus: http.StatusOK, code: 1500, message: "internal error", want: ErrTemporaryUpstream},
+		{name: "rate limited", httpStatus: http.StatusTooManyRequests, code: 0, message: "too many requests", want: ErrTemporaryUpstream},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -769,8 +777,146 @@ func TestExplicitCreateTaskErrorsRetainTheirClass(t *testing.T) {
 			if errors.Is(err, ErrTaskSubmissionUnknown) {
 				t.Fatalf("explicit create %s error was marked ambiguous: %v", tc.name, err)
 			}
+			if !errors.Is(err, ErrUpstreamRejected) {
+				t.Fatalf("explicit create %s error should carry the rejection marker: %v", tc.name, err)
+			}
 		})
 	}
+}
+
+func TestFindSubmittedTaskVerifiesAmbiguousSubmissions(t *testing.T) {
+	submitted := time.Date(2026, 9, 2, 18, 8, 15, 0, time.UTC)
+	gptImage := "6824519374061285743"
+	history := func(tasks ...map[string]any) map[string]any {
+		return map[string]any{"page": map[string]any{"page_num": 1, "page_size": 20}, "tasks": tasks}
+	}
+	task := func(id string, createdAt time.Time, inferenceID, prompt string) map[string]any {
+		return map[string]any{
+			"id": id, "status": "running", "created_at": createdAt.UnixMilli(),
+			"inference_info": map[string]any{"inference_id": inferenceID, "inference_type": "t2i"},
+			"children": []any{map[string]any{"inputs": []any{
+				map[string]any{"name": "prompt", "internal_name": "prompt", "value": prompt},
+				map[string]any{"name": "quality", "internal_name": "quality", "value": "high"},
+			}}},
+		}
+	}
+	query := SubmittedTaskQuery{
+		Model: "gpt-image-2", Prompt: "black glass bottle",
+		From: submitted.Add(-time.Minute), To: submitted.Add(3 * time.Minute),
+	}
+
+	serve := func(t *testing.T, pages ...map[string]any) *httptest.Server {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/user/current" {
+				writeEnvelope(t, w, map[string]any{"user_id": "7680542804493451317", "user_name": "member", "role": "normal"})
+				return
+			}
+			if r.URL.Path != "/api/inference/task/query_task_list" {
+				http.NotFound(w, r)
+				return
+			}
+			var body struct {
+				PageNum int `json:"page_num"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			page := body.PageNum - 1
+			if page < 0 || page >= len(pages) {
+				page = len(pages) - 1
+			}
+			// The live endpoint returns the page object directly, without a code
+			// or data envelope.
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(pages[page])
+		}))
+		t.Cleanup(server.Close)
+		withAPIBase(t, server.URL+"/api")
+		return server
+	}
+
+	t.Run("matching task is adopted", func(t *testing.T) {
+		serve(t, history(
+			task("newer-other-model", submitted.Add(30*time.Second), "8162745039814627354", "black glass bottle"),
+			task("newer-other-prompt", submitted.Add(20*time.Second), gptImage, "a cat"),
+			task("match", submitted.Add(2*time.Second), gptImage, "black glass bottle"),
+			task("too-old", submitted.Add(-10*time.Minute), gptImage, "black glass bottle"),
+		))
+		got, err := NewClient("").FindSubmittedTask(context.Background(), "csrfToken=x; sessionid=y", query)
+		if err != nil || got != "match" {
+			t.Fatalf("FindSubmittedTask() = %q, %v; want match", got, err)
+		}
+	})
+
+	t.Run("empty history is a verified absence", func(t *testing.T) {
+		serve(t, history())
+		got, err := NewClient("").FindSubmittedTask(context.Background(), "csrfToken=x; sessionid=y", query)
+		if err != nil || got != "" {
+			t.Fatalf("FindSubmittedTask() = %q, %v; want verified absence", got, err)
+		}
+	})
+
+	t.Run("only older tasks is a verified absence", func(t *testing.T) {
+		serve(t, history(task("old", submitted.Add(-time.Hour), gptImage, "black glass bottle")))
+		got, err := NewClient("").FindSubmittedTask(context.Background(), "csrfToken=x; sessionid=y", query)
+		if err != nil || got != "" {
+			t.Fatalf("FindSubmittedTask() = %q, %v; want verified absence", got, err)
+		}
+	})
+
+	t.Run("unreadable history stays unknown", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/user/current" {
+				writeEnvelope(t, w, map[string]any{"user_id": "7680542804493451317", "user_name": "member", "role": "normal"})
+				return
+			}
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		withAPIBase(t, server.URL+"/api")
+		_, err := NewClient("").FindSubmittedTask(context.Background(), "csrfToken=x; sessionid=y", query)
+		if !errors.Is(err, ErrTemporaryUpstream) || errors.Is(err, ErrAuth) {
+			t.Fatalf("FindSubmittedTask() error = %v, want temporary", err)
+		}
+	})
+
+	t.Run("expired session is not evidence of absence", func(t *testing.T) {
+		// Production 2026-09-02: an expired Lumina cookie still answers code 0 on
+		// /user/current, but as user_id 1 "guest", and its task history is empty.
+		var historyCalls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/user/current":
+				writeEnvelope(t, w, map[string]any{"user_id": "1", "user_name": "guest", "role": "guest"})
+			case "/api/inference/task/query_task_list":
+				historyCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(history())
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		withAPIBase(t, server.URL+"/api")
+		got, err := NewClient("").FindSubmittedTask(context.Background(), "csrfToken=x; sessionid=y", query)
+		if !errors.Is(err, ErrAuth) || got != "" {
+			t.Fatalf("FindSubmittedTask() = %q, %v; want ErrAuth", got, err)
+		}
+		if historyCalls != 0 {
+			t.Fatalf("history was consulted %d times through a guest session", historyCalls)
+		}
+	})
+
+	t.Run("dead session is auth", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}))
+		defer server.Close()
+		withAPIBase(t, server.URL+"/api")
+		_, err := NewClient("").FindSubmittedTask(context.Background(), "csrfToken=x; sessionid=y", query)
+		if !errors.Is(err, ErrAuth) {
+			t.Fatalf("FindSubmittedTask() error = %v, want auth", err)
+		}
+	})
 }
 
 func TestGenerateRetriesAcceptedTaskPollWithoutResubmitting(t *testing.T) {
@@ -857,6 +1003,150 @@ func TestAcceptedTaskErrorSuppressesNonBusinessClasses(t *testing.T) {
 	}
 }
 
+func TestAcceptedBetaInstabilityFailureCarriesRetryMarker(t *testing.T) {
+	var createCalls atomic.Int32
+	var pollCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/user/current":
+			writeEnvelope(t, w, map[string]any{"user_id": "1", "role": "member"})
+		case "/api/inference/v2/create_task":
+			createCalls.Add(1)
+			writeEnvelope(t, w, map[string]any{"parent_task_id": "accepted-beta-task"})
+		case "/api/inference/task/query_task_list":
+			pollCalls.Add(1)
+			// Exact production response shape from 2026-09-04: the parent has no
+			// failure text; both the execution phase and reason live on one child.
+			writeEnvelope(t, w, map[string]any{"tasks": []any{map[string]any{
+				"status":         "failed",
+				"inference_info": map[string]any{"inference_id": "6824519374061285743"},
+				"children": []any{map[string]any{
+					"status":      "downstream_execute",
+					"fail_reason": betaInstabilityFailureReason,
+				}},
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	withAPIBase(t, server.URL+"/api")
+
+	_, _, err := NewClient("").GenerateImage(context.Background(), "csrfToken=x; sessionid=y", ImageRequest{
+		Model: "lumina-gpt-image-2", Prompt: "test",
+	})
+	for _, marker := range []error{ErrTaskAccepted, ErrTaskFailed, ErrTemporaryUpstream, ErrRetryableTaskFailed} {
+		if !errors.Is(err, marker) {
+			t.Fatalf("accepted beta failure = %v, want marker %v", err, marker)
+		}
+	}
+	if got := AcceptedTaskID(err); got != "accepted-beta-task" {
+		t.Fatalf("AcceptedTaskID() = %q, want accepted-beta-task", got)
+	}
+	if !strings.Contains(err.Error(), betaInstabilityFailureReason) {
+		t.Fatalf("accepted beta failure lost upstream reason: %v", err)
+	}
+	if createCalls.Load() != 1 || pollCalls.Load() != 1 {
+		t.Fatalf("provider calls = create %d, poll %d; want 1, 1", createCalls.Load(), pollCalls.Load())
+	}
+}
+
+func TestRetryableBetaTaskErrorRequiresExactTerminalShape(t *testing.T) {
+	child := func(status, reason string) map[string]any {
+		return map[string]any{"status": status, "fail_reason": reason}
+	}
+	productionTask := func(children ...map[string]any) map[string]any {
+		raw := make([]any, 0, len(children))
+		for _, item := range children {
+			raw = append(raw, item)
+		}
+		return map[string]any{
+			"status": "failed", "children": raw,
+			"inference_info": map[string]any{"inference_id": "6824519374061285743"},
+		}
+	}
+
+	tests := []struct {
+		name         string
+		parentStatus string
+		task         map[string]any
+		want         bool
+	}{
+		{
+			name: "exact production shape", parentStatus: "failed",
+			task: productionTask(child("downstream_execute", betaInstabilityFailureReason)), want: true,
+		},
+		{
+			name: "outer whitespace is transport noise", parentStatus: " failed ",
+			task: productionTask(child(" downstream_execute ", "  "+betaInstabilityFailureReason+"  ")), want: true,
+		},
+		{
+			name: "parent is not failed", parentStatus: "complete",
+			task: productionTask(child("downstream_execute", betaInstabilityFailureReason)),
+		},
+		{
+			name: "different child phase", parentStatus: "failed",
+			task: productionTask(child("risk", betaInstabilityFailureReason)),
+		},
+		{
+			name: "different model", parentStatus: "failed",
+			task: func() map[string]any {
+				item := productionTask(child("downstream_execute", betaInstabilityFailureReason))
+				item["inference_info"] = map[string]any{"inference_id": "8162745039814627354"}
+				return item
+			}(),
+		},
+		{
+			name: "generic terminal failure", parentStatus: "failed",
+			task: productionTask(child("downstream_execute", "terminal business outcome")),
+		},
+		{
+			name: "near match with appended text", parentStatus: "failed",
+			task: productionTask(child("downstream_execute", betaInstabilityFailureReason+" (retry soon)")),
+		},
+		{
+			name: "case changed reason", parentStatus: "failed",
+			task: productionTask(child("downstream_execute", strings.ToLower(betaInstabilityFailureReason))),
+		},
+		{
+			name: "reason is not fail_reason", parentStatus: "failed",
+			task: map[string]any{"status": "failed", "inference_info": map[string]any{"inference_id": "6824519374061285743"}, "children": []any{map[string]any{
+				"status": "downstream_execute", "message": betaInstabilityFailureReason,
+			}}},
+		},
+		{
+			name: "status and reason belong to different children", parentStatus: "failed",
+			task: productionTask(
+				child("downstream_execute", "generic failure"),
+				child("failed", betaInstabilityFailureReason),
+			),
+		},
+		{
+			name: "reason exists only on parent", parentStatus: "failed",
+			task: map[string]any{
+				"status": "failed", "fail_reason": betaInstabilityFailureReason,
+				"inference_info": map[string]any{"inference_id": "6824519374061285743"},
+				"children":       []any{child("downstream_execute", "")},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := retryableBetaTaskError(tc.task, tc.parentStatus)
+			if tc.want {
+				if !errors.Is(err, ErrRetryableTaskFailed) || !errors.Is(err, ErrTaskFailed) || !errors.Is(err, ErrTemporaryUpstream) {
+					t.Fatalf("retryableBetaTaskError() = %v, want retryable task failure chain", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("retryableBetaTaskError() = %v, want nil", err)
+			}
+		})
+	}
+}
+
 func TestAcceptedTerminalBusinessErrorsRetainClass(t *testing.T) {
 	for _, tc := range []struct {
 		status string
@@ -895,6 +1185,9 @@ func TestAcceptedTerminalBusinessErrorsRetainClass(t *testing.T) {
 			}
 			if errors.Is(err, ErrAuth) {
 				t.Fatalf("accepted terminal %s error retained auth: %v", tc.status, err)
+			}
+			if tc.status == "failed" && errors.Is(err, ErrRetryableTaskFailed) {
+				t.Fatalf("generic accepted failure gained beta retry marker: %v", err)
 			}
 			if createCalls.Load() != 1 {
 				t.Fatalf("create_task calls = %d, want 1", createCalls.Load())

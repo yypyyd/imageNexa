@@ -60,6 +60,29 @@ test('treats a browser cookie array as one account', () => {
   assert.equal(imports[0].provider, 'byteplus')
 })
 
+test('preserves Lumina login material for private server-side renewal', () => {
+  const exported = {
+    platform: 'lumina',
+    email: 'lumina@example.com',
+    cookie_string: 'csrfToken=csrf; digest=jwt; AccountID=account-1',
+    session_expires: 1788500000,
+    session_expires_at: '2026-09-04T05:33:20Z',
+    password: 'must-not-survive',
+  }
+  const items = parseCredentialImports(JSON.stringify(exported))
+  assert.deepEqual(items, [{
+    provider: 'byteplus',
+    credential: {
+      cookie_string: exported.cookie_string,
+      email: exported.email,
+      password: exported.password,
+      session_expires_at: exported.session_expires_at,
+      session_expires: exported.session_expires,
+    },
+  }])
+  assert.equal(JSON.stringify(items).includes(exported.password), true)
+})
+
 test('parses and deduplicates account JSON files from a ZIP', () => {
   const token = jwt({ 'https://api.openai.com/profile': { email: 'zip@example.com' } })
   const auth = strToU8(JSON.stringify({ type: 'codex', access_token: token }))

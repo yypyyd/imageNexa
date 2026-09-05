@@ -46,7 +46,9 @@ var ErrNotFound = gorm.ErrRecordNotFound
 
 const (
 	bytePlusCredentialFingerprintMetaKey = "byteplus_credential_fingerprint"
+	bytePlusIdentityFingerprintMetaKey   = "byteplus_identity_fingerprint"
 	bytePlusProbeVersionMetaKey          = "byteplus_probe_version"
+	bytePlusSessionExpiresAtMetaKey      = "byteplus_session_expires_at"
 )
 
 // bytePlusAccountClient is the narrow provider surface needed by account
@@ -96,7 +98,9 @@ func (s repoBytePlusPendingStore) RefreshCredential(ctx context.Context, id, coo
 	metaPatch := map[string]any{
 		"pending_check":                      true,
 		bytePlusCredentialFingerprintMetaKey: fingerprint,
+		bytePlusIdentityFingerprintMetaKey:   bytePlusIdentityFingerprint(cookie),
 		bytePlusProbeVersionMetaKey:          version,
+		bytePlusSessionExpiresAtMetaKey:      bytePlusSessionExpiryText(cookie),
 	}
 	patch := map[string]any{
 		"value":  cookie,
@@ -161,6 +165,7 @@ func (s repoBytePlusPendingStore) CompleteProbe(ctx context.Context, id, cookie,
 }
 
 type TokenService struct {
+	quotas   quotaSnapshotWriter
 	tokens   *repo.TokenRepository
 	refresh  *repo.RefreshProfileRepository
 	events   *repo.EventRepository
@@ -183,7 +188,7 @@ type TokenService struct {
 	oreateRefreshing atomic.Bool
 }
 
-func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
+func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, quotas *repo.QuotaRepository) *TokenService {
 	service := &TokenService{
 		tokens:   tokens,
 		refresh:  refresh,
@@ -202,6 +207,9 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 	}
 	// Avoid storing a typed nil pointer in the interface: pending imports should
 	// take the explicit no-client path rather than attempting a network probe.
+	if quotas != nil {
+		service.quotas = quotas
+	}
 	if bytePlusClient != nil {
 		service.byteplus = bytePlusClient
 	}
@@ -392,11 +400,28 @@ func (s *TokenService) ImportBytePlusCookie(ctx context.Context, cookie string) 
 	}
 	fingerprint := bytePlusCredentialFingerprint(cookie)
 	tokenID := bytePlusTokenIDFromFingerprint(fingerprint)
+	identityFingerprint := bytePlusIdentityFingerprint(cookie)
+	if identityFingerprint != "" {
+		tokenID = bytePlusTokenIDFromFingerprint(identityFingerprint)
+		// Accounts imported before stable identity support use a hash of the old
+		// session Cookie as their row id. Reuse that row when AccountID matches so
+		// a 48-hour login rotation replaces the credential instead of creating a
+		// duplicate account every two days.
+		if s.tokens != nil {
+			existing, listErr := s.tokens.ListByPool(ctx, "byteplus")
+			if listErr != nil {
+				return nil, listErr
+			}
+			tokenID = bytePlusExistingTokenID(existing, identityFingerprint, tokenID)
+		}
+	}
 	version := randomUpper(20)
 	meta := datatypes.JSONMap{
 		"pending_check":                      true,
 		bytePlusCredentialFingerprintMetaKey: fingerprint,
+		bytePlusIdentityFingerprintMetaKey:   identityFingerprint,
 		bytePlusProbeVersionMetaKey:          version,
+		bytePlusSessionExpiresAtMetaKey:      bytePlusSessionExpiryText(cookie),
 	}
 	now := time.Now()
 	item := &model.TokenAccount{
@@ -417,6 +442,56 @@ func (s *TokenService) ImportBytePlusCookie(ctx context.Context, cookie string) 
 		}
 	}
 	go s.checkPendingBytePlus(tokenID, cookie, fingerprint, version)
+	return item, nil
+}
+
+// ConfigureBytePlusLogin attaches password-login renewal material to an
+// already-imported account. The secret stays in refresh_profiles and is never
+// returned by the control plane.
+func (s *TokenService) ConfigureBytePlusLogin(ctx context.Context, accountID, identity, secret, cookie string) error {
+	identity, secret = strings.TrimSpace(identity), strings.TrimSpace(secret)
+	if identity == "" || secret == "" {
+		return nil
+	}
+	if s.refresh == nil {
+		return errors.New("refresh profile repository unavailable")
+	}
+	next := time.Now()
+	if expiry := bytePlusSessionExpiry(cookie); !expiry.IsZero() {
+		next = expiry.Add(-6 * time.Hour)
+	}
+	return s.refresh.UpsertBytePlusLogin(ctx, accountID, identity, secret, next)
+}
+
+// RotateBytePlusCookie replaces one existing account's session after a local
+// password login. Stable AccountID matching prevents a bad credential mapping
+// from overwriting a different account.
+func (s *TokenService) RotateBytePlusCookie(ctx context.Context, accountID, cookie string) (*model.TokenAccount, error) {
+	cookie = normalizeBytePlusCookie(cookie)
+	if cookie == "" || !byteplus.IsBytePlusCookie(cookie) {
+		return nil, errors.New("not a byteplus lumina cookie")
+	}
+	if s.tokens == nil || s.byteplusPending == nil {
+		return nil, errors.New("byteplus token repository unavailable")
+	}
+	current, err := s.tokens.Get(ctx, "byteplus", accountID)
+	if err != nil {
+		return nil, err
+	}
+	expected := strings.TrimSpace(stringValue(current.Meta[bytePlusIdentityFingerprintMetaKey]))
+	if expected == "" {
+		expected = bytePlusIdentityFingerprint(current.Value)
+	}
+	if actual := bytePlusIdentityFingerprint(cookie); expected == "" || actual == "" || actual != expected {
+		return nil, errors.New("byteplus login returned a different AccountID")
+	}
+	fingerprint := bytePlusCredentialFingerprint(cookie)
+	version := randomUpper(20)
+	item, err := s.byteplusPending.RefreshCredential(ctx, accountID, cookie, fingerprint, version)
+	if err != nil {
+		return nil, err
+	}
+	go s.checkPendingBytePlus(accountID, cookie, fingerprint, version)
 	return item, nil
 }
 
@@ -494,6 +569,92 @@ func normalizeBytePlusCookie(cookie string) string {
 func bytePlusCredentialFingerprint(cookie string) string {
 	digest := sha256.Sum256([]byte(normalizeBytePlusCookie(cookie)))
 	return fmt.Sprintf("%x", digest[:])
+}
+
+// bytePlusIdentityFingerprint is stable across 48-hour login rotations. The
+// AccountID cookie is an opaque account identifier rather than a bearer token;
+// only its SHA-256 digest is persisted in metadata or used for row identity.
+func bytePlusIdentityFingerprint(cookie string) string {
+	accountID := bytePlusCookieValue(cookie, "AccountID")
+	if accountID == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte("byteplus-account\x00" + accountID))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func bytePlusExistingTokenID(items []model.TokenAccount, identityFingerprint, fallback string) string {
+	for _, item := range items {
+		if item.Pool != "byteplus" {
+			continue
+		}
+		stored := strings.TrimSpace(stringValue(item.Meta[bytePlusIdentityFingerprintMetaKey]))
+		if stored == "" {
+			stored = bytePlusIdentityFingerprint(item.Value)
+		}
+		if stored == identityFingerprint {
+			return item.ID
+		}
+	}
+	return fallback
+}
+
+func bytePlusCookieValue(cookie, wanted string) string {
+	for _, part := range strings.Split(normalizeBytePlusCookie(cookie), ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(name), wanted) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+// bytePlusSessionExpiry reads the unverified exp claim from Lumina's digest
+// cookie. It is used only as a local scheduling deadline, never as proof of
+// identity or authorization.
+func bytePlusSessionExpiry(cookie string) time.Time {
+	token := bytePlusCookieValue(cookie, "digest")
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return time.Time{}
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.Exp <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(claims.Exp, 0).UTC()
+}
+
+func bytePlusSessionExpiryText(cookie string) string {
+	if expiry := bytePlusSessionExpiry(cookie); !expiry.IsZero() {
+		return expiry.Format(time.RFC3339)
+	}
+	return ""
+}
+
+func bytePlusAccountSessionExpiry(item model.TokenAccount) time.Time {
+	if item.Pool != "byteplus" {
+		return time.Time{}
+	}
+	if raw := strings.TrimSpace(stringValue(item.Meta[bytePlusSessionExpiresAtMetaKey])); raw != "" {
+		if expiry, err := time.Parse(time.RFC3339, raw); err == nil {
+			return expiry.UTC()
+		}
+	}
+	return bytePlusSessionExpiry(item.Value)
+}
+
+// Unknown legacy sessions remain eligible and are still validated by the
+// provider. A known-expired digest is never scheduled for ordinary traffic.
+func bytePlusAccountSessionUsable(item model.TokenAccount, now time.Time) bool {
+	expiry := bytePlusAccountSessionExpiry(item)
+	return expiry.IsZero() || expiry.After(now)
 }
 
 func bytePlusTokenIDFromFingerprint(fingerprint string) string {
@@ -1120,6 +1281,7 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 			patch["cached_quota_reset_after"] = reset
 		}
 		_ = s.tokens.UpdateMergingMeta(ctx, "grok", it.ID, metaPatch, patch)
+		recordBookkeepingError("refresh grok quota bucket", s.storeQuotaSnapshot(ctx, "grok", it.ID, data))
 	}
 	log.Printf("grok liveness: checked %d due account(s)", len(items))
 }
@@ -1518,6 +1680,7 @@ func (s *TokenService) RefreshLowCreditOreateAccounts(ctx context.Context) {
 					log.Printf("oreate maintenance: could not persist refreshed quota for %s", item.ID)
 					return
 				}
+				recordBookkeepingError("refresh oreate quota bucket", s.storeQuotaSnapshot(probeCtx, "oreate", item.ID, data))
 				refreshed.Add(1)
 			}()
 		}
@@ -1752,7 +1915,20 @@ func (s *TokenService) Accounts(ctx context.Context) ([]map[string]any, error) {
 	return out, nil
 }
 
+// Quota publishes every trusted provider probe to the same bucket used by
+// dispatch. Unknown/error readings preserve the previous schedulable balance.
 func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]any, error) {
+	snapshot, err := s.probeQuota(ctx, pool, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.storeQuotaSnapshot(ctx, normalizePool(pool), id, snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+func (s *TokenService) probeQuota(ctx context.Context, pool, id string) (map[string]any, error) {
 	s.applyProxy(ctx)
 	item, err := s.tokens.Get(ctx, normalizePool(pool), id)
 	if err != nil {
@@ -1800,6 +1976,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
 			"quota_cached_at": metaPatch["cached_quota_at"],
 			"unchanged":       false,
+			"auth_failed":     authFailed,
 			"unknown":         boolValueWithDefault(data["unknown"], false),
 			"error":           safeQuotaProbeError(data),
 		}, nil
@@ -1810,6 +1987,9 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			// A balance endpoint can be independently challenged (notably generic
 			// 403s). Only a real generation verdict may disable an account/route.
 			return nil, err
+		}
+		if quotaProbeUntrusted(data) {
+			return unknownQuotaSnapshot(data), nil
 		}
 		patch := map[string]any{}
 		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
@@ -1843,6 +2023,9 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		data, err := s.byteplus.FetchCreditsBalance(ctx, item.Value)
 		if err != nil {
 			return nil, err
+		}
+		if quotaProbeUntrusted(data) {
+			return unknownQuotaSnapshot(data), nil
 		}
 		metaPatch := map[string]any{}
 		var upstreamRemaining *float64
@@ -1891,6 +2074,9 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		if err != nil {
 			return nil, err
 		}
+		if quotaProbeUntrusted(data) {
+			return unknownQuotaSnapshot(data), nil
+		}
 		patch := map[string]any{}
 		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 		if remaining, ok := data["remaining"].(int); ok {
@@ -1924,6 +2110,9 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		data, err := s.grok.FetchCreditsBalance(ctx, item.Value)
 		if err != nil {
 			return nil, err
+		}
+		if quotaProbeUntrusted(data) {
+			return unknownQuotaSnapshot(data), nil
 		}
 		patch := map[string]any{}
 		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
@@ -1962,6 +2151,9 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		data, err := s.oreate.FetchCreditsBalance(ctx, oreateAccountFromToken(*item))
 		if err != nil {
 			return nil, err
+		}
+		if quotaProbeUntrusted(data) {
+			return unknownQuotaSnapshot(data), nil
 		}
 		now := time.Now()
 		item, err = persistOreateQuotaSnapshot(ctx, s.tokens, item.ID, data, now)

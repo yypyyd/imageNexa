@@ -154,6 +154,10 @@ function statusLabel(value) {
   return ({ active: '可用', quota: '额度受限', pending: '待校验', disabled: '已禁用', auth_error: '凭据失效', cooldown: '冷却中' })[value] || value || '未知'
 }
 
+function sessionLabel(account) {
+  return ({ valid: '会话', expiring: '会话将到期', expired: '会话已过期', unknown: '会话到期未知' })[account.session_state] || '会话'
+}
+
 async function patchAccount(account, patch, key) {
   busy.value = `${account.id}:${key}`
   const response = await api(`/accounts/${encodeURIComponent(account.id)}`, jsonBody('PATCH', patch))
@@ -378,7 +382,7 @@ onMounted(() => { load(); loadModels() })
                 <span v-else class="text-white/30">未获取</span>
               </td>
               <td class="stats-cell"><div><b>{{ account.active_jobs || 0 }}</b> 在途</div><small><span class="ok">{{ account.success_total || 0 }} 成功</span> · <span :class="Number(account.fail_total || 0) > 0 && 'bad'">{{ account.fail_total || 0 }} 失败</span></small></td>
-              <td class="time-cell"><div title="最后使用">用 {{ fmtTime(account.last_used_at) }}</div><small title="导入/创建时间">建 {{ fmtTime(account.created_at) }}</small></td>
+              <td class="time-cell"><div title="最后使用">用 {{ fmtTime(account.last_used_at) }}</div><small title="导入/创建时间">建 {{ fmtTime(account.created_at) }}</small><small v-if="account.provider === 'byteplus'" :class="{ warn: account.session_state === 'expiring', bad: account.session_state === 'expired' }" :title="sessionLabel(account)">{{ sessionLabel(account) }} {{ fmtTime(account.session_expires_at) }}</small></td>
               <td>
                 <div class="job-count">运行中 {{ account.active_jobs || 0 }}</div>
                 <input type="number" min="0" max="1000" class="compact-input" :value="account.max_concurrency || 0" title="账号并发，0 表示使用 Provider 默认值" @change="patchAccount(account,{max_concurrency:Number($event.target.value)},'concurrency')" />

@@ -24,6 +24,29 @@ func TestSafeCustomMetaCannotExposeCredential(t *testing.T) {
 	}
 }
 
+func TestBytePlusSessionStatus(t *testing.T) {
+	now := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		expiry time.Time
+		want   string
+	}{
+		{name: "valid", expiry: now.Add(7 * time.Hour), want: "valid"},
+		{name: "expiring", expiry: now.Add(6 * time.Hour), want: "expiring"},
+		{name: "expired", expiry: now, want: "expired"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			account := model.TokenAccount{Pool: "byteplus", Meta: datatypes.JSONMap{
+				bytePlusSessionExpiresAtMetaKey: test.expiry.Format(time.RFC3339),
+			}}
+			gotExpiry, gotState := bytePlusSessionStatus(account, now)
+			if gotExpiry != test.expiry.Format(time.RFC3339) || gotState != test.want {
+				t.Fatalf("status = (%q, %q), want (%q, %q)", gotExpiry, gotState, test.expiry.Format(time.RFC3339), test.want)
+			}
+		})
+	}
+}
+
 func TestBytePlusCredentialSecretAcceptsOnlyCookieMaterial(t *testing.T) {
 	tests := []struct {
 		name  string

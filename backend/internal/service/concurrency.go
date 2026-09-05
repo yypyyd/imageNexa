@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -18,12 +17,12 @@ var ErrConcurrencyBackendUnavailable = errors.New("concurrency backend unavailab
 // Each slot is a member of a sorted set keyed by the subject (user/account),
 // scored with its expiry time. Acquire prunes expired members first, so a slot
 // whose Release was lost (crash / missed defer) auto-frees after the TTL — the
-// count can never leak forever. It's intentionally lossy-tolerant: if Redis is
-// unavailable it FAILS OPEN (allows the work) rather than blocking generation.
+// count can never leak forever. Bounded gates fail closed when Redis is
+// unavailable; observational capacity reads are best-effort.
 type ConcurrencyService struct {
 	redis *redis.Client
-	// ttl is the max lifetime of a slot — the longest a generation can run
-	// (video ~3min) plus head-room, after which a stuck slot self-heals.
+	// ttl covers the image/video execution deadlines plus bookkeeping headroom.
+	// A crashed worker cannot retain a slot indefinitely.
 	ttl int
 }
 
@@ -70,7 +69,9 @@ func (c *ConcurrencyService) Release(ctx context.Context, key, token string) {
 	if c == nil || c.redis == nil {
 		return
 	}
-	_ = c.redis.ZRem(ctx, key, token).Err()
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	recordBookkeepingError("release concurrency slot", c.redis.ZRem(cleanupCtx, key, token).Err())
 }
 
 // ActiveCount reports live slots after pruning crash-expired members. It is
@@ -105,22 +106,43 @@ func (c *ConcurrencyService) ActiveCounts(ctx context.Context, keys []string) (m
 	if len(unique) == 0 {
 		return map[string]int64{}, true
 	}
-	now := strconv.FormatInt(time.Now().Unix(), 10)
-	pipe := c.redis.TxPipeline()
-	commands := make(map[string]*redis.IntCmd, len(unique))
-	for _, key := range unique {
-		pipe.ZRemRangeByScore(ctx, key, "-inf", now)
-		commands[key] = pipe.ZCard(ctx, key)
+	// Use Redis time, as Acquire does. Observation must never prune a live
+	// lease using a worker's potentially skewed clock. Bound each read-only Lua
+	// batch so a large account pool does not monopolize the Redis event loop.
+	const batchSize = 128
+	pipe := c.redis.Pipeline()
+	commands := make([]*redis.Cmd, 0, (len(unique)+batchSize-1)/batchSize)
+	for start := 0; start < len(unique); start += batchSize {
+		end := min(start+batchSize, len(unique))
+		commands = append(commands, pipe.Eval(ctx, activeCountsScript, unique[start:end]))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, false
 	}
-	counts := make(map[string]int64, len(commands))
-	for key, command := range commands {
-		counts[key] = command.Val()
+	counts := make(map[string]int64, len(unique))
+	index := 0
+	for _, command := range commands {
+		values, err := command.Int64Slice()
+		if err != nil {
+			return nil, false
+		}
+		for _, count := range values {
+			counts[unique[index]] = count
+			index++
+		}
 	}
 	return counts, true
 }
+
+// Counts only live leases; expiration cleanup belongs to atomic acquisition.
+const activeCountsScript = `
+local now = redis.call('TIME')[1]
+local counts = {}
+for i, key in ipairs(KEYS) do
+    counts[i] = redis.call('ZCOUNT', key, '(' .. now, '+inf')
+end
+return counts
+`
 
 // NextCursor returns the next value of a shared round-robin counter (starting at
 // 0) and advances it. It is Redis-backed on purpose: a per-process counter

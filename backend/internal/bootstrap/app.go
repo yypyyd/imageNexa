@@ -104,9 +104,9 @@ func NewApp(ctx context.Context) (*App, error) {
 	tokenSvc := service.NewTokenService(
 		tokenRepo, refreshRepo, eventRepo, settingsRepo,
 		adobeClient, bytePlusClient, chatGPTClient, runwayClient,
-		grokClient, oreateClient, customClient,
+		grokClient, oreateClient, customClient, modelRepo.Quotas(),
 	)
-	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient)
+	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient, bytePlusClient, tokenSvc)
 	v1Svc := service.NewV1Service(
 		cfg, modelRepo, credentialSvc, eventRepo, tokenRepo, settingsRepo, concurrencySvc,
 		adobeClient, bytePlusClient, chatGPTClient, runwayClient,

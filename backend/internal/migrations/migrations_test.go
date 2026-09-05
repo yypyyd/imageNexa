@@ -31,8 +31,8 @@ func TestLoadMigrationsIsOrderedAndChecksummed(t *testing.T) {
 	if len(migrations) == 0 {
 		t.Fatal("Load() returned no migrations")
 	}
-	if len(migrations) != 7 {
-		t.Fatalf("Load() returned %d migrations, want 7", len(migrations))
+	if len(migrations) != 9 {
+		t.Fatalf("Load() returned %d migrations, want 9", len(migrations))
 	}
 	hexChecksum := regexp.MustCompile(`^[0-9a-f]{64}$`)
 	for index, migration := range migrations {
@@ -47,6 +47,29 @@ func TestLoadMigrationsIsOrderedAndChecksummed(t *testing.T) {
 		}
 		if strings.Contains(migration.SQL, "\r") {
 			t.Fatalf("migration %s is not LF-only", migration.Filename)
+		}
+	}
+}
+
+func TestBytePlusLoginProfileMigrationKeepsSecretsPrivate(t *testing.T) {
+	sql := loadedMigrationSQL(t, 9)
+	for _, required := range []string{"ALTER TABLE refresh_profiles", "login_identity TEXT", "login_secret TEXT"} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("byteplus login profile migration missing %q", required)
+		}
+	}
+}
+
+func TestQuotaReservationMigrationCascadesAccountDeletion(t *testing.T) {
+	sql := loadedMigrationSQL(t, 8)
+	for _, required := range []string{
+		"DROP CONSTRAINT IF EXISTS quota_reservations_quota_bucket_id_fkey",
+		"FOREIGN KEY (quota_bucket_id)",
+		"REFERENCES account_quota_buckets(id)",
+		"ON DELETE CASCADE",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("quota reservation cascade migration missing %q", required)
 		}
 	}
 }

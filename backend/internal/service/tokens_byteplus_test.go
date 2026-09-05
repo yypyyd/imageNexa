@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +98,40 @@ func TestBytePlusTokenIDUsesCompleteCredentialFingerprint(t *testing.T) {
 	}
 }
 
+func bytePlusTestDigest(t *testing.T, expiry time.Time) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"exp": expiry.Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "header." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
+
+func TestBytePlusIdentityAndExpirySurviveSessionRotation(t *testing.T) {
+	expiry := time.Date(2026, 9, 5, 3, 23, 28, 0, time.UTC)
+	oldCookie := "csrfToken=old; digest=" + bytePlusTestDigest(t, expiry.Add(-48*time.Hour)) + "; AccountID=stable-account"
+	newCookie := "csrfToken=new; digest=" + bytePlusTestDigest(t, expiry) + "; AccountID=stable-account"
+
+	oldIdentity := bytePlusIdentityFingerprint(oldCookie)
+	newIdentity := bytePlusIdentityFingerprint(newCookie)
+	if oldIdentity == "" || oldIdentity != newIdentity {
+		t.Fatalf("identity changed across login rotation: old=%q new=%q", oldIdentity, newIdentity)
+	}
+	if got := bytePlusSessionExpiry(newCookie); !got.Equal(expiry) {
+		t.Fatalf("session expiry = %v, want %v", got, expiry)
+	}
+
+	legacy := []model.TokenAccount{{ID: "BP-LEGACY-ROW", Pool: "byteplus", Value: oldCookie}}
+	fallback := bytePlusTokenIDFromFingerprint(newIdentity)
+	if got := bytePlusExistingTokenID(legacy, newIdentity, fallback); got != "BP-LEGACY-ROW" {
+		t.Fatalf("rotated session selected account %q, want legacy row", got)
+	}
+	item := model.TokenAccount{Pool: "byteplus", Value: newCookie}
+	if !bytePlusAccountSessionUsable(item, expiry.Add(-time.Second)) || bytePlusAccountSessionUsable(item, expiry) {
+		t.Fatal("known session expiry did not gate scheduling")
+	}
+}
+
 type bytePlusProbeCompletion struct {
 	version string
 	status  string
@@ -160,7 +196,9 @@ func (s *memoryBytePlusPendingStore) RefreshCredential(_ context.Context, id, co
 	}
 	item.Meta["pending_check"] = true
 	item.Meta[bytePlusCredentialFingerprintMetaKey] = fingerprint
+	item.Meta[bytePlusIdentityFingerprintMetaKey] = bytePlusIdentityFingerprint(cookie)
 	item.Meta[bytePlusProbeVersionMetaKey] = version
+	item.Meta[bytePlusSessionExpiresAtMetaKey] = bytePlusSessionExpiryText(cookie)
 	return cloneBytePlusTestAccount(item), nil
 }
 

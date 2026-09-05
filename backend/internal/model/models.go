@@ -162,6 +162,8 @@ type RefreshProfile struct {
 	Kind                string `gorm:"size:64;index;not null"`
 	Cookie              string `gorm:"type:text"`
 	ARPSessionToken     string `gorm:"column:arp_session_token;type:text;not null;default:''" json:"-"`
+	LoginIdentity       string `gorm:"column:login_identity;type:text;not null;default:''" json:"-"`
+	LoginSecret         string `gorm:"column:login_secret;type:text;not null;default:''" json:"-"`
 	Enabled             bool   `gorm:"not null;default:true"`
 	IntervalSeconds     int    `gorm:"not null;default:54000"`
 	ImportedAt          *time.Time

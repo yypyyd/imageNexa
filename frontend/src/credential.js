@@ -171,6 +171,12 @@ function parseJSONValue(value) {
           user_agent: String(value.user_agent || value.userAgent || '').trim(),
           reg_ts: Number(value.reg_ts || value.createTime || 0) || 0,
           vip: String(value.vip || '0').trim(),
+        } : provider === 'byteplus' ? {
+          cookie_string: cookie,
+          email: String(value.email || value.account?.account_email || '').trim(),
+          password: String(value.password || value.login_secret || '').trim(),
+          session_expires_at: String(value.session_expires_at || '').trim(),
+          session_expires: Number(value.session_expires || 0) || 0,
         } : cookie,
       }]
     }

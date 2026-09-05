@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -76,6 +77,38 @@ func (r *DispatchRepository) ListAccepted(ctx context.Context, limit int) ([]mod
 		Where("state = ? AND upstream_task_id <> ''", "accepted").
 		Order("started_at ASC").Limit(limit).Find(&items).Error
 	return items, err
+}
+
+// ListUnknown returns ambiguous submissions that finished before the cutoff and
+// are therefore old enough for the provider's task history to be authoritative.
+func (r *DispatchRepository) ListUnknown(ctx context.Context, finishedBefore time.Time, limit int) ([]model.DispatchAttempt, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	var items []model.DispatchAttempt
+	err := r.db.WithContext(ctx).
+		Where("state = ? AND COALESCE(finished_at, started_at) <= ?", "unknown", finishedBefore).
+		Order("started_at ASC").Limit(limit).Find(&items).Error
+	return items, err
+}
+
+// Adopt upgrades an ambiguous submission to an accepted one once the provider's
+// own task history proves the task exists. From then on the attempt follows the
+// normal accepted-task recovery path and is never resubmitted.
+func (r *DispatchRepository) Adopt(ctx context.Context, attemptID, upstreamTaskID string) error {
+	upstreamTaskID = clipDispatchField(upstreamTaskID, 255)
+	if upstreamTaskID == "" {
+		return errors.New("upstream task id is required to adopt a submission")
+	}
+	now := time.Now()
+	return r.db.WithContext(ctx).Model(&model.DispatchAttempt{}).
+		Where("id = ? AND state = ?", attemptID, "unknown").
+		Updates(map[string]any{
+			"state": "accepted", "failure_class": "temporary",
+			"upstream_task_id": upstreamTaskID,
+			"error":            dispatchFailureMessage("accepted", "temporary"),
+			"finished_at":      nil, "updated_at": now,
+		}).Error
 }
 
 func dispatchFailureMessage(state, failureClass string) string {

@@ -4,25 +4,32 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
+	"backend/internal/provider/byteplus"
 	"backend/internal/repo"
 	"gorm.io/datatypes"
 )
 
 type RefreshProfileService struct {
-	profiles *repo.RefreshProfileRepository
-	tokens   *repo.TokenRepository
-	adobe    *adobe.Client
+	profiles           *repo.RefreshProfileRepository
+	tokens             *repo.TokenRepository
+	adobe              *adobe.Client
+	byteplus           *byteplus.Client
+	tokenSvc           *TokenService
+	bytePlusRefreshing atomic.Bool
 }
 
-func NewRefreshProfileService(profiles *repo.RefreshProfileRepository, tokens *repo.TokenRepository, adobeClient *adobe.Client) *RefreshProfileService {
+func NewRefreshProfileService(profiles *repo.RefreshProfileRepository, tokens *repo.TokenRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, tokenSvc *TokenService) *RefreshProfileService {
 	return &RefreshProfileService{
 		profiles: profiles,
 		tokens:   tokens,
 		adobe:    adobeClient,
+		byteplus: bytePlusClient,
+		tokenSvc: tokenSvc,
 	}
 }
 
@@ -31,14 +38,17 @@ func (s *RefreshProfileService) List(ctx context.Context) ([]model.RefreshProfil
 }
 
 func (s *RefreshProfileService) RefreshNow(ctx context.Context, id string) error {
-	if s.adobe == nil || s.tokens == nil {
+	if s.tokens == nil {
 		return errors.New("refresh client not configured")
 	}
 	profile, err := s.profiles.Get(ctx, id)
 	if err != nil {
 		return err
 	}
-	if profile.Pool != "adobe" || profile.Kind != "adobe_cookie" {
+	if profile.Pool == "byteplus" && profile.Kind == "byteplus_password" {
+		return s.refreshBytePlus(ctx, *profile)
+	}
+	if profile.Pool != "adobe" || profile.Kind != "adobe_cookie" || s.adobe == nil {
 		return errors.New("unsupported refresh profile")
 	}
 
@@ -118,6 +128,9 @@ func (s *RefreshProfileService) RefreshNow(ctx context.Context, id string) error
 			meta["cached_quota_total"] = total
 		}
 		tokenPatch["meta"] = meta
+		if s.tokenSvc != nil {
+			recordBookkeepingError("refresh adobe quota bucket", s.tokenSvc.storeQuotaSnapshot(ctx, "adobe", id, quotaData))
+		}
 		if resetAfter := strings.TrimSpace(stringValue(quotaData["available_until"])); resetAfter != "" {
 			tokenPatch["cached_quota_reset_after"] = resetAfter
 		}
@@ -140,12 +153,45 @@ func (s *RefreshProfileService) RefreshNow(ctx context.Context, id string) error
 	return err
 }
 
+func (s *RefreshProfileService) refreshBytePlus(ctx context.Context, profile model.RefreshProfile) error {
+	if s.byteplus == nil || s.tokenSvc == nil {
+		return errors.New("byteplus refresh client not configured")
+	}
+	s.tokenSvc.applyProxy(ctx)
+	now := time.Now()
+	_, _ = s.profiles.Update(ctx, profile.ID, map[string]any{"last_attempt_at": now})
+	cookie, err := s.byteplus.Login(ctx, profile.LoginIdentity, profile.LoginSecret)
+	if err == nil {
+		_, err = s.tokenSvc.RotateBytePlusCookie(ctx, profile.ID, cookie)
+	}
+	if err != nil {
+		failures := profile.ConsecutiveFailures + 1
+		minutes := 5 * failures
+		if minutes > 60 {
+			minutes = 60
+		}
+		_, _ = s.profiles.Update(ctx, profile.ID, map[string]any{
+			"last_error": safeGenerationErrorText(err), "consecutive_failures": failures,
+			"next_retry_at": now.Add(time.Duration(minutes) * time.Minute),
+		})
+		return err
+	}
+	next := now.Add(42 * time.Hour)
+	if expiry := bytePlusSessionExpiry(cookie); !expiry.IsZero() {
+		next = expiry.Add(-6 * time.Hour)
+	}
+	_, err = s.profiles.Update(ctx, profile.ID, map[string]any{
+		"last_success_at": now, "next_retry_at": next, "last_error": "", "consecutive_failures": 0,
+	})
+	return err
+}
+
 // RefreshDue refreshes every enabled profile whose next_retry_at has passed.
 // Driven by the background maintenance loop so Adobe cookies auto-renew without
 // an admin clicking "refresh". Individual failures are recorded on the profile
 // (backoff + dead escalation) and don't abort the sweep.
 func (s *RefreshProfileService) RefreshDue(ctx context.Context) (int, error) {
-	if s.adobe == nil || s.tokens == nil {
+	if s.tokens == nil {
 		return 0, nil
 	}
 	due, err := s.profiles.ListDue(ctx, time.Now())
@@ -153,14 +199,34 @@ func (s *RefreshProfileService) RefreshDue(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	refreshed := 0
+	bytePlusDue := make([]model.RefreshProfile, 0)
 	for _, p := range due {
-		if p.Pool != "adobe" || p.Kind != "adobe_cookie" {
+		if p.Pool == "byteplus" && p.Kind == "byteplus_password" {
+			bytePlusDue = append(bytePlusDue, p)
+			continue
+		}
+		if p.Pool != "adobe" || p.Kind != "adobe_cookie" || s.adobe == nil {
 			continue
 		}
 		if err := s.RefreshNow(ctx, p.ID); err != nil {
 			continue
 		}
 		refreshed++
+	}
+	if len(bytePlusDue) > 0 && s.byteplus != nil && s.tokenSvc != nil && s.bytePlusRefreshing.CompareAndSwap(false, true) {
+		profiles := append([]model.RefreshProfile(nil), bytePlusDue...)
+		go func() {
+			defer s.bytePlusRefreshing.Store(false)
+			for i, profile := range profiles {
+				if i > 0 {
+					time.Sleep(8 * time.Second)
+				}
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				_ = s.RefreshNow(refreshCtx, profile.ID)
+				cancel()
+			}
+		}()
+		refreshed += len(profiles)
 	}
 	return refreshed, nil
 }

@@ -18,8 +18,8 @@ func TestResolveImageSizeModelSemantics(t *testing.T) {
 		want string
 	}{
 		{name: "other model ignores quality", item: otherModel, in: V1ImageRequest{Size: "2480x3312", Quality: "high"}, want: "2K"},
-		{name: "GPT Image 2 maps quality", item: gptImage2, in: V1ImageRequest{Size: "2480x3312", Quality: "high"}, want: "4K"},
-		{name: "Lumina GPT Image 2 maps quality", item: luminaGPTImage2, in: V1ImageRequest{Size: "2480x3312", Quality: "high"}, want: "4K"},
+		{name: "GPT Image 2 keeps size tier with high quality", item: gptImage2, in: V1ImageRequest{Size: "2480x3312", Quality: "high"}, want: "2K"},
+		{name: "Lumina GPT Image 2 keeps size tier with low quality", item: luminaGPTImage2, in: V1ImageRequest{Size: "3072x4096", Quality: "low"}, want: "4K"},
 		{name: "blank quality keeps size tier", item: gptImage2, in: V1ImageRequest{Size: "2480x3312"}, want: "2K"},
 		{name: "explicit resolution remains authoritative", item: gptImage2, in: V1ImageRequest{Size: "2480x3312", Quality: "high", Resolution: "2K"}, want: "2K"},
 	}
@@ -36,17 +36,17 @@ func TestResolveImageSizeModelSemantics(t *testing.T) {
 
 func TestResolveImageSizeForwards4KGPTImage2Payload(t *testing.T) {
 	item := &model.ModelConfig{ID: "firefly-gpt-image-2", Prices: datatypes.JSONMap{"1K": 1, "2K": 2, "4K": 4}}
-	ratio, resolution := resolveImageSize(item, V1ImageRequest{Size: "2480x3312", Quality: "high"})
+	ratio, resolution := resolveImageSize(item, V1ImageRequest{Size: "3072x4096", Quality: "low"})
 	if size := upstreamSize(ratio, resolution); size != "3072x4096" {
 		t.Fatalf("upstreamSize() = %q, want 3072x4096", size)
 	}
-	if quality := upstreamQualityForModel(item.ID, resolution); quality != "high" {
-		t.Fatalf("upstreamQualityForModel() = %q, want high", quality)
+	if quality := upstreamQualityForModel(item.ID, "low", resolution); quality != "low" {
+		t.Fatalf("upstreamQualityForModel() = %q, want low", quality)
 	}
-	if quality := upstreamQualityForModel("seedream-4.5", resolution); quality != "" {
+	if quality := upstreamQualityForModel("seedream-4.5", "low", resolution); quality != "" {
 		t.Fatalf("non-GPT upstream quality = %q, want empty", quality)
 	}
-	if quality := upstreamQualityForModel("lumina-gpt-image-2", resolution); quality != "high" {
-		t.Fatalf("Lumina GPT Image 2 upstream quality = %q, want high", quality)
+	if quality := upstreamQualityForModel("lumina-gpt-image-2", "low", resolution); quality != "low" {
+		t.Fatalf("Lumina GPT Image 2 upstream quality = %q, want low", quality)
 	}
 }

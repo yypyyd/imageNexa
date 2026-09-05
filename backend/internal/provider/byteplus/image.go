@@ -144,7 +144,10 @@ func (c *Client) GenerateImage(ctx context.Context, cookie string, request Image
 	created, err := c.apiData(createCtx, http.MethodPost, "/inference/v2/create_task", cookie, payload)
 	cancelCreate()
 	if err != nil {
-		if errors.Is(err, ErrTemporaryUpstream) {
+		// Only a lost answer (transport failure, timeout, 5xx, unparseable body)
+		// is ambiguous. A 4xx or a business error code is Lumina refusing the
+		// request, so no task exists and the caller may fail over normally.
+		if errors.Is(err, ErrTemporaryUpstream) && !errors.Is(err, ErrUpstreamRejected) {
 			return nil, nil, taskSubmissionUnknownError(err)
 		}
 		return nil, nil, err
@@ -218,6 +221,162 @@ func taskSubmissionUnknownError(cause error) error {
 	return fmt.Errorf("%w: create_task: %v", ErrTaskSubmissionUnknown, cause)
 }
 
+// SubmittedTaskQuery identifies an ambiguous create_task call by what was sent
+// and when it could have been accepted. Model accepts any LookupModel alias.
+type SubmittedTaskQuery struct {
+	Model  string
+	Prompt string
+	From   time.Time
+	To     time.Time
+}
+
+// maxTaskHistoryPages bounds the history walk. The verification window is
+// minutes wide and the history is newest-first, so a handful of pages is ample.
+const maxTaskHistoryPages = 5
+
+// FindSubmittedTask searches the account's Lumina task history for the parent
+// task of an ambiguous create_task call. It is the only safe way to learn
+// whether a lost response actually created a task, because create_task itself
+// must never be replayed. It returns the matching parent task id, or "" when the
+// history was read successfully and no task in the window matches. Any error
+// means the history could not be read and the outcome remains unknown.
+func (c *Client) FindSubmittedTask(ctx context.Context, cookie string, query SubmittedTaskQuery) (string, error) {
+	cookie = normalizeCookie(cookie)
+	if cookie == "" || CSRFTokenFromCookie(cookie) == "" {
+		return "", ErrAuth
+	}
+	spec, ok := LookupModel(query.Model)
+	if !ok {
+		return "", fmt.Errorf("%w: unsupported model %q", ErrInvalidParams, query.Model)
+	}
+	if query.From.IsZero() || query.To.IsZero() || !query.To.After(query.From) {
+		return "", fmt.Errorf("%w: task window is required", ErrInvalidParams)
+	}
+	// An expired Lumina session degrades to a code-0 guest profile whose task
+	// history is legitimately empty. Only an authenticated read may serve as
+	// evidence of absence, so the session is validated the same way create_task
+	// validates it.
+	if _, err := c.FetchProfile(ctx, cookie); err != nil {
+		return "", err
+	}
+	prompt := strings.TrimSpace(query.Prompt)
+	const pageSize = 20
+	for page := 1; page <= maxTaskHistoryPages; page++ {
+		data, err := c.apiData(ctx, http.MethodPost, "/inference/task/query_task_list", cookie, map[string]any{
+			"page_num": page, "page_size": pageSize, "source": []any{},
+		})
+		if err != nil {
+			return "", err
+		}
+		root, _ := data.(map[string]any)
+		tasks, _ := root["tasks"].([]any)
+		if len(tasks) == 0 {
+			return "", nil
+		}
+		reachedWindowStart := false
+		for _, raw := range tasks {
+			task, _ := raw.(map[string]any)
+			createdAt, known := taskCreatedAt(task)
+			if !known {
+				continue
+			}
+			if createdAt.Before(query.From) {
+				reachedWindowStart = true
+				continue
+			}
+			if createdAt.After(query.To) || taskInferenceID(task) != spec.ID {
+				continue
+			}
+			if taskPrompt, found := taskPromptInput(task); prompt != "" && found && taskPrompt != prompt {
+				continue
+			}
+			if id := strings.TrimSpace(stringValue(task["id"])); id != "" {
+				return id, nil
+			}
+		}
+		if reachedWindowStart || len(tasks) < pageSize {
+			return "", nil
+		}
+	}
+	return "", fmt.Errorf("%w: task history window not reached", ErrTemporaryUpstream)
+}
+
+func taskCreatedAt(task map[string]any) (time.Time, bool) {
+	for _, key := range []string{"created_at", "create_time", "created"} {
+		raw, exists := task[key]
+		if !exists {
+			continue
+		}
+		value, ok := numberValue(raw)
+		if !ok || value <= 0 {
+			continue
+		}
+		// Lumina reports millisecond epochs; tolerate second epochs as well.
+		if value > 1e12 {
+			return time.UnixMilli(int64(value)), true
+		}
+		return time.Unix(int64(value), 0), true
+	}
+	return time.Time{}, false
+}
+
+func taskInferenceID(task map[string]any) string {
+	if info, ok := task["inference_info"].(map[string]any); ok {
+		for _, key := range []string{"inference_id", "inference_version_id"} {
+			if value := strings.TrimSpace(stringValue(info[key])); value != "" {
+				return value
+			}
+		}
+	}
+	if value := strings.TrimSpace(stringValue(task["inference_id"])); value != "" {
+		return value
+	}
+	children, _ := task["children"].([]any)
+	for _, rawChild := range children {
+		child, _ := rawChild.(map[string]any)
+		if value := strings.TrimSpace(stringValue(child["model_id"])); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// taskPromptInput returns the prompt the task was created with. Lumina keeps
+// the resolved inputs on each child; the parent's inference_config is a JSON
+// string with the same shape and serves as the fallback.
+func taskPromptInput(task map[string]any) (string, bool) {
+	children, _ := task["children"].([]any)
+	for _, rawChild := range children {
+		child, _ := rawChild.(map[string]any)
+		if prompt, ok := promptFromInputs(child["inputs"]); ok {
+			return prompt, true
+		}
+	}
+	switch config := task["inference_config"].(type) {
+	case map[string]any:
+		return promptFromInputs(config["inputs"])
+	case string:
+		var decoded map[string]any
+		if json.Unmarshal([]byte(config), &decoded) == nil {
+			return promptFromInputs(decoded["inputs"])
+		}
+	}
+	return "", false
+}
+
+func promptFromInputs(raw any) (string, bool) {
+	inputs, _ := raw.([]any)
+	for _, rawInput := range inputs {
+		input, _ := rawInput.(map[string]any)
+		name := strings.TrimSpace(stringValue(input["name"]))
+		internal := strings.TrimSpace(stringValue(input["internal_name"]))
+		if name == "prompt" || internal == "prompt" {
+			return strings.TrimSpace(stringValue(input["value"])), true
+		}
+	}
+	return "", false
+}
+
 type acceptedTaskFailure struct {
 	message  string
 	business error
@@ -242,7 +401,7 @@ func acceptedTaskError(taskID, stage string, cause error) error {
 	// terminal business outcomes retain their class for account state and public
 	// error mapping, while ErrTaskAccepted still prevents any resubmission.
 	var business error
-	for _, candidate := range []error{ErrQuotaExhausted, ErrRiskControl, ErrInvalidParams, ErrTaskFailed} {
+	for _, candidate := range []error{ErrQuotaExhausted, ErrRiskControl, ErrInvalidParams, ErrRetryableTaskFailed, ErrTaskFailed} {
 		if errors.Is(cause, candidate) {
 			business = candidate
 			break
@@ -720,6 +879,9 @@ func (c *Client) pollImageTask(ctx context.Context, cookie, taskID string) (map[
 				}
 				return nil, "", "", status, fmt.Errorf("%w: completed task has no image output", ErrTemporaryUpstream)
 			default:
+				if retryErr := retryableBetaTaskError(task, status); retryErr != nil {
+					return nil, "", "", status, retryErr
+				}
 				return nil, "", "", status, taskStatusError(status, taskFailureText(task))
 			}
 		}
@@ -888,6 +1050,32 @@ func taskFailureText(task map[string]any) string {
 		}
 	}
 	return "task failed"
+}
+
+const betaInstabilityFailureReason = "The model is in beta and may be unstable occasionally, please try again later"
+
+// retryableBetaTaskError recognizes only the exact GPT Image 2 terminal shape
+// observed in production. Status and reason must come from the same child;
+// combining fields from different children or another beta model could turn an
+// unknown paid failure into a resubmit.
+func retryableBetaTaskError(task map[string]any, parentStatus string) error {
+	if strings.ToLower(strings.TrimSpace(parentStatus)) != "failed" {
+		return nil
+	}
+	gptImage, ok := LookupModel("gpt-image-2")
+	if !ok || taskInferenceID(task) != gptImage.ID {
+		return nil
+	}
+	children, _ := task["children"].([]any)
+	for _, rawChild := range children {
+		child, _ := rawChild.(map[string]any)
+		status := strings.ToLower(strings.TrimSpace(stringValue(child["status"])))
+		reason := strings.TrimSpace(stringValue(child["fail_reason"]))
+		if status == "downstream_execute" && reason == betaInstabilityFailureReason {
+			return fmt.Errorf("%w: task %s: %s", ErrRetryableTaskFailed, status, clipString(reason, 240))
+		}
+	}
+	return nil
 }
 
 func taskStatusError(status, reason string) error {

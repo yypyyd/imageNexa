@@ -49,6 +49,12 @@ var (
 	// health, but recovery callers must close the durable event instead of polling
 	// the same failed parent forever.
 	ErrTaskFailed = fmt.Errorf("%w: accepted task failed", ErrTemporaryUpstream)
+	// ErrRetryableTaskFailed is the narrow exception to the usual account-level
+	// no-resubmit policy. Lumina explicitly terminated the task because its beta
+	// model was temporarily unstable, so 2API may advance through its separate,
+	// bounded distinct-account policy after proving the attempt uncharged. It
+	// still carries ErrTaskFailed and ErrTemporaryUpstream.
+	ErrRetryableTaskFailed = fmt.Errorf("%w: explicit beta failure permits bounded account failover", ErrTaskFailed)
 	// ErrTaskAccepted marks failures that happened after create_task returned a
 	// parent task id. It remains a temporary-upstream error for API mapping, but
 	// callers must not retry the whole generation because create_task is not
@@ -58,7 +64,36 @@ var (
 	// temporary, or missing a task id. The request may still have been accepted,
 	// so replaying it would violate at-most-once submission.
 	ErrTaskSubmissionUnknown = fmt.Errorf("%w: task submission outcome unknown; do not resubmit", ErrTemporaryUpstream)
+	// ErrUpstreamRejected marks responses in which Lumina itself refused the
+	// request: an HTTP 4xx or a parsed envelope carrying a business error code.
+	// Such a request was definitely not accepted, so it is safe to fail over
+	// even when the business code is otherwise unrecognized and stays in the
+	// temporary class. Lost, 5xx, and unparseable responses never carry it.
+	ErrUpstreamRejected = errors.New("byteplus upstream rejected request")
+	// ErrNoActivePlan is the code-200402 "No Active Combos." verdict: the account
+	// holds no plan and therefore zero computing points. It is a quota outcome
+	// with a definitive, probe-visible zero balance rather than a temporary blip.
+	ErrNoActivePlan = fmt.Errorf("%w: account has no active plan", ErrQuotaExhausted)
 )
+
+// noActivePlanCode is Lumina's business code for an account without any combo.
+const noActivePlanCode = 200402
+
+// upstreamRejection keeps the classified cause's message and class while adding
+// the ErrUpstreamRejected marker, so callers can distinguish "the server said no"
+// from "the answer was lost" without changing user-visible error mapping.
+type upstreamRejection struct{ cause error }
+
+func (e *upstreamRejection) Error() string { return e.cause.Error() }
+
+func (e *upstreamRejection) Unwrap() []error { return []error{ErrUpstreamRejected, e.cause} }
+
+func rejectedByUpstream(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &upstreamRejection{cause: cause}
+}
 
 // ModelSpec is the immutable upstream identity of one supported Lumina image
 // model. Only these five records are exposed; the similarly named layer-
@@ -284,14 +319,25 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 		if balance, ok := quotaBalance(data); ok {
 			return balance, nil
 		}
+		if hasNoActivePlan(data) {
+			return zeroBalance("no active plan"), nil
+		}
 	} else if errors.Is(err, ErrAuth) {
 		return nil, ErrAuth
+	} else if errors.Is(err, ErrNoActivePlan) {
+		return zeroBalance("no active plan"), nil
 	}
 
 	data, fallbackErr := c.apiData(ctx, http.MethodGet, "/inference/get_user_quota?type=image", cookie, nil)
 	if fallbackErr != nil {
 		if errors.Is(fallbackErr, ErrAuth) {
 			return nil, ErrAuth
+		}
+		if errors.Is(fallbackErr, ErrNoActivePlan) {
+			// "No Active Combos." is a definitive zero, not a failed probe. Leaving
+			// it unknown would keep the account eligible for every request and let
+			// it absorb submissions it can never serve.
+			return zeroBalance("no active plan"), nil
 		}
 		reason := fallbackErr.Error()
 		if err != nil {
@@ -417,6 +463,46 @@ func unknownBalance(reason string) map[string]any {
 	}
 }
 
+// zeroBalance is a known, schedulable-as-empty balance. It is not a failed
+// probe: error stays nil so admin views do not report it as one.
+func zeroBalance(reason string) map[string]any {
+	return map[string]any{
+		"remaining": 0,
+		"used":      0,
+		"total":     0,
+		"unknown":   false,
+		"error":     nil,
+		"reason":    reason,
+	}
+}
+
+// hasNoActivePlan recognizes the account-resources payload of an account that
+// never claimed a plan: the combos list is present but empty and no quota entry
+// exists. A payload without a combos field says nothing and stays unknown.
+func hasNoActivePlan(data any) bool {
+	root, ok := data.(map[string]any)
+	if !ok {
+		return false
+	}
+	combos, present := root["combos"]
+	if !present {
+		return false
+	}
+	switch typed := combos.(type) {
+	case nil:
+	case []any:
+		if len(typed) > 0 {
+			return false
+		}
+	default:
+		return false
+	}
+	if list, ok := root["quota_list"].([]any); ok && len(list) > 0 {
+		return false
+	}
+	return true
+}
+
 func (c *Client) apiData(ctx context.Context, method, path, cookie string, payload any) (any, error) {
 	var body io.Reader
 	if payload != nil {
@@ -455,13 +541,21 @@ func (c *Client) apiData(ctx context.Context, method, path, cookie string, paylo
 		message = responseMessage(raw)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, classifyUpstreamError(resp.StatusCode, code, message)
+		classified := classifyUpstreamError(resp.StatusCode, code, message)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			// A 4xx is the gateway or application refusing the request outright.
+			// Only 5xx and transport failures leave the outcome genuinely unknown.
+			classified = rejectedByUpstream(classified)
+		}
+		return nil, classified
 	}
 	if decodeErr != nil {
 		return nil, fmt.Errorf("%w: non-json response", ErrTemporaryUpstream)
 	}
 	if hasCode && code != 0 && code != 200 {
-		return nil, classifyUpstreamError(resp.StatusCode, code, message)
+		// A parsed business error inside an HTTP 200 envelope is Lumina's explicit
+		// verdict on this request; nothing was created upstream.
+		return nil, rejectedByUpstream(classifyUpstreamError(resp.StatusCode, code, message))
 	}
 	if data, exists := envelope["data"]; exists {
 		return data, nil
@@ -535,6 +629,11 @@ func classifyUpstreamError(httpStatus, code int, message string) error {
 	lower := strings.ToLower(message)
 	base := ErrTemporaryUpstream
 	switch {
+	case code == noActivePlanCode || strings.Contains(lower, "no active combo"):
+		// The account never claimed a plan (observed together with
+		// is_country_blocked=true). It has zero computing points, so this is a
+		// quota verdict with a known-zero balance, not a transient failure.
+		base = ErrNoActivePlan
 	case code == 100000007:
 		base = ErrQuotaExhausted
 	case code == 100000008:

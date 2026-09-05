@@ -382,6 +382,12 @@ func (s *AdminConsoleService) accountRow(ctx context.Context, account model.Toke
 	} else if account.Status == "quota" || account.Status == "pending" || account.Fails > 0 {
 		health = "degraded"
 	}
+	sessionExpiresAt, sessionState := bytePlusSessionStatus(account, time.Now())
+	if sessionState == "expired" {
+		health = "unhealthy"
+	} else if sessionState == "expiring" && health == "healthy" {
+		health = "degraded"
+	}
 	label := strings.TrimSpace(account.AccountDisplayName)
 	if label == "" {
 		label = strings.TrimSpace(account.AccountEmail)
@@ -397,8 +403,26 @@ func (s *AdminConsoleService) accountRow(ctx context.Context, account model.Toke
 		"consecutive_failures": account.Fails, "upstream_failures": account.UpstreamFails,
 		"image_limited": account.ImageLimited, "video_limited": account.VideoLimited,
 		"last_used_at": account.LastUsedAt, "created_at": account.CreatedAt,
+		"session_expires_at": sessionExpiresAt, "session_state": sessionState,
 		"base_url": safeCustomMeta(account, "base_url"), "models": safeCustomMeta(account, "models"),
 	}, nil
+}
+
+func bytePlusSessionStatus(account model.TokenAccount, now time.Time) (string, string) {
+	if account.Pool != "byteplus" {
+		return "", ""
+	}
+	expiry := bytePlusAccountSessionExpiry(account)
+	if expiry.IsZero() {
+		return "", "unknown"
+	}
+	state := "valid"
+	if !expiry.After(now) {
+		state = "expired"
+	} else if !expiry.After(now.Add(6 * time.Hour)) {
+		state = "expiring"
+	}
+	return expiry.UTC().Format(time.RFC3339), state
 }
 
 func safeCustomMeta(account model.TokenAccount, key string) string {
@@ -429,6 +453,11 @@ func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountIm
 		// the import succeeds.
 		secret = bytePlusCredentialSecret(input.Credential, credential)
 		account, err = s.tokenSvc.ImportBytePlusCookie(ctx, secret)
+		if err == nil && account != nil {
+			err = s.tokenSvc.ConfigureBytePlusLogin(ctx, account.ID,
+				firstMapString(credential, "email", "login_identity"),
+				firstMapString(credential, "password", "login_secret"), secret)
+		}
 	case "runway":
 		account, err = s.tokenSvc.ImportRunwayToken(ctx, secret, "")
 	case "grok":
@@ -566,7 +595,12 @@ func (s *AdminConsoleService) UpdateAccount(ctx context.Context, accountID strin
 			return nil, errors.New("status must be active or disabled")
 		}
 		updates["status"] = status
-		updates["dead"] = status == "disabled"
+		// Manual disablement is an operator scheduling choice, not proof that the
+		// credential is dead. Preserve the probe-derived dead flag when disabling;
+		// an explicit re-enable is allowed to clear it.
+		if status == "active" {
+			updates["dead"] = false
+		}
 	}
 	if value, ok := patch["weight"]; ok {
 		weight := intValueSafe(value)
@@ -608,14 +642,13 @@ func (s *AdminConsoleService) DeleteDeadAccounts(ctx context.Context) (int, erro
 		Find(&accounts).Error; err != nil {
 		return 0, err
 	}
-	deleted := 0
+	ids := make([]string, 0, len(accounts))
 	for _, account := range accounts {
-		if err := s.tokenSvc.Delete(ctx, account.Pool, account.ID); err != nil {
-			return deleted, err
-		}
-		deleted++
+		ids = append(ids, account.ID)
 	}
-	return deleted, nil
+	// Delete in one statement so a database error cannot leave a half-deleted
+	// batch. The schema cascades route bindings, quota buckets and reservations.
+	return s.tokenSvc.DeleteBulk(ctx, ids)
 }
 
 func (s *AdminConsoleService) SetAccountRoute(ctx context.Context, accountID, bindingID string, enabled bool) error {
@@ -636,27 +669,7 @@ func (s *AdminConsoleService) RefreshAccountQuota(ctx context.Context, accountID
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := s.tokenSvc.Quota(ctx, account.Pool, account.ID)
-	if err != nil {
-		return nil, err
-	}
-	remainingPtr, totalPtr, resetAt, trusted := trustedQuotaSnapshot(snapshot)
-	if !trusted {
-		// A timeout, 403, rate limit, or unparsable response is not a zero
-		// allowance. Preserve the last durable snapshot so a transient manual
-		// refresh cannot permanently remove this account from scheduling.
-		return snapshot, nil
-	}
-	bucketKey, unit, scoped := providerSnapshotScope(account.Pool)
-	if !scoped {
-		// Custom accounts are explicitly unmetered and unknown provider probes do
-		// not authorize inventing a balance bucket.
-		return snapshot, nil
-	}
-	if _, err := s.models.Quotas().UpsertSnapshot(ctx, account.ID, bucketKey, unit, totalPtr, remainingPtr, resetAt); err != nil {
-		return nil, err
-	}
-	return snapshot, nil
+	return s.tokenSvc.Quota(ctx, account.Pool, account.ID)
 }
 
 func trustedQuotaSnapshot(snapshot map[string]any) (remaining, total *float64, resetAt *time.Time, trusted bool) {

@@ -223,6 +223,21 @@ func accountRouteBindingAllows(binding model.AccountModelRoute, now time.Time, c
 	return !checkCooldown || binding.CooldownUntil == nil || !binding.CooldownUntil.After(now)
 }
 
+// DispatchBinding revalidates the route and logical-model switches together
+// with the account binding in one query. Request admission must not rely on
+// route configuration cached before a queue wait.
+func (r *ModelRouteRepository) DispatchBinding(ctx context.Context, accountID, routeID string) (*model.AccountModelRoute, error) {
+	var binding model.AccountModelRoute
+	err := r.db.WithContext(ctx).Model(&model.AccountModelRoute{}).
+		Select("account_model_routes.*").
+		Joins("JOIN model_routes ON model_routes.id = account_model_routes.model_route_id").
+		Joins("JOIN logical_models ON logical_models.id = model_routes.logical_model_id").
+		Where("account_model_routes.account_id = ? AND account_model_routes.model_route_id = ?", accountID, routeID).
+		Where("model_routes.enabled = ? AND logical_models.enabled = ?", true, true).
+		First(&binding).Error
+	return &binding, err
+}
+
 func (r *ModelRouteRepository) AccountRoute(ctx context.Context, accountID, routeID string) (*model.AccountModelRoute, error) {
 	if strings.TrimSpace(accountID) == "" || strings.TrimSpace(routeID) == "" {
 		return nil, gorm.ErrRecordNotFound

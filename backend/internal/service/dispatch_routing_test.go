@@ -34,8 +34,10 @@ func TestEvaluateRouteCostUsesRequestSpecificProviderRules(t *testing.T) {
 	}{
 		{name: "chatgpt generation", routeID: "image.gpt-image-2.chatgpt", req: model.RouteRequirements{Operation: "generation", Resolution: "1K"}, want: 1, known: true},
 		{name: "byteplus gpt low", routeID: "image.gpt-image-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "16:9", Resolution: "1K"}, want: 1, known: true},
-		{name: "byteplus gpt medium", routeID: "image.gpt-image-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "16:9", Resolution: "2K"}, want: 25, known: true},
-		{name: "byteplus gpt high", routeID: "image.gpt-image-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "16:9", Resolution: "4K"}, want: 230, known: true},
+		{name: "byteplus gpt medium", routeID: "image.gpt-image-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "16:9", Resolution: "2K", Quality: "medium"}, want: 25, known: true},
+		{name: "byteplus gpt high", routeID: "image.gpt-image-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "16:9", Resolution: "4K", Quality: "high"}, want: 230, known: true},
+		{name: "byteplus gpt omitted quality defaults low", routeID: "image.gpt-image-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "1:1", Resolution: "4K"}, want: 3, known: true},
+		{name: "byteplus gpt low 4k square compatibility canvas", routeID: "image.gpt-image-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "1:1", Resolution: "4K", Quality: "low"}, want: 3, known: true},
 		{name: "seedream pro wide with refs", routeID: "image.seedream-5.0-pro.byteplus", req: model.RouteRequirements{Operation: "edit", Ratio: "16:9", Resolution: "2K", ReferenceImages: 3}, want: 9.6, known: true},
 		{name: "seedream pro square with refs", routeID: "image.seedream-5.0-pro.byteplus", req: model.RouteRequirements{Operation: "edit", Ratio: "1:1", Resolution: "2K", ReferenceImages: 3}, want: 18.6, known: true},
 		{name: "nano 4k", routeID: "image.nano-banana-2.byteplus", req: model.RouteRequirements{Operation: "generation", Ratio: "1:1", Resolution: "4K"}, want: 24, known: true},
