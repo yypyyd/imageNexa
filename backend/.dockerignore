@@ -6,3 +6,9 @@ data/
 api
 api.exe
 *.log
+node_modules/
+.gocache/
+.gomodcache/
+*.test
+*.tmp
+*.har

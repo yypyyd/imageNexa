@@ -15,14 +15,11 @@ import (
 // Risk control accepts the generation only when the request itself comes from a
 // real signed page: an A/B run in production had every in-page submit accepted
 // and 20 of 21 Go submits refused as spam, even with a freshly minted token and
-// the very same exit IP. The submit therefore always happens in the page, and
-// only the render is followed from Go.
+// the very same exit IP. The signed page keeps the response open through the
+// render because closing it after the start event can cancel the upstream job.
 const (
-	// The page is only needed until upstream accepts the job: the render itself is
-	// then followed by polling the chat from Go, which keeps a browser out of the
-	// minutes-long wait and lets many more submits share the host.
-	inPageAcceptWait    = 3 * time.Minute
-	inPageSubmitTimeout = inPageAcceptWait + time.Minute
+	inPageRenderWait    = 32 * time.Minute
+	inPageSubmitTimeout = inPageRenderWait + time.Minute
 	inPageStreamLimit   = 8 << 20
 	// The upstream stream pings while a clip renders, so a longer gap means the
 	// connection died: stop the read and let logId recovery use what the page
@@ -38,8 +35,8 @@ type videoSubmitter interface {
 }
 
 // videoSubmitResult is what the page observed for one submit: the SSE text read
-// until upstream accepted the job, which carries the logId and the chat the
-// caller then polls, plus any page-side failure that ended the read early.
+// through the rendered result or a terminal failure, plus the chat and any
+// page-side failure that ended the read early.
 type videoSubmitResult struct {
 	Status  int    `json:"status"`
 	ChatID  string `json:"chatId"`
@@ -49,7 +46,8 @@ type videoSubmitResult struct {
 	// Proxy is the session the submitting page egresses through, which the chat
 	// polling then reuses so the whole generation is seen from one exit IP. The
 	// page fills the rest of this struct, so it must stay out of the JSON.
-	Proxy string `json:"-"`
+	Proxy  string `json:"-"`
+	Cookie string `json:"-"`
 }
 
 // availableCPUs reports the cores the process may use: runtime.NumCPU only sees
@@ -141,9 +139,8 @@ func readCgroupValue(path string) int64 {
 // SubmitVideo mints a Banti token on a warm page of this account and runs both
 // the create-chat and the stream request as fetches on that same page. The
 // payload is the request the caller built; chatId, focusId, jt and bid are
-// filled in by the page because only the page owns those values. It returns as
-// soon as upstream accepts or rejects the job, so the page is handed back to the
-// pool long before the clip is rendered.
+// filled in by the page because only the page owns those values. The page keeps
+// reading the response until the clip or a terminal failure arrives.
 func (s *chromiumSigner) SubmitVideo(ctx context.Context, account Account, payload []byte) (videoSubmitResult, error) {
 	account = account.normalized()
 	if account.Cookie == "" {
@@ -157,8 +154,8 @@ func (s *chromiumSigner) SubmitVideo(ctx context.Context, account Account, paylo
 }
 
 // inPageSubmitScript runs the website's own request sequence: mint the Banti
-// token, create the aiVideo chat, then read the event stream until upstream has
-// either accepted the job or refused it. Failures are kept on the state object
+// token, create the aiVideo chat, then read the event stream until the rendered
+// clip or a terminal error arrives. Failures are kept on the state object
 // instead of rejecting so the collected stream survives.
 func inPageSubmitScript(quotedPayload string) string {
 	return `window.__oreateSubmit = {done: false, status: 0, chatId: "", stream: "", failure: ""};
@@ -200,6 +197,7 @@ func inPageSubmitScript(quotedPayload string) string {
 				payload.jt = jt;
 				payload.chatId = chatId;
 				payload.focusId = chatId;
+				payload.ua = navigator.userAgent;
 				payload.extra.bid = (document.cookie.match(/__bid_n=([^;]*)/) || [])[1] || payload.extra.bid || "";
 				const response = await fetch("/oreate/sse/stream", {
 					method: "POST",
@@ -215,7 +213,7 @@ func inPageSubmitScript(quotedPayload string) string {
 				state.status = response.status;
 				const reader = response.body.getReader();
 				const decoder = new TextDecoder();
-				const accepted = /"event"\s*:\s*"(start|generating)"/;
+				const terminalError = /"event"\s*:\s*"error"/;
 				const stall = ` + strconv.Itoa(int(inPageStreamStall/time.Millisecond)) + `;
 				while (state.stream.length < ` + strconv.Itoa(inPageStreamLimit) + `) {
 					let stallTimer = 0;
@@ -228,7 +226,7 @@ func inPageSubmitScript(quotedPayload string) string {
 					clearTimeout(stallTimer);
 					if (chunk.done) break;
 					state.stream += decoder.decode(chunk.value, {stream: true});
-					if (state.stream.indexOf(".mp4") >= 0 || accepted.test(state.stream)) break;
+					if (state.stream.indexOf(".mp4") >= 0 || terminalError.test(state.stream)) break;
 				}
 			} catch (error) {
 				state.failure = String(error && error.message || error);

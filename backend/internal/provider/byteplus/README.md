@@ -117,9 +117,7 @@ remain manual-renewal accounts.
 ```text
 byteplus/
 ├── client.go       Account, model, HTTP, and error contracts
-├── client_test.go  Catalog, credential, redirect, and quota tests
 ├── image.go        Payloads, ImageX upload, polling, and artifact handling
-├── image_test.go   Generation, retry, upload, and security tests
 ├── README.md       Package usage and scope
 └── DESIGN.md       Design decisions and security boundaries
 ```

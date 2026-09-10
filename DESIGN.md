@@ -1,7 +1,7 @@
 # 2API Design
 
 Status: locked product architecture
-Last updated: 2026-09-03
+Last updated: 2026-09-10
 
 ## 1. Goals and boundaries
 
@@ -307,7 +307,7 @@ Before release:
 ```bash
 # Backend
 cd backend
-go test ./...
+go vet ./...
 go build ./cmd/api
 
 # Frontend
@@ -322,7 +322,7 @@ cd ..
 docker compose config
 ```
 
-Contract tests must assert:
+Release verification should cover:
 
 - the model set is exactly 4 text + 6 image + 9 video IDs;
 - provider-prefixed and unknown model IDs are rejected;
@@ -440,3 +440,30 @@ Contract tests must assert:
 **Impact**: Downstream clients use stable canonical IDs regardless of the selected provider. Administrators manage routes and accounts without exposing credentials. Deployment is defined by `docker-compose.yml` and `.env.example`.
 
 **Security decision**: One administrator, hashed downstream keys, HttpOnly sessions with CSRF, private upstream credentials, server-owned routing, authenticated content endpoints, conservative accepted-task handling, and a Go 1.26.6-or-newer patched build toolchain define the trust boundary.
+
+
+### 2026-09-10 — Dola 视频协议与账号调度
+
+Dola 使用 `seedance_v2.5`，仅提供 30 秒、720p 文生视频。公共模型 `dola-seedance-2.5` 仅路由到 Dola，原通用 Seedance 2.5 路由保留兼容；两者共享账号日期额度桶。迁移 000019 保留账号绑定的 enabled、entitled、cooldown，不重置额度。未验证的参考图片、视频和音频能力不对外发布。
+
+每个账号同时处理一个请求，每天最多两次，每次预占 1 generation；多个账号可以并行处理请求。UTC 00:00（北京时间 08:00）是本地记账边界，尚不代表已验证的上游重置时间。首次建桶使用 ON CONFLICT DO NOTHING，扣次使用 SELECT FOR UPDATE；结算始终指向预占时的日期桶，避免跨日退款增加新一天额度。网页或独立脚本消耗的次数需单独校准。
+
+上游明确每日额度耗尽后封存当天桶，一般内容拒绝不作为额度耗尽。确认未启动生成的时长拒绝释放预占；已受理后的终态失败保留扣次并禁止重发。发送结果不明保留预占，轮询失败或成品下载失败不能触发换号重试。上游是否返还失败任务次数，需要可靠余额或流水证据，不能自动推断。
+
+账号导入经历 pending → checking → ready。调度同时核验 readiness 版本与 credential generation，管理员指定账号也不能绕过。行锁、探测租约与条件更新防止重复探测及旧结果覆盖；停用或重新导入废弃旧探测，验证不消耗生成次数。
+
+协议生成使用 Passport HTTP 认证、设备初始化、离线 Node 签名、HTTP completion 提交及 chain 轮询。每次创建新会话，提交和轮询使用同一账号代理会话，成片校验实际时长。协议就绪版本独立于旧网页验证。运行时签名 SDK 与脚本属于必要依赖，凭证通过 stdin 输入，日志仅记录安全的错误类别。
+
+30 秒扩展只修改页面配置响应中的时长选项，不提供独立生成接口。协议请求保留成功浏览器请求的字段结构，并区分 Alice device_id 与统计 web_id/tea_uuid，保持请求头与 UA 平台一致。跨域设备注册不携带账号 Cookie，禁用重定向和 Cookie jar，目的域固定，响应有大小与格式限制；身份按账号会话隔离缓存。单次 30 秒成片验证不代表上游长期稳定支持。
+
+登录阶段的 Passport Cookie 可通过 sessionid 与 sid_tt 一致、sid_guard、Passport 字段及地区字段的组合识别，单独 sessionid 不足以认定 Dola。识别仅决定导入类型，账号仍需认证。缺少 ttwid 时通过一次 /chat/ HTTP 请求获取服务端 Cookie，避免加载网页资源或生成视频。
+
+明确终态内容拒绝记为 failed/request，同时独立保持已受理任务的额度结算和禁止重试规则；轮询中断仍保留 accepted。最终 assistant 错误码 710092006 表示成片版权拒绝，710092007 表示音频版权拒绝，向下游返回对应原因；用户消息和未完成消息不用于判定终态。
+
+Dola 的发布验证重点包括请求结构、时长限制、导入识别、就绪验证、模型发现、多账号并发、原子预占、第三次拒绝、跨日隔离、退款幂等、耗尽封存、提交失败禁止重发及迁移保留权限和额度。
+
+### 2026-09-10 — 精简源码发布文件
+
+按维护者要求移除 Go 测试源文件及专用夹具，数据库迁移合并到 `backend/internal/migrations/definitions.go`，不再保留独立 SQL 文件。合并保留原始 SQL 字节、版本、名称与 SHA-256 校验和，已有数据库继续按原规则校验和升级。新增迁移应追加版本，不能修改已应用的定义。
+
+后端 CI 改为编译、go vet 和 staticcheck；前端检查保留。Go 自动回归测试不再随源码发布，静态检查和编译不能替代行为验证。合并时已逐项核对全部 19 个迁移内容与校验和，并在移除测试源文件前通过现有迁移检查。

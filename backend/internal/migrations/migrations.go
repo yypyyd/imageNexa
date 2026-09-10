@@ -4,12 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/fs"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,9 +19,6 @@ import (
 const migrationAdvisoryLock int64 = 0x324150494D494752 // "2APIMIGR"
 
 var migrationFilePattern = regexp.MustCompile(`^(\d{6})_([a-z0-9_]+)\.sql$`)
-
-//go:embed sql/*.sql
-var migrationFiles embed.FS
 
 type Migration struct {
 	Version  int64
@@ -42,17 +36,9 @@ type AppliedMigration struct {
 }
 
 func Load() ([]Migration, error) {
-	entries, err := fs.ReadDir(migrationFiles, "sql")
-	if err != nil {
-		return nil, fmt.Errorf("read embedded migrations: %w", err)
-	}
-	migrations := make([]Migration, 0, len(entries))
-	seen := make(map[int64]string, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		filename := filepath.ToSlash(entry.Name())
+	migrations := make([]Migration, 0, len(migrationSources))
+	seen := make(map[int64]string, len(migrationSources))
+	for filename, source := range migrationSources {
 		matches := migrationFilePattern.FindStringSubmatch(filename)
 		if matches == nil {
 			return nil, fmt.Errorf("invalid migration filename %q", filename)
@@ -66,10 +52,7 @@ func Load() ([]Migration, error) {
 		}
 		seen[version] = filename
 
-		raw, err := migrationFiles.ReadFile("sql/" + entry.Name())
-		if err != nil {
-			return nil, fmt.Errorf("read migration %q: %w", filename, err)
-		}
+		raw := []byte(source)
 		if strings.TrimSpace(string(raw)) == "" {
 			return nil, fmt.Errorf("migration %q is empty", filename)
 		}

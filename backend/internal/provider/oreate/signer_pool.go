@@ -3,6 +3,7 @@ package oreate
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -58,6 +60,21 @@ type hotSigner interface {
 	SignHot(ctx context.Context, account Account) (hotSignature, error)
 }
 
+type sessionInvalidator interface {
+	InvalidateSession(account Account)
+}
+
+type sessionCloser interface {
+	Close()
+}
+
+type browserCookieObserver func(account Account, browserCookie string) Account
+
+type signerPageKey struct {
+	identity [sha256.Size]byte
+	version  [sha256.Size]byte
+}
+
 // signerPage is one warm signed chat page: the browser stays open between
 // generations so a mint costs a Banti report instead of a page load. A page
 // carries one account's cookies, so it only ever signs for that account.
@@ -65,45 +82,79 @@ type signerPage struct {
 	mintMu sync.Mutex
 	ctx    context.Context
 	close  func()
-	key    string
+	key    signerPageKey
 	proxy  string
 	opened time.Time
 	idleAt time.Time
 	mints  int
+	stale  atomic.Bool
+
+	account Account
+	observe browserCookieObserver
 }
 
 type signerPool struct {
-	proxy func() string
-	limit int
+	proxy    func() string
+	observe  browserCookieObserver
+	openPage func(Account) (*signerPage, error)
+	limit    int
 
 	mu   sync.Mutex
 	live int
-	// idle holds warm pages per account, never shared across accounts: a token
-	// minted on one account's page is refused as spam for any other account.
-	idle map[string][]*signerPage
+	// idle holds warm pages per account and normalized cookie version. Keys contain
+	// only fixed-size hashes, never a raw session cookie.
+	idle map[signerPageKey][]*signerPage
+	// active pages stay registered so invalidation can mark them stale without
+	// cancelling the generation currently using them.
+	active      map[*signerPage]struct{}
+	invalidated map[signerPageKey]uint64
 
-	free  chan struct{}
-	sweep sync.Once
+	free      chan struct{}
+	done      chan struct{}
+	sweep     sync.Once
+	closeOnce sync.Once
+	closed    bool
 }
 
-func newSignerPool(proxy func() string) *signerPool {
-	return &signerPool{
-		proxy: proxy,
-		limit: signerPages(),
-		idle:  make(map[string][]*signerPage),
-		free:  make(chan struct{}, 1),
+func newSignerPool(proxy func() string, observers ...browserCookieObserver) *signerPool {
+	var observe browserCookieObserver
+	if len(observers) > 0 {
+		observe = observers[0]
 	}
+	pool := &signerPool{
+		proxy:       proxy,
+		observe:     observe,
+		limit:       signerPages(),
+		idle:        make(map[signerPageKey][]*signerPage),
+		active:      make(map[*signerPage]struct{}),
+		invalidated: make(map[signerPageKey]uint64),
+		free:        make(chan struct{}, 1),
+		done:        make(chan struct{}),
+	}
+	pool.openPage = pool.open
+	return pool
 }
 
-// signerKey identifies the account a warm page belongs to.
-func signerKey(account Account) string {
-	if account.OUID != "" {
-		return account.OUID
+// signerKey identifies both the logical account and the exact normalized cookie
+// version a warm page belongs to. Hashes prevent session material from becoming
+// a map key while preserving deterministic equality.
+func signerKey(account Account) signerPageKey {
+	account = account.normalized()
+	identity := ""
+	switch {
+	case account.ID != "":
+		identity = "id:" + account.ID
+	case account.OUID != "":
+		identity = "ouid:" + account.OUID
+	case account.Email != "":
+		identity = "email:" + strings.ToLower(account.Email)
+	default:
+		identity = "anonymous:" + fmt.Sprintf("%x", cookieVersion(account.Cookie))
 	}
-	if account.Email != "" {
-		return account.Email
+	return signerPageKey{
+		identity: sha256.Sum256([]byte(identity)),
+		version:  cookieVersion(account.Cookie),
 	}
-	return account.Cookie
 }
 
 // signerPages sizes the warm pool from the resources this process can use, so
@@ -122,10 +173,10 @@ func signerPages() int {
 	return min(max(limit, minSignerPages), maxSignerPages)
 }
 
-// submit runs one whole in-page submit on a warm page of the account and reports
-// the proxy session that page egresses through, so the chat polling that follows
-// is seen from the same exit IP. A page that fails is dropped and the submit
-// retried once, for the same reason a mint is.
+// submit runs one whole in-page generation on a warm page of the account and
+// reports the proxy session that page egresses through, so recovery requests use
+// the same exit IP. A page that fails is dropped and the submit retried once, for
+// the same reason a mint is.
 func (p *signerPool) submit(ctx context.Context, account Account, quotedPayload string) (videoSubmitResult, error) {
 	result, err := p.submitOnce(ctx, account, quotedPayload)
 	if err == nil || ctx.Err() != nil || errors.Is(err, ErrAuth) {
@@ -178,24 +229,45 @@ func (p *signerPool) acquire(ctx context.Context, account Account) (*signerPage,
 	p.sweep.Do(func() { go p.sweepIdle() })
 	key := signerKey(account)
 	for {
-		page, slot := p.checkout(key)
+		select {
+		case <-p.done:
+			return nil, errors.New("oreate signer pool closed")
+		default:
+		}
+		page, slot, invalidation := p.checkout(key)
 		if page != nil {
 			return page, nil
 		}
 		if slot {
-			page, err := p.open(account)
+			page, err := p.openPage(account)
 			if err != nil {
 				p.mu.Lock()
-				p.live--
+				if !p.closed {
+					p.live--
+				}
 				p.mu.Unlock()
 				p.wake()
 				return nil, err
 			}
-			page.key = key
+			p.mu.Lock()
+			if p.closed {
+				p.mu.Unlock()
+				page.close()
+				return nil, errors.New("oreate signer pool closed")
+			}
+			openedKey := signerKey(page.account)
+			page.key = openedKey
+			if p.invalidated[key] != invalidation || p.invalidated[openedKey] > 0 {
+				page.stale.Store(true)
+			}
+			p.active[page] = struct{}{}
+			p.mu.Unlock()
 			return page, nil
 		}
 		select {
 		case <-p.free:
+		case <-p.done:
+			return nil, errors.New("oreate signer pool closed")
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -205,16 +277,21 @@ func (p *signerPool) acquire(ctx context.Context, account Account) (*signerPage,
 // checkout takes a warm page of this account, or reports that the caller may
 // open one. At the limit it closes the page that has been idle longest on
 // another account to free the slot, since that page cannot serve this one.
-func (p *signerPool) checkout(key string) (*signerPage, bool) {
+func (p *signerPool) checkout(key signerPageKey) (*signerPage, bool, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, false, 0
+	}
+	invalidation := p.invalidated[key]
 	pages := p.idle[key]
 	for len(pages) > 0 {
 		page := pages[len(pages)-1]
 		pages = pages[:len(pages)-1]
 		if page.usable() {
 			p.store(key, pages)
-			return page, false
+			p.active[page] = struct{}{}
+			return page, false, invalidation
 		}
 		p.retire(page)
 	}
@@ -222,16 +299,16 @@ func (p *signerPool) checkout(key string) (*signerPage, bool) {
 	if p.live >= p.limit {
 		victim, victimKey := p.oldestIdle()
 		if victim == nil {
-			return nil, false
+			return nil, false, invalidation
 		}
 		p.drop(victimKey, victim)
 		p.retire(victim)
 	}
 	p.live++
-	return nil, true
+	return nil, true, invalidation
 }
 
-func (p *signerPool) store(key string, pages []*signerPage) {
+func (p *signerPool) store(key signerPageKey, pages []*signerPage) {
 	if len(pages) == 0 {
 		delete(p.idle, key)
 		return
@@ -240,9 +317,9 @@ func (p *signerPool) store(key string, pages []*signerPage) {
 }
 
 // oldestIdle picks the least recently used idle page across all accounts.
-func (p *signerPool) oldestIdle() (*signerPage, string) {
+func (p *signerPool) oldestIdle() (*signerPage, signerPageKey) {
 	var oldest *signerPage
-	oldestKey := ""
+	var oldestKey signerPageKey
 	for key, pages := range p.idle {
 		for _, page := range pages {
 			if oldest == nil || page.idleAt.Before(oldest.idleAt) {
@@ -253,7 +330,7 @@ func (p *signerPool) oldestIdle() (*signerPage, string) {
 	return oldest, oldestKey
 }
 
-func (p *signerPool) drop(key string, page *signerPage) {
+func (p *signerPool) drop(key signerPageKey, page *signerPage) {
 	pages := p.idle[key]
 	for i, candidate := range pages {
 		if candidate == page {
@@ -265,26 +342,50 @@ func (p *signerPool) drop(key string, page *signerPage) {
 
 // retire closes a page and gives its slot back; the pool lock is held.
 func (p *signerPool) retire(page *signerPage) {
+	delete(p.active, page)
 	page.close()
 	p.live--
 }
 
 func (p *signerPool) release(page *signerPage, err error) {
-	if err != nil || !page.usable() {
-		p.discard(page)
+	p.mu.Lock()
+	if p.closed {
+		delete(p.active, page)
+		p.mu.Unlock()
+		page.close()
 		return
 	}
-	page.idleAt = time.Now()
-	p.mu.Lock()
-	p.idle[page.key] = append(p.idle[page.key], page)
+	delete(p.active, page)
+	if err != nil || !page.usable() {
+		p.retire(page)
+	} else {
+		page.idleAt = time.Now()
+		p.idle[page.key] = append(p.idle[page.key], page)
+	}
 	p.mu.Unlock()
 	p.wake()
 }
 
-func (p *signerPool) discard(page *signerPage) {
+// invalidate closes idle pages for one account/version immediately and marks
+// checked-out pages stale. It deliberately does not cancel active work.
+func (p *signerPool) invalidate(account Account) {
+	key := signerKey(account)
 	p.mu.Lock()
-	p.drop(page.key, page)
-	p.retire(page)
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.invalidated[key]++
+	pages := p.idle[key]
+	delete(p.idle, key)
+	for _, page := range pages {
+		p.retire(page)
+	}
+	for page := range p.active {
+		if page.key == key {
+			page.stale.Store(true)
+		}
+	}
 	p.mu.Unlock()
 	p.wake()
 }
@@ -297,26 +398,56 @@ func (p *signerPool) wake() {
 	}
 }
 
+func (p *signerPool) Close() {
+	p.closeOnce.Do(func() {
+		close(p.done)
+		p.mu.Lock()
+		p.closed = true
+		pages := make(map[*signerPage]struct{}, p.live)
+		for _, idle := range p.idle {
+			for _, page := range idle {
+				pages[page] = struct{}{}
+			}
+		}
+		for page := range p.active {
+			page.stale.Store(true)
+			pages[page] = struct{}{}
+		}
+		p.idle = make(map[signerPageKey][]*signerPage)
+		p.active = make(map[*signerPage]struct{})
+		p.live = 0
+		p.mu.Unlock()
+		for page := range pages {
+			page.close()
+		}
+	})
+}
+
 // sweepIdle closes pages nothing has needed for a while so a quiet instance
 // stops paying for browsers it is not using.
 func (p *signerPool) sweepIdle() {
 	ticker := time.NewTicker(signerSweepEvery)
 	defer ticker.Stop()
-	for range ticker.C {
-		p.mu.Lock()
-		for key, pages := range p.idle {
-			kept := pages[:0]
-			for _, page := range pages {
-				if page.usable() && time.Since(page.idleAt) < signerPageIdleTTL {
-					kept = append(kept, page)
-					continue
+	for {
+		select {
+		case <-p.done:
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			for key, pages := range p.idle {
+				kept := pages[:0]
+				for _, page := range pages {
+					if page.usable() && time.Since(page.idleAt) < signerPageIdleTTL {
+						kept = append(kept, page)
+						continue
+					}
+					p.retire(page)
 				}
-				p.retire(page)
+				p.store(key, kept)
 			}
-			p.store(key, kept)
+			p.mu.Unlock()
+			p.wake()
 		}
-		p.mu.Unlock()
-		p.wake()
 	}
 }
 
@@ -334,7 +465,7 @@ func (p *signerPool) open(account Account) (*signerPage, error) {
 	// The page outlives the generation that opened it, so its browser hangs off
 	// the background context and is only closed by the pool.
 	pageCtx, cancelPage := context.WithCancel(context.Background())
-	opts, bridge, err := browserExecOptions(pageCtx, path, account, proxyURL)
+	opts, bridge, err := browserExecOptions(pageCtx, path, proxyURL)
 	if err != nil {
 		cancelPage()
 		return nil, err
@@ -342,10 +473,12 @@ func (p *signerPool) open(account Account) (*signerPage, error) {
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(pageCtx, opts...)
 	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
 	page := &signerPage{
-		ctx:    browserCtx,
-		proxy:  proxyURL,
-		opened: time.Now(),
-		idleAt: time.Now(),
+		ctx:     browserCtx,
+		proxy:   proxyURL,
+		opened:  time.Now(),
+		idleAt:  time.Now(),
+		account: account.normalized(),
+		observe: p.observe,
 	}
 	page.close = sync.OnceFunc(func() {
 		cancelBrowser()
@@ -382,7 +515,8 @@ func (p *signerPool) open(account Account) (*signerPage, error) {
 func (page *signerPage) prepare(account Account) error {
 	ctx, cancel := context.WithTimeout(page.ctx, signerTimeout)
 	defer cancel()
-	if err := chromedp.Run(ctx, signerCookieActions(account)...); err != nil {
+	page.account = account.normalized()
+	if err := chromedp.Run(ctx, signerCookieActions(page.account)...); err != nil {
 		return fmt.Errorf("oreate signer: cookie setup: %w", err)
 	}
 	navErr := navigateSignerPage(ctx)
@@ -394,7 +528,21 @@ func (page *signerPage) prepare(account Account) error {
 		}
 		return fmt.Errorf("oreate signer: Paris runtime: %w (%s)", err, diagnostics)
 	}
+	browserCookie, err := browserOreateCookieHeader(ctx)
+	if err != nil {
+		return fmt.Errorf("oreate signer: cookie capture: %w", err)
+	}
+	page.captureBrowserCookies(browserCookie)
 	return nil
+}
+
+func (page *signerPage) captureBrowserCookies(browserCookie string) {
+	if page.observe != nil {
+		page.account = page.observe(page.account, browserCookie)
+	} else {
+		page.account = applyBrowserCookies(page.account, browserCookie, nil)
+	}
+	page.key.version = cookieVersion(page.account.Cookie)
 }
 
 // mint asks the page runtime for one token. Only one mint runs on a page at a
@@ -410,11 +558,10 @@ func (page *signerPage) mint(ctx context.Context) (Signature, error) {
 	if err := chromedp.Run(runCtx, chromedp.Evaluate(hotMintScript, nil)); err != nil {
 		return Signature{}, fmt.Errorf("oreate signer: Banti dispatch: %w", err)
 	}
-	var jt, browserCookie string
+	var jt string
 	if err := chromedp.Run(runCtx,
 		chromedp.Poll(`window.__oreateSignerJT`, &jt,
 			chromedp.WithPollingInterval(25*time.Millisecond), chromedp.WithPollingTimeout(bantiResponseTimeout)),
-		chromedp.Evaluate(`document.cookie`, &browserCookie),
 	); err != nil {
 		return Signature{}, fmt.Errorf("oreate signer: Banti response: %w", err)
 	}
@@ -423,7 +570,10 @@ func (page *signerPage) mint(ctx context.Context) (Signature, error) {
 	if jt == "" || len(jt) > maxBantiJTLength {
 		return Signature{}, ErrRiskControl
 	}
-	return Signature{JT: jt, BID: cookieValue(browserCookie, "__bid_n"), Cookie: strings.TrimSpace(browserCookie)}, nil
+	if browserCookie, err := browserOreateCookieHeader(runCtx); err == nil {
+		page.captureBrowserCookies(browserCookie)
+	}
+	return Signature{JT: jt, BID: page.account.BID, Cookie: page.account.Cookie}, nil
 }
 
 // submit mints a token and posts the generation from the page itself, which is
@@ -442,7 +592,7 @@ func (page *signerPage) submit(ctx context.Context, quotedPayload string) (video
 		return videoSubmitResult{}, fmt.Errorf("oreate signer: submit dispatch: %w", err)
 	}
 	pollErr := chromedp.Run(runCtx, chromedp.Poll(`window.__oreateSubmit && window.__oreateSubmit.done === true`, nil,
-		chromedp.WithPollingInterval(250*time.Millisecond), chromedp.WithPollingTimeout(inPageAcceptWait)))
+		chromedp.WithPollingInterval(250*time.Millisecond), chromedp.WithPollingTimeout(inPageRenderWait)))
 	var result videoSubmitResult
 	if err := chromedp.Run(runCtx, chromedp.Evaluate(`window.__oreateSubmit || {}`, &result)); err != nil {
 		if pollErr != nil {
@@ -453,10 +603,12 @@ func (page *signerPage) submit(ctx context.Context, quotedPayload string) (video
 	if pollErr != nil && result.Failure == "" {
 		result.Failure = pollErr.Error()
 	}
+	if browserCookie, err := browserOreateCookieHeader(runCtx); err == nil {
+		page.captureBrowserCookies(browserCookie)
+	}
+	result.Cookie = page.account.Cookie
 	page.mints++
-	// A warm page reduces a submit to the two fetches the site itself makes, and
-	// that cost is what decides how many generations a host can start per minute.
-	log.Printf("oreate inpage submit: submits=%d accept=%s chat=%s", page.mints,
+	log.Printf("oreate inpage submit: submits=%d elapsed=%s chat=%s", page.mints,
 		time.Since(started).Round(time.Millisecond), result.ChatID)
 	return result, nil
 }
@@ -477,7 +629,7 @@ func (page *signerPage) runContext(ctx context.Context, budget time.Duration) (c
 }
 
 func (page *signerPage) usable() bool {
-	return page.ctx.Err() == nil && page.mints < signerPageMaxMints && time.Since(page.opened) < signerPageMaxAge
+	return !page.stale.Load() && page.ctx.Err() == nil && page.mints < signerPageMaxMints && time.Since(page.opened) < signerPageMaxAge
 }
 
 // hotMintScript mints one token on a page that is already loaded. The token is

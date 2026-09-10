@@ -47,6 +47,9 @@ func poolPolicy(ctx context.Context) poolSchedulingPolicy {
 }
 
 func accountDispatchable(account model.TokenAccount, pool, kind, logicalID, pinnedID string, now time.Time) bool {
+	if pool == "dola" && !model.DolaAccountReady(account) {
+		return false
+	}
 	if strings.TrimSpace(account.Value) == "" {
 		return false
 	}
@@ -136,6 +139,7 @@ func (s *V1Service) revalidateDispatchAccount(ctx context.Context, pool, account
 	if bucketKey == "" {
 		bucketKey = strings.TrimSpace(plan.Route.QuotaBucketKey)
 	}
+	bucketKey = dispatchQuotaBucket(plan, bucketKey)
 	if authoritative, _, scoped := providerSnapshotScope(pool); scoped && authoritative != bucketKey {
 		bucketKey = ""
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -26,7 +27,7 @@ const (
 	chatVideoPollInterval = 10 * time.Second
 	chatVideoMaxFailures  = 3
 	videoRecoveryInterval = 15 * time.Second
-	videoRecoveryWindow   = 15 * time.Minute
+	videoRecoveryWindow   = 30 * time.Minute
 )
 
 // errStreamIncomplete marks a stream that neither produced a result nor an
@@ -263,8 +264,13 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 		return nil, nil, err
 	}
 	chatID = result.ChatID
-	// The chat is polled from Go, so it has to leave through the session the
-	// submitting page used: upstream sees one exit IP per generation.
+	if IsOreateCookie(result.Cookie) {
+		account.Cookie = result.Cookie
+		account.OUID = cookieValue(result.Cookie, "OUID")
+		account.BID = cookieValue(result.Cookie, "__bid_n")
+	}
+	// Recovery polling has to leave through the submitting page's session:
+	// upstream sees one exit IP per generation.
 	egress = result.Proxy
 	submitFailure := strings.TrimSpace(result.Failure)
 	status, err := inPageStreamStatus(result)
@@ -287,9 +293,9 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 		if !errors.Is(err, errStreamIncomplete) {
 			return nil, nil, err
 		}
-		// The page hands the render over as soon as upstream accepts it, so the
-		// chat is where the result arrives: it reports the finished clip or the
-		// upstream giving up, and only an unreadable chat falls back to the CDN.
+		// A dropped page stream can still leave the result on the chat: it reports
+		// the finished clip or the upstream giving up, and only an unreadable chat
+		// falls back to the CDN.
 		verdict := c.awaitChatVideo(ctx, account, chatID, egress)
 		switch {
 		case verdict.VideoURL != "":
@@ -612,7 +618,10 @@ func extractVideoURL(s string) string {
 func classifyUpstreamError(code int, message string) error {
 	msg := strings.TrimSpace(message)
 	lower := strings.ToLower(msg)
+	log.Printf("oreate upstream verdict: code=%d", code)
 	switch {
+	case code == 7350001 || strings.Contains(msg, "请输入验证码") || strings.Contains(lower, "captcha") || strings.Contains(lower, "verification code"):
+		return fmt.Errorf("%w: %w: %s", ErrAccountChallenge, ErrRiskControl, msg)
 	case code == 212361 || strings.Contains(lower, "spam user") || strings.Contains(lower, "risk control"):
 		if code == 212361 || strings.Contains(lower, "spam user") {
 			// An explicit spam-user response is an account-level risk decision.

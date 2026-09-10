@@ -58,6 +58,14 @@ function cookieFromObject(value) {
 function cookieProvider(value) {
   const cookie = String(value || '')
   if (/(?:^|;\s*)OUID=[^;]+/i.test(cookie) && /(?:^|;\s*)ouss=[^;]+/i.test(cookie)) return 'oreate'
+  // Login-only Passport exports can omit the browser fingerprint cookie.
+  // Match the session bundle as well; sessionid alone is shared by providers.
+  const cookieValue = (name) => cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`, 'i'))?.[1]?.trim() || ''
+  const sessionID = cookieValue('sessionid')
+  const passportSession = cookieValue('sid_tt') === sessionID && cookieValue('sid_guard') &&
+    (cookieValue('passport_csrf_token') || cookieValue('passport_auth_status')) &&
+    (cookieValue('store-idc') || cookieValue('store-country-code'))
+  if (sessionID && (cookieValue('s_v_web_id') || passportSession)) return 'dola'
 
   const cookies = cookie.split(';').map((part) => {
     const index = part.indexOf('=')

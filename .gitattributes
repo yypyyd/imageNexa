@@ -1,1 +1,1 @@
-backend/internal/migrations/sql/*.sql text eol=lf
+backend/internal/migrations/definitions.go text eol=lf

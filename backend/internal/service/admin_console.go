@@ -61,7 +61,7 @@ type AccountImportInput struct {
 	Credential any
 }
 
-var adminAccountProviders = []string{"chatgpt", "adobe", "byteplus", "runway", "grok", "oreate", "custom"}
+var adminAccountProviders = SchedulableProviders()
 
 func NewAdminConsoleService(cfg *config.Config, db *gorm.DB, models *repo.ModelRepository, tokens *repo.TokenRepository, tokenSvc *TokenService, settings *repo.SiteSettingRepository) *AdminConsoleService {
 	return &AdminConsoleService{cfg: cfg, db: db, models: models, tokens: tokens, tokenSvc: tokenSvc, settings: settings}
@@ -382,6 +382,10 @@ func (s *AdminConsoleService) accountRow(ctx context.Context, account model.Toke
 	} else if account.Status == "quota" || account.Status == "pending" || account.Fails > 0 {
 		health = "degraded"
 	}
+	readiness, readinessDetail := dolaReadinessView(account)
+	if account.Pool == "dola" && readiness != "ready" {
+		health = "degraded"
+	}
 	sessionExpiresAt, sessionState := bytePlusSessionStatus(account, time.Now())
 	if sessionState == "expired" {
 		health = "unhealthy"
@@ -404,6 +408,7 @@ func (s *AdminConsoleService) accountRow(ctx context.Context, account model.Toke
 		"image_limited": account.ImageLimited, "video_limited": account.VideoLimited,
 		"last_used_at": account.LastUsedAt, "created_at": account.CreatedAt,
 		"session_expires_at": sessionExpiresAt, "session_state": sessionState,
+		"readiness": readiness, "readiness_detail": readinessDetail,
 		"base_url": safeCustomMeta(account, "base_url"), "models": safeCustomMeta(account, "models"),
 	}, nil
 }
@@ -464,6 +469,8 @@ func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountIm
 		account, err = s.tokenSvc.ImportGrokToken(ctx, secret, "")
 	case "oreate":
 		account, err = s.tokenSvc.ImportOreateAccount(ctx, secret, stringFromMap(credential, "email"), stringFromMap(credential, "ouid"), stringFromMap(credential, "user_agent"), int64FromMap(credential, "reg_ts"), stringFromMap(credential, "vip"), "")
+	case "dola":
+		account, err = s.tokenSvc.ImportDolaAccount(ctx, secret, stringFromMap(credential, "user_agent"))
 	case "custom":
 		models := canonicalModelsFromCredential(credential)
 		if len(models) == 0 {
@@ -521,6 +528,9 @@ func (s *AdminConsoleService) bindAccountRoutes(ctx context.Context, account mod
 		}
 	}
 	for _, definition := range model.CanonicalRoutingCatalog() {
+		if definition.Model.ID == model.DolaPublicVideoModel && account.Pool != "dola" {
+			continue
+		}
 		if account.Pool == "custom" && !allowed[definition.Model.ID] {
 			continue
 		}
@@ -616,6 +626,22 @@ func (s *AdminConsoleService) UpdateAccount(ctx context.Context, accountID strin
 		}
 		updates["concurrency"] = limit
 	}
+	if account.Pool == "dola" {
+		if status, ok := updates["status"]; ok {
+			if err := s.tokens.SetDolaEnabled(ctx, account.ID, status == "active"); err != nil {
+				return nil, err
+			}
+			delete(updates, "status")
+			delete(updates, "dead")
+			if status == "active" {
+				go s.tokenSvc.verifyDolaReadiness(account.ID, true)
+			}
+			account, err = s.tokens.Get(ctx, "dola", account.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	if len(updates) > 0 {
 		account, err = s.tokens.Update(ctx, account.Pool, account.ID, updates)
 		if err != nil {
@@ -668,6 +694,13 @@ func (s *AdminConsoleService) RefreshAccountQuota(ctx context.Context, accountID
 	account, err := s.accountByID(ctx, accountID)
 	if err != nil {
 		return nil, err
+	}
+	if account.Pool == "dola" {
+		if account.Status == "disabled" {
+			return nil, errors.New("请先启用账号，再验证 Dola 会话")
+		}
+		go s.tokenSvc.verifyDolaReadiness(account.ID, true)
+		return map[string]any{"queued": true, "message": "已安排 Dola 协议会话验证，不消耗生成次数"}, nil
 	}
 	return s.tokenSvc.Quota(ctx, account.Pool, account.ID)
 }
@@ -927,7 +960,7 @@ func normalizeAdminProvider(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "openai", "chatgpt":
 		return "chatgpt"
-	case "adobe", "byteplus", "runway", "grok", "oreate", "custom":
+	case "adobe", "byteplus", "runway", "grok", "oreate", "dola", "custom":
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return ""

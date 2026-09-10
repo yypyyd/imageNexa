@@ -122,15 +122,12 @@ Production callers use the provider through `service.V1Service`; they should
 not construct accounts from untrusted request data. `GenerateVideo` returns
 either downloaded bytes or a result map containing the upstream artifact URL.
 
-## Tests
+## Verification
 
 ```powershell
-go test ./internal/provider/oreate
+go vet ./internal/provider/oreate
+go build ./internal/provider/oreate
 ```
-
-`TestLiveSignerProbe` and `TestLiveAccountProbe` are deployment-only. They skip
-unless `OREATE_LIVE_TEST=1` and read their credential JSON exclusively from
-standard input. They never create a video or print credentials or token bodies.
 
 ## Files
 
@@ -144,4 +141,3 @@ standard input. They never create a video or print credentials or token bodies.
 - `video_inpage.go`: the in-page submit script and its result parsing.
 - `proxy_bridge.go`: Oreate adapter for the shared authenticated proxy bridge.
 - `browser_isolation_*.go`: Linux child-process privilege isolation.
-- `*_test.go`: deterministic protocol, proxy, model, and deployment probes.

@@ -135,6 +135,9 @@ func (m *MaintenanceService) refreshDueQuota(ctx context.Context) {
 }
 
 func (m *MaintenanceService) tick(ctx context.Context) {
+	if m.tokenSvc != nil {
+		m.tokenSvc.ReprobeDolaReadiness(ctx)
+	}
 	m.resumeAcceptedImages(ctx)
 	// Verified-absent submissions flip to failed here so the reservation sweep
 	// below releases their hold in the same tick.
@@ -181,12 +184,14 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 		// 1d. Refresh Oreate quota rows and active rows cached below the
 		//     operating floor. Replenished accounts return to active automatically.
 		m.tokenSvc.RefreshLowCreditOreateAccounts(ctx)
-		// 1e. Re-probe ChatGPT accounts stuck in pending past stalePending — an
+		// 1e. Keep Oreate website sessions warm without submitting paid work.
+		m.tokenSvc.RefreshOreateSessions(ctx)
+		// 1f. Re-probe ChatGPT accounts stuck in pending past stalePending — an
 		//     import probe interrupted by a restart (or that never finished) would
 		//     otherwise strand a good freshly-registered account forever, since
 		//     RecoverQuota only revives 限额, never pending.
 		m.tokenSvc.ReprobeStalePendingChatGPT(ctx, m.stalePending)
-		// 1f. Same stale-pending safety net for Adobe: a cookie→token exchange
+		// 1g. Same stale-pending safety net for Adobe: a cookie→token exchange
 		//     interrupted mid-flight (process restart / redis blip during import)
 		//     would otherwise strand the row as an empty-email pending zombie.
 		m.tokenSvc.ReprobeStalePendingAdobe(ctx, m.stalePending)
@@ -258,6 +263,9 @@ func (m *MaintenanceService) resumeAcceptedImages(ctx context.Context) {
 		return
 	}
 	for _, attempt := range attempts {
+		if strings.HasPrefix(attempt.ModelRouteID, "video.") {
+			continue
+		} // Image recovery cannot prove a video was uncharged.
 		event, eventErr := m.events.GetByID(ctx, attempt.EventID)
 		if eventErr != nil {
 			log.Printf("maintenance: load accepted image event failed")
@@ -298,6 +306,9 @@ func (m *MaintenanceService) reconcileUnknownSubmissions(ctx context.Context) {
 	m.recovery.applyGlobalProxy(ctx)
 	adopted, closed := 0, 0
 	for _, attempt := range attempts {
+		if strings.HasPrefix(attempt.ModelRouteID, "video.") {
+			continue
+		} // Image recovery cannot prove a video was uncharged.
 		event, eventErr := m.events.GetByID(ctx, attempt.EventID)
 		if eventErr != nil {
 			log.Printf("maintenance: load unknown submission event failed")

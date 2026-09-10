@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
+	"backend/internal/provider/dola"
 	"backend/internal/provider/grok"
 	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
@@ -26,6 +28,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type App struct {
@@ -33,6 +36,7 @@ type App struct {
 	DB     *gorm.DB
 	Redis  *redis.Client
 	Engine *gin.Engine
+	oreate *oreate.Client
 	cancel context.CancelFunc
 }
 
@@ -45,7 +49,15 @@ func NewApp(ctx context.Context) (*App, error) {
 		return nil, fmt.Errorf("create generated root %s: %w", cfg.GeneratedRoot, err)
 	}
 
-	db, err := gorm.Open(postgres.Open(cfg.PostgresDSN), &gorm.Config{TranslateError: true})
+	dbLogger := logger.Default.LogMode(logger.Warn)
+	if cfg.AppEnv == "production" {
+		// Provider cookies, API keys and login material are query parameters. Never
+		// interpolate them into production SQL logs, including slow-query output.
+		dbLogger = logger.New(log.New(os.Stderr, "", log.LstdFlags), logger.Config{
+			SlowThreshold: time.Second, LogLevel: logger.Warn, ParameterizedQueries: true,
+		})
+	}
+	db, err := gorm.Open(postgres.Open(cfg.PostgresDSN), &gorm.Config{TranslateError: true, Logger: dbLogger})
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
@@ -98,19 +110,20 @@ func NewApp(ctx context.Context) (*App, error) {
 	runwayClient := runway.NewClient("")
 	grokClient := grok.NewClient("")
 	oreateClient := oreate.NewClient("")
+	dolaClient := dola.NewClient("")
 	customClient := custom.NewClient()
 	objectStore := storage.New(cfg.RustFSEndpoint, cfg.RustFSBucket, cfg.RustFSAccessKey, cfg.RustFSSecretKey)
 
 	tokenSvc := service.NewTokenService(
 		tokenRepo, refreshRepo, eventRepo, settingsRepo,
 		adobeClient, bytePlusClient, chatGPTClient, runwayClient,
-		grokClient, oreateClient, customClient, modelRepo.Quotas(),
+		grokClient, oreateClient, dolaClient, customClient, modelRepo.Quotas(),
 	)
 	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient, bytePlusClient, tokenSvc)
 	v1Svc := service.NewV1Service(
 		cfg, modelRepo, credentialSvc, eventRepo, tokenRepo, settingsRepo, concurrencySvc,
 		adobeClient, bytePlusClient, chatGPTClient, runwayClient,
-		grokClient, oreateClient, customClient, objectStore,
+		grokClient, oreateClient, dolaClient, customClient, objectStore,
 	)
 	v1Svc.SetRefresh(refreshSvc)
 	v1Svc.SetBannedWords(bannedRepo)
@@ -128,13 +141,16 @@ func NewApp(ctx context.Context) (*App, error) {
 		BannedWords:    handler.NewBannedWordsHandler(bannedRepo),
 	})
 
-	return &App{Config: cfg, DB: db, Redis: rdb, Engine: engine, cancel: cancelMaintenance}, nil
+	return &App{Config: cfg, DB: db, Redis: rdb, Engine: engine, oreate: oreateClient, cancel: cancelMaintenance}, nil
 }
 
 func (a *App) Close() error {
 	var firstErr error
 	if a.cancel != nil {
 		a.cancel()
+	}
+	if a.oreate != nil {
+		a.oreate.Close()
 	}
 	if a.Redis != nil {
 		if err := a.Redis.Close(); err != nil {

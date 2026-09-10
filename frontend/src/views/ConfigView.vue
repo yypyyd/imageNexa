@@ -22,6 +22,7 @@ const PROVIDER_LABELS = {
   byteplus: 'BytePlus',
   chatgpt: 'ChatGPT',
   custom: '自定义上游',
+  dola: 'Dola (豆包国际版)',
   grok: 'Grok',
   oreate: 'OreateAI',
   runway: 'Runway',

@@ -40,8 +40,9 @@ var signerBlockedURLs = []string{
 }
 
 type chromiumSigner struct {
-	proxy func() string
-	sem   chan struct{}
+	proxy   func() string
+	sem     chan struct{}
+	observe browserCookieObserver
 	// pool keeps the warm signed pages that mint the tokens and post the
 	// generations, which is what bounds how many submits run at once.
 	pool  *signerPool
@@ -81,12 +82,33 @@ type chromiumProxy struct {
 	authenticate bool
 }
 
-func newChromiumSigner(proxy func() string) *chromiumSigner {
-	return &chromiumSigner{
-		proxy: proxy,
-		sem:   make(chan struct{}, 2),
-		pool:  newSignerPool(proxy),
+func newChromiumSigner(proxy func() string, observers ...browserCookieObserver) *chromiumSigner {
+	var observe browserCookieObserver
+	if len(observers) > 0 {
+		observe = observers[0]
 	}
+	return &chromiumSigner{
+		proxy:   proxy,
+		sem:     make(chan struct{}, 2),
+		observe: observe,
+		pool:    newSignerPool(proxy, observe),
+	}
+}
+
+// InvalidateSession retires warm pages for one account cookie version.
+func (s *chromiumSigner) InvalidateSession(account Account) {
+	s.pool.invalidate(account.normalized())
+}
+
+func (s *chromiumSigner) Close() {
+	s.pool.Close()
+}
+
+func (s *chromiumSigner) observedAccount(account Account, browserCookie string) Account {
+	if s.observe != nil {
+		return s.observe(account, browserCookie)
+	}
+	return applyBrowserCookies(account, browserCookie, nil)
 }
 
 // SignHot mints a token on a warm page and reports the proxy session that page
@@ -166,16 +188,16 @@ func navigateSignerPage(ctx context.Context) error {
 
 // browserOptions builds the Chrome flags for a one-shot signing browser. The
 // caller closes the returned bridge once the browser exits.
-func (s *chromiumSigner) browserOptions(ctx context.Context, path string, account Account) ([]chromedp.ExecAllocatorOption, *proxyBridge, error) {
+func (s *chromiumSigner) browserOptions(ctx context.Context, path string) ([]chromedp.ExecAllocatorOption, *proxyBridge, error) {
 	raw := ""
 	if s.proxy != nil {
 		raw = s.proxy()
 	}
-	return browserExecOptions(ctx, path, account, raw)
+	return browserExecOptions(ctx, path, raw)
 }
 
 // browserExecOptions builds the flags for one browser on the given proxy URL.
-func browserExecOptions(ctx context.Context, path string, account Account, proxyURL string) ([]chromedp.ExecAllocatorOption, *proxyBridge, error) {
+func browserExecOptions(ctx context.Context, path, proxyURL string) ([]chromedp.ExecAllocatorOption, *proxyBridge, error) {
 	proxy, err := parseChromiumProxy(proxyURL)
 	if err != nil {
 		return nil, nil, err
@@ -199,7 +221,6 @@ func browserExecOptions(ctx context.Context, path string, account Account, proxy
 		chromedp.Flag("disable-features", "Translate,BlinkGenPropertyTrees"),
 		chromedp.Flag("enable-automation", false),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.UserAgent(account.UserAgent),
 	)
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("OREATE_NO_SANDBOX")), "true") {
 		opts = append(opts, chromedp.Flag("no-sandbox", true))
@@ -218,6 +239,22 @@ func browserExecOptions(ctx context.Context, path string, account Account, proxy
 
 // signerCookieActions installs the account cookies on the website origin and
 // keeps third-party trackers from slowing the page down.
+func browserOreateCookieHeader(ctx context.Context) (string, error) {
+	cookies, err := network.GetCookies().WithURLs([]string{apiBase}).Do(ctx)
+	if err != nil {
+		return "", err
+	}
+	values := make(map[string]string)
+	for _, cookie := range cookies {
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
+		if domain != "oreateai.com" && !strings.HasSuffix(domain, ".oreateai.com") {
+			continue
+		}
+		values[cookie.Name] = cookie.Value
+	}
+	return formatCookieHeader(values), nil
+}
+
 func signerCookieActions(account Account) []chromedp.Action {
 	actions := []chromedp.Action{network.Enable(), chromedp.ActionFunc(setSignerBlockedURLs)}
 	for _, part := range strings.Split(account.Cookie, ";") {
@@ -233,7 +270,7 @@ func signerCookieActions(account Account) []chromedp.Action {
 func (s *chromiumSigner) signOnce(parent context.Context, path string, account Account) (Signature, error) {
 	ctx, cancel := context.WithTimeout(parent, signerTimeout)
 	defer cancel()
-	opts, bridge, err := s.browserOptions(ctx, path, account)
+	opts, bridge, err := s.browserOptions(ctx, path)
 	if err != nil {
 		return Signature{}, err
 	}
@@ -293,16 +330,17 @@ func (s *chromiumSigner) signOnce(parent context.Context, path string, account A
 	if err := chromedp.Run(browserCtx,
 		chromedp.Poll(`window.__oreateSignerJT`, &jt,
 			chromedp.WithPollingInterval(25*time.Millisecond), chromedp.WithPollingTimeout(bantiResponseTimeout)),
-		chromedp.Evaluate(`document.cookie`, &browserCookie),
 	); err != nil {
 		s.reportRuntimeProbe(browserCtx)
 		return Signature{}, fmt.Errorf("oreate signer: Banti response: %w", err)
 	}
+	browserCookie, _ = browserOreateCookieHeader(browserCtx)
 	s.reportRuntimeProbe(browserCtx)
 	if err := reportWaiter.wait(browserCtx, bantiResponseTimeout); err != nil {
 		return Signature{}, fmt.Errorf("oreate signer: Banti report: %w", err)
 	}
-	return Signature{JT: strings.TrimSpace(jt), BID: cookieValue(browserCookie, "__bid_n"), Cookie: strings.TrimSpace(browserCookie)}, nil
+	account = s.observedAccount(account, browserCookie)
+	return Signature{JT: strings.TrimSpace(jt), BID: account.BID, Cookie: account.Cookie}, nil
 }
 
 type bantiReportResult struct {

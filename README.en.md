@@ -234,7 +234,7 @@ Backend:
 
 ```bash
 cd backend
-go test ./...
+go vet ./...
 go build ./cmd/api
 ```
 

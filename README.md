@@ -65,7 +65,7 @@ Authorization: Bearer sk-your-api-key
 
 ## Canonical 模型闭集
 
-`GET /v1/models` 只返回以下 19 个公共 ID。Provider 的上游模型名和 route ID 仅供内部适配，不能作为 API 的 `model` 值。
+`GET /v1/models` 只返回以下 20 个公共 ID。Provider 的上游模型名和 route ID 仅供内部适配，不能作为 API 的 `model` 值。
 
 ### 文本（4）
 
@@ -83,7 +83,7 @@ Authorization: Bearer sk-your-api-key
 - `nano-banana-pro`
 - `grok-imagine-image`
 
-### 视频（9）
+### 视频（10）
 
 - `kling-3`
 - `kling-o3`
@@ -92,6 +92,7 @@ Authorization: Bearer sk-your-api-key
 - `seedance-2.0-mini`
 - `seedance-1.5-pro`
 - `seedance-2.5`
+- `dola-seedance-2.5`（Dola 专用，30 秒）
 - `grok-imagine-video`
 - `firefly-video`
 
@@ -124,6 +125,19 @@ Cookie 是高敏感凭据：不要写入日志、截图、文档、`.env` 或 Gi
 Adobe 可以继续导入纯 Cookie；系统会按 Adobe SherlockSdk 的当前协议在本地自动创建基础 `x-arp-session-id`（随机 v4 会话 UUID 的紧凑 JSON，再做标准 Base64），不需要额外代理请求。若浏览器导出 JSON 已包含更完整的 Adobe ARP 值（也兼容常见字段别名），则优先保存并沿用该值。ARP 只在图片/视频生成提交时携带，后续只重导纯 Cookie 不会清除或轮换已有会话。
 
 Cookie 和 ARP 都不会出现在账号列表、日志或 API 响应中。升级时会自动为缺失 ARP 的旧 Adobe 账号补齐基础会话，无需重新导入；浏览器侧 Forter/BFP 指纹属于异步增强信息，服务端不会为了获取它们加载整套页面资源。
+
+## Dola 账号导入
+
+Dola（豆包国际版，dola.com）提供独立公共模型 `dola-seedance-2.5`，同时保留 `seedance-2.5` 的视频生成 route（上游即 Dreamina Seedance 2.5）。导入物是 dola.com 的完整浏览器 Cookie；Cookie 必须同时包含有效 `sessionid` 与 `s_v_web_id`（通常还带 `msToken`），粘贴到"账号"页或导入文本框即可自动识别为 Dola 凭据。同一 `sessionid` 重复导入会原位覆盖，不会新建重复账号。
+
+要求与限制：
+
+- **出口 IP**：dola.com 仅在日韩等地区可访问，服务端调用会跟随系统设置的 `proxy.url` 代理；没有代理时国内服务器无法使用。
+- **能力范围**：仅视频（文生视频，仅 30s，比例 16:9、9:16、1:1、4:3、3:4，720p），不支持参考图/图生视频。
+- **额度**：每号每天 2 次，每次仅生成 30 秒视频，调度单位为 `generations`。提交前原子预占 1 次，第三次不再调度该账号。提交前明确失败可退次；已受理、提交结果不明、成品下载失败不退次且不自动重发。按 UTC 日期（北京时间 08:00）隔离记账；上游提示每日额度耗尽时封存当天剩余额度，上游重置时间仍以实际返回为准。
+- **有效期**：Cookie 约 60 天有效；导入时后台会校验会话，失效 Cookie 会被标记停用。
+
+Cookie 是高敏感凭据：不要写入日志、截图、文档、`.env` 或 Git。
 
 ## 快速部署
 
@@ -244,7 +258,7 @@ curl https://api.example.com/v1/videos \
 
 ```bash
 cd backend
-go test ./...
+go vet ./...
 go build ./cmd/api
 ```
 
@@ -271,3 +285,15 @@ DESIGN.md                架构、数据模型、安全边界与调度语义
 ## License
 
 本项目基于 [MIT License](LICENSE) 开源。
+
+`GET /v1/models` 和 `GET /v1/models?extended=true` 均返回 `dola-seedance-2.5`。下游拉取后选择该模型即可固定使用 Dola 账号池，`POST /v1/videos` 参数为 `seconds: "30"`、`resolution: "720p"`，不接受参考媒体。原 `seedance-2.5` 保留自动路由；两个入口共享每个 Dola 账号每天 2 次额度，默认单号并发 1。
+
+### Dola Cookie 导入与协议调度
+
+Dola 导入通过 HTTP 验证 Passport 登录态，再由 Alice 协议分配设备标识。生成请求使用本地 Node + jsdom 执行固定版本签名 SDK，通过 HTTP 提交新会话并查询成片，不启动浏览器，也不自动回退网页生成。验证只证明协议认证与签名可用，不承诺上游有额度或一定生成成功。
+
+每号默认并发 1、每天 2 次、只接受 30s/720p；两个模型入口共享次数。已提交或结果不明禁止自动重发。视频返回时检查上游实际时长，非 30 秒不会作为成功交付。账号页显示协议会话验证状态，临时失败最多 3 次、间隔 5/10 分钟重试。更新 Cookie、手动启用和重验均不重置每日次数。
+
+运行依赖 `node` 及 `scripts/dola-protocol` 内固定版本 SDK 和 npm lock；可用 `DOLA_PROTOCOL_DIR` 指定私有运行目录。签名在本地完成，不上传 Cookie 到签名服务。
+
+协议提交与轮询固定使用同一个账号代理会话，避免等待期间切换出口。视频并发锁覆盖 35 分钟任务超时并留 5 分钟余量，防止长任务未结束就放行同号第二个请求。上游明确拒绝时长且确认未启动视频任务时，及时结束并释放预占；已经启动后的内容拒绝保留扣次，不自动重发。

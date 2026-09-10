@@ -121,6 +121,7 @@ type TokenAccount struct {
 	ID              string `gorm:"primaryKey;size:64"`
 	Pool            string `gorm:"size:64;index;not null"`
 	Value           string `gorm:"type:text;not null;default:''"`
+	IdentityHash    string `gorm:"column:identity_hash;size:64;not null;default:''" json:"-"`
 	ARPSessionToken string `gorm:"column:arp_session_token;type:text;not null;default:''" json:"-"`
 	Status          string `gorm:"size:32;index;not null"`
 	Fails           int    `gorm:"not null;default:0"`

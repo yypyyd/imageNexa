@@ -92,6 +92,7 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
     volumes:
       - generated:/app/data/generated
+      - dola_profiles:/app/data/dola-profiles
     depends_on:
       postgres:
         condition: service_healthy
@@ -124,3 +125,4 @@ volumes:
   redisdata:
   rustfsdata:
   generated:
+  dola_profiles:

@@ -20,7 +20,7 @@ FROM alpine:3.20
 # pinned digest instead of using --ignore-certificate-errors. Chromium 131 uses
 # NSS independently of Alpine's CA bundle, so keep the intermediate (without
 # root trust) in the dedicated browser user's NSS database as well.
-RUN apk add --no-cache ca-certificates tzdata wget chromium openssl nss-tools \
+RUN apk add --no-cache ca-certificates tzdata wget chromium nodejs npm openssl nss-tools \
     && addgroup -S chrome \
     && adduser -S -G chrome chrome \
     && wget -q https://secure.globalsign.com/cacert/gsgccr3dvtlsca2020.crt \
@@ -41,12 +41,16 @@ RUN apk add --no-cache ca-certificates tzdata wget chromium openssl nss-tools \
     && rm -f /tmp/globalsign-gcc-r3-dv-tls-ca-2020.der \
     && apk del openssl nss-tools
 WORKDIR /app
+COPY scripts/dola-protocol /app/scripts/dola-protocol
+RUN cd /app/scripts/dola-protocol && npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --chown=chrome:chrome --from=build /out/api /app/api
 COPY --chown=chrome:chrome scripts/oreate-chromium /usr/local/bin/oreate-chromium
 # Local fallback for generated media / reference uploads (RustFS/S3 is primary).
-RUN mkdir -p /app/data/generated \
-	&& chown -R chrome:chrome /app/data \
-	&& chmod +x /app/api /usr/local/bin/oreate-chromium
+# Dola browser profiles live here so a server restart reuses the server-created
+# device identity instead of copying one from another machine.
+RUN mkdir -p /app/data/generated /app/data/dola-profiles \
+		&& chown -R chrome:chrome /app/data \
+		&& chmod +x /app/api /usr/local/bin/oreate-chromium
 ENV OREATE_CHROME=/usr/local/bin/oreate-chromium
 # Docker's default seccomp profile blocks Chromium's user namespaces. The
 # entire API already runs as the unprivileged chrome UID; browser processes

@@ -27,7 +27,7 @@ type ConcurrencyService struct {
 }
 
 func NewConcurrencyService(rdb *redis.Client) *ConcurrencyService {
-	return &ConcurrencyService{redis: rdb, ttl: 900} // 15 min
+	return &ConcurrencyService{redis: rdb, ttl: int(videoGenerationTimeout.Seconds()) + 300} // longest video deadline plus bookkeeping
 }
 
 // acquireScript: KEYS[1]=set, ARGV[1]=max (0=unlimited), ARGV[2]=ttl secs,

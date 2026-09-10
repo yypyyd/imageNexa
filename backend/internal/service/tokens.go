@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
+	"backend/internal/provider/dola"
 	"backend/internal/provider/grok"
 	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
@@ -37,6 +39,7 @@ var validTokenPools = map[string]string{
 	"runway":   "runway",
 	"grok":     "grok",
 	"oreate":   "oreate",
+	"dola":     "dola",
 	"custom":   "custom",
 }
 
@@ -45,6 +48,8 @@ var validTokenPools = map[string]string{
 var ErrNotFound = gorm.ErrRecordNotFound
 
 const (
+	oreateCredentialGenerationMetaKey    = "oreate_credential_generation"
+	dolaCredentialGenerationMetaKey      = "dola_credential_generation"
 	bytePlusCredentialFingerprintMetaKey = "byteplus_credential_fingerprint"
 	bytePlusIdentityFingerprintMetaKey   = "byteplus_identity_fingerprint"
 	bytePlusProbeVersionMetaKey          = "byteplus_probe_version"
@@ -179,16 +184,20 @@ type TokenService struct {
 	runway          *runway.Client
 	grok            *grok.Client
 	oreate          *oreate.Client
+	dola            *dola.Client
 	custom          *custom.Client
 	// sem caps concurrent background pending-probe goroutines (mirrors Python's
 	// 10-worker _quota_check_pool) so a big paste doesn't fire hundreds of
 	// simultaneous upstream requests.
 	sem chan struct{}
-	// oreateRefreshing guards the bounded low-credit balance refresh sweep.
-	oreateRefreshing atomic.Bool
+	// Separate guards keep quota maintenance and no-cost session keepalive from
+	// overlapping with themselves while allowing either job to make progress.
+	oreateRefreshing        atomic.Bool
+	oreateSessionRefreshing atomic.Bool
+	dolaVerifying           atomic.Bool
 }
 
-func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, quotas *repo.QuotaRepository) *TokenService {
+func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, dolaClient *dola.Client, customClient *custom.Client, quotas *repo.QuotaRepository) *TokenService {
 	service := &TokenService{
 		tokens:   tokens,
 		refresh:  refresh,
@@ -202,6 +211,7 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 		runway:  runwayClient,
 		grok:    grokClient,
 		oreate:  oreateClient,
+		dola:    dolaClient,
 		custom:  customClient,
 		sem:     make(chan struct{}, 10),
 	}
@@ -212,6 +222,9 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 	}
 	if bytePlusClient != nil {
 		service.byteplus = bytePlusClient
+	}
+	if oreateClient != nil {
+		oreateClient.SetSessionRotationCallback(service.persistOreateBrowserSession)
 	}
 	return service
 }
@@ -237,6 +250,16 @@ func (s *TokenService) applyProxy(ctx context.Context) {
 	}
 	if s.oreate != nil {
 		s.oreate.SetProxy(proxy)
+	}
+	if s.dola != nil {
+		s.dola.SetProxy(proxy)
+		sessionAPI := ""
+		if s.settings != nil {
+			if value, err := s.settings.GetValue(ctx, "proxy.dola.session_api"); err == nil {
+				sessionAPI = strings.TrimSpace(value)
+			}
+		}
+		s.dola.SetSessionAPI(sessionAPI)
 	}
 }
 
@@ -1286,55 +1309,99 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 	log.Printf("grok liveness: checked %d due account(s)", len(items))
 }
 
+func oreateCookieValue(cookie, name string) string {
+	for _, part := range strings.Split(cookie, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && key == name {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func oreateIdentityHash(ouid string) string {
+	sum := sha256.Sum256([]byte("oreate:" + strings.TrimSpace(ouid)))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *TokenService) persistOreateBrowserSession(accountID, expectedOldCookie, newCookie string) {
+	if s.tokens == nil || s.oreate == nil || strings.TrimSpace(accountID) == "" || expectedOldCookie == newCookie || !oreate.IsOreateCookie(newCookie) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	metaPatch := map[string]any{"oreate_cookie_observed_at": time.Now().Unix()}
+	if bid := oreateCookieValue(newCookie, "__bid_n"); bid != "" {
+		metaPatch["bid"] = bid
+	}
+	if ouid := oreateCookieValue(newCookie, "OUID"); ouid != "" {
+		metaPatch["ouid"] = ouid
+	}
+	if _, err := s.tokens.RotateOreateSession(ctx, accountID, expectedOldCookie, newCookie, metaPatch); err != nil {
+		log.Printf("persist oreate browser session failed for %s", accountID)
+	}
+}
+
 // ImportOreateAccount stores only the website cookie and non-secret profile
 // metadata. Passwords from account-export files are deliberately never accepted
 // by this boundary. A background probe validates the session and hydrates quota.
-func (s *TokenService) ImportOreateAccount(ctx context.Context, cookie, email, ouid, userAgent string, regTS int64, vip, tokenID string) (*model.TokenAccount, error) {
+func (s *TokenService) ImportOreateAccount(ctx context.Context, cookie, email, _, userAgent string, regTS int64, vip, tokenID string) (*model.TokenAccount, error) {
 	s.applyProxy(ctx)
 	cookie = strings.TrimSpace(cookie)
 	if !oreate.IsOreateCookie(cookie) {
 		return nil, errors.New("not an OreateAI cookie")
 	}
 	email = strings.TrimSpace(email)
-	if existing, _ := s.tokens.GetByPoolEmail(ctx, "oreate", email); email != "" && existing != nil {
-		tokenID = existing.ID
-	} else if strings.TrimSpace(tokenID) == "" {
+	// The cookie is authoritative: export metadata can be stale, and two rows for
+	// one upstream OUID would share the same browser session and first-use bonus.
+	ouid := oreateCookieValue(cookie, "OUID")
+	if ouid == "" {
+		return nil, errors.New("OreateAI cookie is missing OUID")
+	}
+	if strings.TrimSpace(tokenID) == "" {
 		tokenID = newTokenID("oreate")
 	}
+	credentialGeneration := newTokenID("oreate-generation")
 	meta := datatypes.JSONMap{
-		"pending_check": true,
-		"user_agent":    strings.TrimSpace(userAgent),
-		"ouid":          strings.TrimSpace(ouid),
-		"reg_ts":        regTS,
-		"vip":           strings.TrimSpace(vip),
+		"pending_check": true, "ouid": ouid,
+		oreateCredentialGenerationMetaKey: credentialGeneration,
 	}
-	// Only a brand new row may spend credits on the first-use image: re-importing
-	// a refreshed cookie for a known account must never pay for it again.
-	fresh := true
-	item, err := s.createToken(ctx, "oreate", tokenID, cookie, "pending", meta)
+	metaPatch := map[string]any{
+		"pending_check": true, "ouid": ouid,
+		oreateCredentialGenerationMetaKey: credentialGeneration,
+	}
+	if userAgent = strings.TrimSpace(userAgent); userAgent != "" {
+		meta["user_agent"] = userAgent
+		metaPatch["user_agent"] = userAgent
+	}
+	if regTS != 0 {
+		meta["reg_ts"] = regTS
+		metaPatch["reg_ts"] = regTS
+	}
+	if vip = strings.TrimSpace(vip); vip != "" {
+		meta["vip"] = vip
+		metaPatch["vip"] = vip
+	}
+	identityHash := oreateIdentityHash(ouid)
+	previous, _ := s.tokens.GetByIdentityHash(ctx, "oreate", identityHash)
+	now := time.Now()
+	candidate := &model.TokenAccount{
+		ID: tokenID, Pool: "oreate", Value: cookie, IdentityHash: identityHash,
+		Status: "pending", Meta: meta, AccountEmail: email, AddedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	item, fresh, err := s.tokens.UpsertOreateByIdentity(ctx, candidate, metaPatch)
 	if err != nil {
-		if !errors.Is(err, gorm.ErrDuplicatedKey) {
-			return nil, err
-		}
-		fresh = false
-		item, err = s.tokens.Update(ctx, "oreate", tokenID, map[string]any{
-			"value": cookie, "status": "pending", "dead": false, "meta": meta,
-		})
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
-	if email != "" {
-		if updated, updateErr := s.tokens.Update(ctx, "oreate", tokenID, map[string]any{"account_email": email}); updateErr == nil {
-			item = updated
-		}
+	if previous != nil && previous.Value != cookie && s.oreate != nil {
+		s.oreate.InvalidateSession(previous.ID, previous.Value)
 	}
-	account := oreate.Account{Cookie: cookie, Email: email, OUID: strings.TrimSpace(ouid), UserAgent: strings.TrimSpace(userAgent), RegTS: regTS, VIP: strings.TrimSpace(vip)}
-	go s.checkPendingOreate(tokenID, account, fresh)
+	account := oreate.Account{ID: item.ID, Cookie: cookie, Email: email, OUID: ouid, UserAgent: userAgent, RegTS: regTS, VIP: vip}
+	go s.checkPendingOreate(item.ID, credentialGeneration, account, fresh)
 	return item, nil
 }
 
-func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account, claimFirstImage bool) {
+func (s *TokenService) checkPendingOreate(tokenID, credentialGeneration string, account oreate.Account, claimFirstImage bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("token import: oreate pending check panicked for %s", tokenID)
@@ -1345,13 +1412,13 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if s.oreate == nil {
-		s.finishPending(ctx, "oreate", tokenID, "active", false, nil)
+		s.finishPendingOreate(ctx, tokenID, credentialGeneration, "active", false, nil)
 		return
 	}
 	s.applyProxy(ctx)
 	profile, profileErr := s.oreate.FetchProfile(ctx, account)
 	if errors.Is(profileErr, oreate.ErrAuth) {
-		s.finishPending(ctx, "oreate", tokenID, "disabled", true, nil)
+		s.finishPendingOreate(ctx, tokenID, credentialGeneration, "disabled", true, nil)
 		return
 	}
 	if profileErr == nil {
@@ -1374,20 +1441,21 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 			account.RegTS = profile.RegTS
 		}
 		if len(patch) > 0 || len(metaPatch) > 0 {
-			_ = s.tokens.UpdateMergingMeta(ctx, "oreate", tokenID, metaPatch, patch)
+			if applied, _ := s.tokens.UpdateMergingMetaIfGeneration(ctx, "oreate", tokenID, oreateCredentialGenerationMetaKey, credentialGeneration, metaPatch, patch); !applied {
+				return
+			}
 		}
 	}
 	data, quotaErr := s.oreate.FetchCreditsBalance(ctx, account)
 	if errors.Is(quotaErr, oreate.ErrAuth) {
-		s.finishPending(ctx, "oreate", tokenID, "disabled", true, nil)
+		s.finishPendingOreate(ctx, tokenID, credentialGeneration, "disabled", true, nil)
 		return
 	}
 	if quotaErr != nil {
 		// Network and upstream errors are inconclusive; keep the account usable and
 		// let the live quota path retry later.
-		s.finishPending(ctx, "oreate", tokenID, "active", false, nil)
-		if claimFirstImage {
-			go s.claimOreateFirstImage(tokenID, account)
+		if s.finishPendingOreate(ctx, tokenID, credentialGeneration, "active", false, nil) && claimFirstImage {
+			go s.claimOreateFirstImage(tokenID, credentialGeneration, account)
 		}
 		return
 	}
@@ -1399,24 +1467,67 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 	if total, ok := data["total"].(int); ok {
 		quotaMeta["cached_quota_total"] = total
 	}
+	terminalPatch := map[string]any{}
 	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
-		_, _ = s.tokens.Update(ctx, "oreate", tokenID, map[string]any{"cached_quota_reset_after": reset})
+		terminalPatch["cached_quota_reset_after"] = reset
 	}
 	status := "active"
 	if hasRemaining && remaining < oreateMinUsableCredits {
 		status = "quota"
 	}
-	s.finishPending(ctx, "oreate", tokenID, status, false, quotaMeta)
-	if claimFirstImage {
-		go s.claimOreateFirstImage(tokenID, account)
+	quotaMeta["pending_check"] = false
+	terminalPatch["status"] = status
+	terminalPatch["dead"] = false
+	applied, _ := s.tokens.UpdateMergingMetaIfGeneration(ctx, "oreate", tokenID, oreateCredentialGenerationMetaKey, credentialGeneration, quotaMeta, terminalPatch)
+	if applied && claimFirstImage {
+		go s.claimOreateFirstImage(tokenID, credentialGeneration, account)
 	}
+}
+
+// ImportDolaAccount stores a cookie and verifies the protocol session
+// before admitting it to scheduling. Verification never submits video;
+// importing an existing session preserves its two-use daily quota.
+func (s *TokenService) ImportDolaAccount(ctx context.Context, cookie, userAgent string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
+	cookie = strings.TrimSpace(cookie)
+	if !dola.IsDolaCookie(cookie) {
+		return nil, errors.New("not a Dola cookie (need sessionid with a browser fingerprint or Passport session bundle)")
+	}
+	sessionID := dola.CookieValue(cookie, "sessionid")
+	credentialGeneration := newTokenID("dola-generation")
+	meta := datatypes.JSONMap{
+		"pending_check":  true,
+		"dola_readiness": "pending", "dola_readiness_version": "", "dola_verified_generation": "", "dola_probe_id": "", "dola_probe_until": "", "dola_retry_at": "", "dola_probe_attempts": 0, "dola_readiness_detail": "",
+		dolaCredentialGenerationMetaKey: credentialGeneration,
+	}
+	metaPatch := map[string]any{
+		"pending_check":  true,
+		"dola_readiness": "pending", "dola_readiness_version": "", "dola_verified_generation": "", "dola_probe_id": "", "dola_probe_until": "", "dola_retry_at": "", "dola_probe_attempts": 0, "dola_readiness_detail": "",
+		dolaCredentialGenerationMetaKey: credentialGeneration,
+	}
+	if userAgent = strings.TrimSpace(userAgent); userAgent != "" {
+		meta["user_agent"] = userAgent
+		metaPatch["user_agent"] = userAgent
+	}
+	identityHash := dola.IdentityHash(sessionID)
+	now := time.Now()
+	candidate := &model.TokenAccount{
+		ID: newTokenID("dola"), Pool: "dola", Value: cookie, IdentityHash: identityHash,
+		Status: "pending", Meta: meta, AddedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	item, _, err := s.tokens.UpsertDolaByIdentity(ctx, candidate, metaPatch)
+	if err != nil {
+		return nil, err
+	}
+	go s.verifyDolaReadiness(item.ID, false)
+	return item, nil
 }
 
 // claimOreateFirstImage generates the account's first image so Oreate releases
 // the 50-credit first-use bonus, then refreshes the cached balance. The image
 // itself is discarded: only the grant matters, and it is a one-time award the
 // account cannot collect later without generating.
-func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Account) {
+func (s *TokenService) claimOreateFirstImage(tokenID, credentialGeneration string, account oreate.Account) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("token import: oreate first-image claim panicked for %s", tokenID)
@@ -1430,7 +1541,7 @@ func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Acco
 	ctx, cancel := context.WithTimeout(context.Background(), oreateFirstImageTimeout)
 	defer cancel()
 	item, err := s.tokens.Get(ctx, "oreate", tokenID)
-	if err != nil || item == nil || item.Dead {
+	if err != nil || item == nil || item.Dead || strings.TrimSpace(stringValue(item.Meta[oreateCredentialGenerationMetaKey])) != credentialGeneration {
 		return
 	}
 	if _, claimed := jsonMapInt(item.Meta, oreateFirstImageAtMetaKey); claimed {
@@ -1439,25 +1550,27 @@ func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Acco
 	s.applyProxy(ctx)
 	// Record the attempt before spending credits: a crash or timeout must not let
 	// a later import pay for a second image.
-	if markErr := s.tokens.UpdateMergingMeta(ctx, "oreate", tokenID, map[string]any{
+	marked, markErr := s.tokens.UpdateMergingMetaIfGeneration(ctx, "oreate", tokenID, oreateCredentialGenerationMetaKey, credentialGeneration, map[string]any{
 		oreateFirstImageAtMetaKey:    int(time.Now().Unix()),
 		oreateFirstImageStateMetaKey: oreateFirstImageRunning,
 		oreateFirstImageErrMetaKey:   "",
-	}, nil); markErr != nil {
+	}, nil)
+	if markErr != nil || !marked {
 		return
 	}
 	imageURL, claimErr := s.oreate.ClaimFirstImageBonus(ctx, account)
 	if claimErr != nil {
 		log.Printf("token import: oreate first-use bonus not claimed for %s (%s)", tokenID, safeGenerationErrorText(claimErr))
 	}
-	s.recordOreateFirstImage(ctx, tokenID, imageURL, claimErr)
+	s.recordOreateFirstImage(ctx, tokenID, credentialGeneration, imageURL, claimErr)
 	// The grant lands asynchronously, so read the balance until it grows past the
 	// pre-claim reading or the bounded window elapses.
 	before, _ := jsonMapInt(item.Meta, "cached_quota_remaining")
 	for deadline := time.Now().Add(oreateFirstImageBonusWait); ; {
 		data, balanceErr := s.oreate.FetchCreditsBalance(ctx, account)
 		if balanceErr == nil {
-			if _, persistErr := persistOreateQuotaSnapshot(ctx, s.tokens, tokenID, data, time.Now()); persistErr != nil {
+			applied, persistErr := persistOreateQuotaSnapshotGeneration(ctx, s.tokens, tokenID, credentialGeneration, data, time.Now())
+			if persistErr != nil || !applied {
 				log.Printf("token import: could not persist oreate balance for %s", tokenID)
 				return
 			}
@@ -1479,7 +1592,7 @@ func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Acco
 // recordOreateFirstImage persists the outcome of the import-time image so the
 // accounts UI can tell a spam-blocked account from one whose stream merely broke
 // (the site charged for that image and released the bonus all the same).
-func (s *TokenService) recordOreateFirstImage(ctx context.Context, tokenID, imageURL string, claimErr error) {
+func (s *TokenService) recordOreateFirstImage(ctx context.Context, tokenID, credentialGeneration, imageURL string, claimErr error) {
 	state, detail := oreateFirstImageOK, ""
 	if claimErr != nil {
 		detail = safeGenerationErrorText(claimErr)
@@ -1493,16 +1606,16 @@ func (s *TokenService) recordOreateFirstImage(ctx context.Context, tokenID, imag
 			state = oreateFirstImageFailed
 		}
 	}
-	if err := s.tokens.UpdateMergingMeta(ctx, "oreate", tokenID, map[string]any{
+	if applied, err := s.tokens.UpdateMergingMetaIfGeneration(ctx, "oreate", tokenID, oreateCredentialGenerationMetaKey, credentialGeneration, map[string]any{
 		oreateFirstImageStateMetaKey: state,
 		oreateFirstImageErrMetaKey:   detail,
-	}, nil); err != nil {
+	}, nil); err != nil || !applied {
 		log.Printf("token import: could not persist oreate first-image state for %s", tokenID)
 	}
 }
 
 func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
-	account := oreate.Account{Cookie: item.Value, Email: item.AccountEmail}
+	account := oreate.Account{ID: item.ID, Cookie: item.Value, Email: item.AccountEmail}
 	if item.Meta == nil {
 		return account
 	}
@@ -1534,6 +1647,8 @@ const (
 	oreateMinUsableCredits             = 60
 	oreateQuotaRefreshBatchSize        = 4
 	oreateQuotaRefreshInterval         = 30 * time.Minute
+	oreateSessionRefreshBatchSize      = 2
+	oreateSessionRefreshInterval       = 6 * time.Hour
 	oreateQuotaCheckedAtMetaKey        = "oreate_quota_checked_at"
 	oreateLegacyRetirementCheckedAtKey = "oreate_retirement_checked_at"
 )
@@ -1597,6 +1712,15 @@ func persistOreateQuotaSnapshot(ctx context.Context, tokens *repo.TokenRepositor
 		return nil, err
 	}
 	return tokens.Get(ctx, "oreate", tokenID)
+}
+
+func persistOreateQuotaSnapshotGeneration(ctx context.Context, tokens *repo.TokenRepository, tokenID, credentialGeneration string, data map[string]any, now time.Time) (bool, error) {
+	item, err := tokens.Get(ctx, "oreate", tokenID)
+	if err != nil {
+		return false, err
+	}
+	metaPatch, patch := oreateQuotaPatches(*item, data, now)
+	return tokens.UpdateMergingMetaIfGeneration(ctx, "oreate", tokenID, oreateCredentialGenerationMetaKey, credentialGeneration, metaPatch, patch)
 }
 
 func selectOreateQuotaRefreshCandidates(items []model.TokenAccount, now time.Time) []model.TokenAccount {
@@ -1691,6 +1815,81 @@ func (s *TokenService) RefreshLowCreditOreateAccounts(ctx context.Context) {
 	}()
 }
 
+func selectOreateSessionRefreshCandidates(items []model.TokenAccount, now time.Time) []model.TokenAccount {
+	cutoff := now.Add(-oreateSessionRefreshInterval).Unix()
+	type candidate struct {
+		account   model.TokenAccount
+		checkedAt int64
+	}
+	due := make([]candidate, 0, oreateSessionRefreshBatchSize)
+	for _, item := range items {
+		if item.Dead || (item.Status != "active" && item.Status != "quota") || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		checkedAt, _ := jsonMapInt(item.Meta, "oreate_session_checked_at")
+		if observedAt, ok := jsonMapInt(item.Meta, "oreate_cookie_observed_at"); ok && observedAt > checkedAt {
+			checkedAt = observedAt
+		}
+		if int64(checkedAt) > cutoff {
+			continue
+		}
+		due = append(due, candidate{account: item, checkedAt: int64(checkedAt)})
+	}
+	sort.SliceStable(due, func(i, j int) bool {
+		if due[i].checkedAt != due[j].checkedAt {
+			return due[i].checkedAt < due[j].checkedAt
+		}
+		return due[i].account.ID < due[j].account.ID
+	})
+	if len(due) > oreateSessionRefreshBatchSize {
+		due = due[:oreateSessionRefreshBatchSize]
+	}
+	out := make([]model.TokenAccount, len(due))
+	for i := range due {
+		out[i] = due[i].account
+	}
+	return out
+}
+
+// RefreshOreateSessions proactively visits a small number of signed pages and
+// mints a Banti token without submitting a generation. Set-Cookie rotations are
+// persisted through the client's CAS callback; the check marker prevents bursts.
+func (s *TokenService) RefreshOreateSessions(ctx context.Context) {
+	if s.oreate == nil || !s.oreateSessionRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.oreateSessionRefreshing.Store(false)
+		items, err := s.tokens.ListByPool(ctx, "oreate")
+		if err != nil {
+			return
+		}
+		items = selectOreateSessionRefreshCandidates(items, time.Now())
+		if len(items) == 0 {
+			return
+		}
+		s.applyProxy(ctx)
+		var refreshed int
+		for _, item := range items {
+			probeCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
+			err := s.oreate.RefreshSession(probeCtx, oreateAccountFromToken(item))
+			cancel()
+			nowUnix := time.Now().Unix()
+			markerCtx, cancelMarker := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_, _ = s.tokens.RotateOreateSession(markerCtx, item.ID, item.Value, item.Value, map[string]any{
+				"oreate_session_checked_at": nowUnix,
+			})
+			cancelMarker()
+			if err == nil {
+				refreshed++
+			}
+		}
+		if refreshed > 0 {
+			log.Printf("oreate maintenance: refreshed %d browser session(s)", refreshed)
+		}
+	}()
+}
+
 // ImportCustomAccount adds an upstream as a custom account: base_url + key, the
 // csv list of model ids it serves (empty = all), plus optional weight and
 // per-account concurrency. No probe — the account goes active immediately and is
@@ -1777,6 +1976,16 @@ func normalizeCustomBaseURL(ctx context.Context, raw string) (string, error) {
 
 // finishPending writes the terminal status/dead flag and clears the pending_check
 // marker (merging any cached quota) for a background import probe.
+func (s *TokenService) finishPendingOreate(ctx context.Context, id, credentialGeneration, status string, dead bool, quotaMeta map[string]any) bool {
+	metaPatch := map[string]any{"pending_check": false}
+	for k, v := range quotaMeta {
+		metaPatch[k] = v
+	}
+	patch := map[string]any{"status": status, "dead": dead}
+	applied, _ := s.tokens.UpdateMergingMetaIfGeneration(ctx, "oreate", id, oreateCredentialGenerationMetaKey, credentialGeneration, metaPatch, patch)
+	return applied
+}
+
 func (s *TokenService) finishPending(ctx context.Context, pool, id, status string, dead bool, quotaMeta map[string]any) {
 	metaPatch := map[string]any{"pending_check": false}
 	for k, v := range quotaMeta {
@@ -1852,6 +2061,10 @@ func (s *TokenService) Delete(ctx context.Context, pool, id string) error {
 	if pool == "" {
 		return errors.New("unknown pool")
 	}
+	var deletedOreate *model.TokenAccount
+	if pool == "oreate" {
+		deletedOreate, _ = s.tokens.Get(ctx, pool, id)
+	}
 	rows, err := s.tokens.Delete(ctx, pool, id)
 	if err != nil {
 		return err
@@ -1866,6 +2079,9 @@ func (s *TokenService) Delete(ctx context.Context, pool, id string) error {
 	_ = s.refresh.Delete(ctx, id)
 	if rows == 0 && !profileRemoved {
 		return ErrNotFound
+	}
+	if deletedOreate != nil && s.oreate != nil {
+		s.oreate.InvalidateSession(deletedOreate.ID, deletedOreate.Value)
 	}
 	return nil
 }
@@ -1889,6 +2105,14 @@ func (s *TokenService) DeleteBulk(ctx context.Context, ids []string) (int, error
 	if len(clean) == 0 {
 		return 0, nil
 	}
+	var deletedOreate []model.TokenAccount
+	if s.oreate != nil {
+		all, listErr := s.tokens.ListByIDs(ctx, "oreate", clean)
+		if listErr != nil {
+			return 0, listErr
+		}
+		deletedOreate = all
+	}
 	rows, err := s.tokens.DeleteByIDs(ctx, clean)
 	if err != nil {
 		return 0, err
@@ -1896,6 +2120,9 @@ func (s *TokenService) DeleteBulk(ctx context.Context, ids []string) (int, error
 	// Drop matching cookie refresh profiles (id == token id) so the background
 	// refresher doesn't re-create the tokens.
 	_ = s.refresh.DeleteByIDs(ctx, clean)
+	for _, item := range deletedOreate {
+		s.oreate.InvalidateSession(item.ID, item.Value)
+	}
 	return int(rows), nil
 }
 

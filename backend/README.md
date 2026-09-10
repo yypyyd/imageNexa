@@ -32,14 +32,31 @@ Never commit the real `.env` or any provider credential. The backend imports Byt
 
 ## Database lifecycle
 
+Migration definitions are compiled from `internal/migrations/definitions.go`; no separate SQL files or manual SQL execution are required. Existing migration names and checksums remain unchanged. Append new versions instead of editing applied definitions.
+
 Forward-only, checksummed migrations create administrator/API-credential identity, the 19-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Provider-account deletion cascades through its route bindings, quota buckets, and bucket-owned reservations, while event logs and nullable dispatch history remain. Startup refuses unknown or modified applied migrations. `AutoMigrate` is limited to compatible columns on retained operational tables and does not seed retired models.
 
 ## Verification
 
 ```powershell
-go test ./...
 go vet ./...
 go build ./cmd/api
 ```
 
 Operational probes are `GET /health/live` and `GET /health/ready`. Readiness requires PostgreSQL, Redis, the latest migration, and access to the configured private RustFS bucket.
+
+Dola 视频只接受 `30s`，按每号每天 2 次计量。调度使用 `dola.video.daily:YYYY-MM-DD`（UTC）持久化预占，已提交及结果不明的任务不退款、不自动换号重发。000018 迁移保留旧账本，并回填当天可识别用量。迁移定义已合并进 Go 代码，服务器启动时自动执行未应用的版本。
+
+每日 2 次上限按 **Dola 账号**独立计算，不是 API 用户或系统总并发限制。6 个 Dola 账号共可预占 12 次。并发槽位沿用原配置；目前浏览器提交有共享锁，生成结果轮询可重叠执行。
+
+公共模型发现：`dola-seedance-2.5` 由 000019 迁移注册，普通与 extended 模型列表均可获取。此入口仅匹配 Dola 路由（30s/720p/文生视频），不接受 custom 等其他 provider 替代；原 `seedance-2.5` 路由保持兼容。两入口共享日期额度桶，迁移保留原有绑定权限、冷却期和用量。
+
+### Dola Cookie 导入与协议调度
+
+Dola 导入通过 HTTP 验证 Passport 登录态，再由 Alice 协议分配设备标识。生成请求使用本地 Node + jsdom 执行固定版本签名 SDK，通过 HTTP 提交新会话并查询成片，不启动浏览器，也不自动回退网页生成。验证只证明协议认证与签名可用，不承诺上游有额度或一定生成成功。
+
+每号默认并发 1、每天 2 次、只接受 30s/720p；两个模型入口共享次数。已提交或结果不明禁止自动重发。视频返回时检查上游实际时长，非 30 秒不会作为成功交付。账号页显示协议会话验证状态，临时失败最多 3 次、间隔 5/10 分钟重试。更新 Cookie、手动启用和重验均不重置每日次数。
+
+运行依赖 `node` 及 `scripts/dola-protocol` 内固定版本 SDK 和 npm lock；可用 `DOLA_PROTOCOL_DIR` 指定私有运行目录。签名在本地完成，不上传 Cookie 到签名服务。
+
+协议提交与轮询固定使用同一个账号代理会话，避免等待期间切换出口。视频并发锁覆盖 35 分钟任务超时并留 5 分钟余量，防止长任务未结束就放行同号第二个请求。上游明确拒绝时长且确认未启动视频任务时，及时结束并释放预占；已经启动后的内容拒绝保留扣次，不自动重发。

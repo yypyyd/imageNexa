@@ -5,12 +5,14 @@ package oreate
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,21 +20,24 @@ import (
 )
 
 const (
-	apiBase      = "https://www.oreateai.com"
-	defaultUA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-	defaultRefer = apiBase + "/home/chat/aiVideo"
+	apiBase               = "https://www.oreateai.com"
+	defaultUA             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+	defaultRefer          = apiBase + "/home/chat/aiVideo"
+	maxOreateCookieLength = 32 << 10
 )
 
 var (
 	ErrAuth              = errors.New("oreate auth failed")
 	ErrQuotaExhausted    = errors.New("oreate quota exhausted")
 	ErrRiskControl       = errors.New("oreate risk control")
+	ErrAccountChallenge  = errors.New("oreate account verification required")
 	ErrSpamUser          = errors.New("oreate spam user")
 	ErrTemporaryUpstream = errors.New("oreate upstream temporary error")
 	ErrContentRejected   = errors.New("oreate content rejected")
 )
 
 type Account struct {
+	ID        string `json:"-"`
 	Cookie    string
 	UserAgent string
 	Email     string
@@ -43,6 +48,7 @@ type Account struct {
 }
 
 func (a Account) normalized() Account {
+	a.ID = strings.TrimSpace(a.ID)
 	a.Cookie = strings.TrimSpace(a.Cookie)
 	a.UserAgent = strings.TrimSpace(a.UserAgent)
 	if a.UserAgent == "" {
@@ -70,9 +76,16 @@ type Signer interface {
 	Sign(context.Context, Account) (Signature, error)
 }
 
+// SessionRotationCallback persists a browser-observed session using
+// expectedOldCookie as a compare-and-swap guard. Cookie values must not be
+// logged by callback implementations.
+type SessionRotationCallback func(accountID, expectedOldCookie, newCookie string)
+
 type Client struct {
 	proxyMu      sync.RWMutex
 	proxy        string
+	rotationMu   sync.RWMutex
+	rotation     SessionRotationCallback
 	signer       Signer
 	baseURL      string
 	cdnBaseURL   string
@@ -81,7 +94,7 @@ type Client struct {
 
 func NewClient(proxy string) *Client {
 	c := &Client{proxy: strings.TrimSpace(proxy), baseURL: apiBase}
-	c.signer = newChromiumSigner(c.proxyValue)
+	c.signer = newChromiumSigner(c.proxyValue, c.observeBrowserCookies)
 	return c
 }
 
@@ -97,6 +110,54 @@ func (c *Client) SetProxy(proxy string) {
 	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)
 	c.proxyMu.Unlock()
+}
+
+// SetSessionRotationCallback installs or replaces the callback used when a
+// browser rotates an Oreate session. It is safe to call while requests run.
+func (c *Client) SetSessionRotationCallback(callback SessionRotationCallback) {
+	c.rotationMu.Lock()
+	c.rotation = callback
+	c.rotationMu.Unlock()
+}
+
+func (c *Client) sessionRotationCallback() SessionRotationCallback {
+	c.rotationMu.RLock()
+	callback := c.rotation
+	c.rotationMu.RUnlock()
+	return callback
+}
+
+func (c *Client) observeBrowserCookies(account Account, browserCookie string) Account {
+	return applyBrowserCookies(account, browserCookie, c.sessionRotationCallback())
+}
+
+// InvalidateSession retires warm browser pages for exactly this account and
+// cookie version. Active generations are allowed to finish; their pages close
+// when released back to the pool.
+func (c *Client) InvalidateSession(accountID, cookie string) {
+	invalidator, ok := c.signer.(sessionInvalidator)
+	if !ok {
+		return
+	}
+	invalidator.InvalidateSession((Account{ID: accountID, Cookie: cookie}).normalized())
+}
+
+func (c *Client) Close() {
+	if closer, ok := c.signer.(sessionCloser); ok {
+		closer.Close()
+	}
+}
+
+// RefreshSession opens or reuses the account's signed page and mints a Banti
+// token without submitting a generation. Browser Set-Cookie changes observed by
+// the signer flow through the rotation callback.
+func (c *Client) RefreshSession(ctx context.Context, account Account) error {
+	account = account.normalized()
+	if account.Cookie == "" {
+		return ErrAuth
+	}
+	_, err := c.signHot(ctx, account)
+	return err
 }
 
 func (c *Client) proxyValue() string {
@@ -315,17 +376,101 @@ func cookieValue(cookie, name string) string {
 }
 
 // mergeCookies overlays browser-observed cookies onto the stored cookie so the
-// website request carries the full tracking jar; stored values win on conflict.
+// website request carries the full tracking jar. Browser values win while
+// fields absent from the browser remain available from storage. Invalid browser
+// observations are ignored so they cannot poison a valid persisted session.
 func mergeCookies(stored, browser string) string {
-	merged := strings.TrimSpace(stored)
-	for _, part := range strings.Split(browser, ";") {
-		name, _, ok := strings.Cut(strings.TrimSpace(part), "=")
-		if !ok || name == "" || cookieValue(merged, name) != "" {
-			continue
-		}
-		merged += "; " + strings.TrimSpace(part)
+	merged, err := mergeOreateCookies(stored, browser)
+	if err != nil {
+		return strings.TrimSpace(stored)
 	}
 	return merged
+}
+
+func mergeOreateCookies(stored, browser string) (string, error) {
+	if len(stored) > maxOreateCookieLength || len(browser) > maxOreateCookieLength {
+		return "", errors.New("oreate: browser cookie exceeds size limit")
+	}
+	storedValues, err := parseCookieHeader(stored)
+	if err != nil {
+		return "", err
+	}
+	browserValues, err := parseCookieHeader(browser)
+	if err != nil {
+		return "", err
+	}
+	if storedOUID, browserOUID := storedValues["OUID"], browserValues["OUID"]; storedOUID != "" && browserOUID != "" && storedOUID != browserOUID {
+		return "", errors.New("oreate: browser cookie identity changed")
+	}
+	for name, value := range browserValues {
+		storedValues[name] = value
+	}
+	merged := formatCookieHeader(storedValues)
+	if len(merged) > maxOreateCookieLength {
+		return "", errors.New("oreate: browser cookie exceeds size limit")
+	}
+	if cookieValue(merged, "OUID") == "" || cookieValue(merged, "ouss") == "" {
+		return "", errors.New("oreate: browser cookie is missing session identity")
+	}
+	return merged, nil
+}
+
+func parseCookieHeader(raw string) (map[string]string, error) {
+	values := make(map[string]string)
+	for _, part := range strings.Split(strings.TrimSpace(raw), ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(part, "=")
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if !ok || name == "" {
+			return nil, errors.New("oreate: invalid browser cookie")
+		}
+		if err := (&http.Cookie{Name: name, Value: value}).Valid(); err != nil {
+			return nil, errors.New("oreate: invalid browser cookie")
+		}
+		values[name] = value
+	}
+	return values, nil
+}
+
+func formatCookieHeader(values map[string]string) string {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+values[name])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func cookieVersion(cookie string) [sha256.Size]byte {
+	values, err := parseCookieHeader(cookie)
+	if err != nil {
+		return sha256.Sum256([]byte(strings.TrimSpace(cookie)))
+	}
+	return sha256.Sum256([]byte(formatCookieHeader(values)))
+}
+
+func applyBrowserCookies(account Account, browserCookie string, callback SessionRotationCallback) Account {
+	expected := strings.TrimSpace(account.Cookie)
+	merged, err := mergeOreateCookies(expected, browserCookie)
+	if err != nil {
+		return account
+	}
+	changed := cookieVersion(expected) != cookieVersion(merged)
+	account.Cookie = merged
+	account.OUID = cookieValue(merged, "OUID")
+	account.BID = cookieValue(merged, "__bid_n")
+	if changed && callback != nil {
+		callback(account.ID, expected, merged)
+	}
+	return account
 }
 
 func IsOreateCookie(cookie string) bool {

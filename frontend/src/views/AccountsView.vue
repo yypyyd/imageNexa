@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import Icon from '../components/Icon.vue'
 import SelectMenu from '../components/SelectMenu.vue'
 import AccountTestModal from '../components/AccountTestModal.vue'
@@ -7,8 +7,8 @@ import CustomAccountModal from '../components/CustomAccountModal.vue'
 import { api, jsonBody, listOf } from '../api'
 import { parseCredentialFile, parseCredentialImports, uniqueCredentialImports } from '../credential'
 
-const ALLOWED_PROVIDERS = ['chatgpt', 'byteplus', 'adobe', 'runway', 'grok', 'oreate', 'custom']
-const PROVIDER_OPTIONS = ALLOWED_PROVIDERS.map((value) => ({ value, label: value === 'chatgpt' ? 'ChatGPT' : value === 'oreate' ? 'OreateAI' : value[0].toUpperCase() + value.slice(1) }))
+const ALLOWED_PROVIDERS = ['chatgpt', 'byteplus', 'adobe', 'runway', 'grok', 'oreate', 'dola', 'custom']
+const PROVIDER_OPTIONS = ALLOWED_PROVIDERS.map((value) => ({ value, label: value === 'chatgpt' ? 'ChatGPT' : value === 'oreate' ? 'OreateAI' : value === 'dola' ? 'Dola' : value[0].toUpperCase() + value.slice(1) }))
 const PROVIDER_LABELS = Object.fromEntries(PROVIDER_OPTIONS.map((option) => [option.value, option.label]))
 
 const accounts = ref([])
@@ -67,8 +67,9 @@ function listURL() {
   return `/accounts?${params}`
 }
 
-async function load() {
-  loading.value = true
+async function load(quiet = false) {
+  if (quiet && loading.value) return
+  if (!quiet) loading.value = true
   const response = await api(listURL())
   if (response.ok) {
     accounts.value = listOf(response.data)
@@ -154,6 +155,10 @@ function statusLabel(value) {
   return ({ active: '可用', quota: '额度受限', pending: '待校验', disabled: '已禁用', auth_error: '凭据失效', cooldown: '冷却中' })[value] || value || '未知'
 }
 
+function dolaReadinessLabel(account) {
+ return ({pending:'待验证',checking:'正在验证协议会话',ready:'协议会话已就绪',login_required:'需要更新登录 Cookie',challenge:'需要人机验证',retry:'等待自动重试',failed:'验证失败，请重新验证'})[account.readiness] || '待验证'
+}
+
 function sessionLabel(account) {
   return ({ valid: '会话', expiring: '会话将到期', expired: '会话已过期', unknown: '会话到期未知' })[account.session_state] || '会话'
 }
@@ -167,8 +172,8 @@ async function patchAccount(account, patch, key) {
 }
 
 async function toggleAccount(account) {
-  if (!['active', 'disabled'].includes(account.status)) return
-  await patchAccount(account, { status: account.status === 'active' ? 'disabled' : 'active' }, 'status')
+  if (account.provider !== 'dola' && !['active', 'disabled'].includes(account.status)) return
+  await patchAccount(account, { status: account.status === 'disabled' ? 'active' : 'disabled' }, 'status')
 }
 
 async function toggleAccountRoute(account, route) {
@@ -306,7 +311,14 @@ async function customSaved() {
   await load()
 }
 
-onMounted(() => { load(); loadModels() })
+let readinessTimer
+onMounted(() => {
+  load(); loadModels()
+  readinessTimer = setInterval(() => {
+    if (accounts.value.some(a => a.provider === 'dola' && a.status !== 'disabled')) load(true)
+  }, 5000)
+})
+onUnmounted(() => clearInterval(readinessTimer))
 </script>
 
 <template>
@@ -388,12 +400,12 @@ onMounted(() => { load(); loadModels() })
                 <input type="number" min="0" max="1000" class="compact-input" :value="account.max_concurrency || 0" title="账号并发，0 表示使用 Provider 默认值" @change="patchAccount(account,{max_concurrency:Number($event.target.value)},'concurrency')" />
               </td>
               <td><input type="number" min="-1000" max="1000" class="compact-input" :value="account.weight ?? 0" title="调度权重，高的优先" @change="patchAccount(account,{weight:Number($event.target.value)},'weight')" /></td>
-              <td><span class="status" :class="`status-${account.status}`">{{ statusLabel(account.status) }}</span><div v-if="account.image_limited || account.video_limited" class="limit-flags"><span v-if="account.image_limited">图片限额</span><span v-if="account.video_limited">视频限额</span></div></td>
+              <td><span class="status" :class="`status-${account.status}`">{{ statusLabel(account.status) }}</span><div v-if="account.provider === 'dola'" class="text-xs mt-1" :class="account.readiness === 'ready' ? 'ok' : 'warn'" :title="account.readiness_detail">{{ dolaReadinessLabel(account) }}</div><small v-if="account.provider === 'dola' && account.readiness_detail && account.readiness !== 'ready'" class="block max-w-48 text-white/50">{{ account.readiness_detail }}</small><div v-if="account.image_limited || account.video_limited" class="limit-flags"><span v-if="account.image_limited">图片限额</span><span v-if="account.video_limited">视频限额</span></div></td>
               <td><div class="flex items-center gap-1 justify-end">
                 <button class="icon-btn test-action" title="账号能力测试" @click="testingAccount = account"><Icon name="test" class="w-3.5 h-3.5" /></button>
                 <button v-if="account.provider === 'custom'" class="icon-btn" title="编辑自定义上游" @click="customAccount = account"><Icon name="config" class="w-3.5 h-3.5" /></button>
-                <button class="icon-btn" title="校验账号并刷新真实额度" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
-                <button class="switch" :class="account.status === 'active' && 'on'" :disabled="!['active','disabled'].includes(account.status)" :title="account.status === 'disabled' ? '启用账号' : (account.status === 'active' ? '停用账号' : `${statusLabel(account.status)}状态不可手动切换`)" @click="toggleAccount(account)"><span></span></button>
+                <button class="icon-btn" :title="account.provider === 'dola' ? '重新验证协议会话（不生成视频）' : '校验账号并刷新真实额度'" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
+                <button class="switch" :class="(account.provider === 'dola' ? account.status !== 'disabled' : account.status === 'active') && 'on'" :disabled="account.provider !== 'dola' && !['active','disabled'].includes(account.status)" :title="account.status === 'disabled' ? '启用账号' : (account.provider === 'dola' || account.status === 'active' ? '停用账号' : `${statusLabel(account.status)}状态不可手动切换`)" @click="toggleAccount(account)"><span></span></button>
                 <button class="icon-btn danger" title="删除账号" @click="removeAccount(account)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
               </div></td>
             </tr>
@@ -420,7 +432,7 @@ onMounted(() => { load(); loadModels() })
     <div v-if="importing" class="modal-bg" @click.self="closeImportModal">
       <form class="modal-card" @submit.prevent="importAccount">
         <div class="flex items-center justify-between"><h3 class="font-semibold text-white/90">导入账号</h3><button type="button" @click="closeImportModal"><Icon name="close" class="w-4 h-4" /></button></div>
-        <p class="text-[11px] leading-5 text-white/45">自动识别 CPA / Sub2API JSON、ChatGPT / Runway / Grok JWT、Adobe / BytePlus Cookie、OreateAI 账号 JSON，以及多行混合凭据。全粘进来即可，无需任何前缀或平台选择。</p>
+        <p class="text-[11px] leading-5 text-white/45">自动识别 CPA / Sub2API JSON、ChatGPT / Runway / Grok JWT、Adobe / BytePlus / Dola Cookie、OreateAI 账号 JSON，以及多行混合凭据。全粘进来即可，无需任何前缀或平台选择。</p>
 
         <input ref="fileInput" type="file" accept=".json,.zip,application/json,application/zip" multiple class="hidden" @change="selectImportFiles" />
         <div class="file-picker">

@@ -66,6 +66,24 @@ func (r *TokenRepository) Get(ctx context.Context, pool, id string) (*model.Toke
 
 // GetByPoolEmail finds an account in a pool by its account_email (the logical
 // identity for import dedup). Returns (nil, nil) when none / email is blank.
+func (r *TokenRepository) GetByIdentityHash(ctx context.Context, pool, identityHash string) (*model.TokenAccount, error) {
+	identityHash = strings.TrimSpace(identityHash)
+	if identityHash == "" {
+		return nil, nil
+	}
+	var item model.TokenAccount
+	err := r.db.WithContext(ctx).
+		Where("pool = ? AND identity_hash = ?", pool, identityHash).
+		First(&item).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
 func (r *TokenRepository) GetByPoolEmail(ctx context.Context, pool, email string) (*model.TokenAccount, error) {
 	email = strings.TrimSpace(email)
 	if email == "" {
@@ -88,6 +106,88 @@ func (r *TokenRepository) Create(ctx context.Context, item *model.TokenAccount) 
 	return r.db.WithContext(ctx).Create(item).Error
 }
 
+// UpsertOreateByIdentity inserts one Oreate credential or rotates the existing
+// row with the same upstream identity. The unique identity index makes concurrent
+// raw-cookie imports converge on one durable account.
+func (r *TokenRepository) UpsertOreateByIdentity(ctx context.Context, item *model.TokenAccount, metaPatch map[string]any) (*model.TokenAccount, bool, error) {
+	if item == nil || item.Pool != "oreate" || strings.TrimSpace(item.IdentityHash) == "" {
+		return nil, false, errors.New("oreate identity is required")
+	}
+	if err := r.Create(ctx, item); err == nil {
+		return item, true, nil
+	} else if !errors.Is(err, gorm.ErrDuplicatedKey) {
+		return nil, false, err
+	}
+	existing, err := r.GetByIdentityHash(ctx, "oreate", item.IdentityHash)
+	if err != nil || existing == nil {
+		return nil, false, err
+	}
+	patch := map[string]any{
+		"value":         item.Value,
+		"status":        item.Status,
+		"dead":          false,
+		"fails":         0,
+		"identity_hash": item.IdentityHash,
+	}
+	if strings.TrimSpace(item.AccountEmail) != "" {
+		patch["account_email"] = item.AccountEmail
+	}
+	if err := r.UpdateMergingMeta(ctx, "oreate", existing.ID, metaPatch, patch); err != nil {
+		return nil, false, err
+	}
+	updated, err := r.Get(ctx, "oreate", existing.ID)
+	return updated, false, err
+}
+
+// UpsertDolaByIdentity inserts one Dola credential or rotates the existing row
+// with the same sessionid identity, converging concurrent imports the same way
+// the Oreate upsert does.
+func (r *TokenRepository) UpsertDolaByIdentity(ctx context.Context, item *model.TokenAccount, metaPatch map[string]any) (*model.TokenAccount, bool, error) {
+	if item == nil || item.Pool != "dola" || strings.TrimSpace(item.IdentityHash) == "" {
+		return nil, false, errors.New("dola identity is required")
+	}
+	if err := r.Create(ctx, item); err == nil {
+		return item, true, nil
+	} else if !errors.Is(err, gorm.ErrDuplicatedKey) {
+		return nil, false, err
+	}
+	existing, err := r.GetByIdentityHash(ctx, "dola", item.IdentityHash)
+	if err != nil || existing == nil {
+		return nil, false, err
+	}
+	patch := map[string]any{
+		"value":         item.Value,
+		"status":        item.Status,
+		"dead":          false,
+		"fails":         0,
+		"identity_hash": item.IdentityHash,
+	}
+	if err := r.UpdateMergingMeta(ctx, "dola", existing.ID, metaPatch, patch); err != nil {
+		return nil, false, err
+	}
+	updated, err := r.Get(ctx, "dola", existing.ID)
+	return updated, false, err
+}
+
+// RotateOreateSession atomically persists a browser-observed Cookie only while
+// the account still contains the credential used to open that browser. A stale
+// page therefore cannot overwrite a newer manual import.
+func (r *TokenRepository) RotateOreateSession(ctx context.Context, id, expectedValue, replacementValue string, metaPatch map[string]any) (bool, error) {
+	raw, err := json.Marshal(metaPatch)
+	if err != nil {
+		return false, err
+	}
+	result := r.db.WithContext(ctx).
+		Model(&model.TokenAccount{}).
+		Where("pool = ? AND id = ? AND value = ?", "oreate", id, expectedValue).
+		Updates(map[string]any{
+			"value":      replacementValue,
+			"meta":       gorm.Expr("COALESCE(meta, '{}'::jsonb) || CAST(? AS jsonb)", string(raw)),
+			"updated_at": time.Now(),
+		})
+	return result.RowsAffected == 1, result.Error
+}
+
 func (r *TokenRepository) Update(ctx context.Context, pool, id string, patch map[string]any) (*model.TokenAccount, error) {
 	patch["updated_at"] = time.Now()
 	if err := r.db.WithContext(ctx).
@@ -97,6 +197,26 @@ func (r *TokenRepository) Update(ctx context.Context, pool, id string, patch map
 		return nil, err
 	}
 	return r.Get(ctx, pool, id)
+}
+
+// UpdateMergingMetaIfGeneration fences asynchronous work started for an older
+// credential import while atomically merging unrelated metadata.
+func (r *TokenRepository) UpdateMergingMetaIfGeneration(ctx context.Context, pool, id, generationKey, expectedGeneration string, metaPatch map[string]any, patch map[string]any) (bool, error) {
+	raw, err := json.Marshal(metaPatch)
+	if err != nil {
+		return false, err
+	}
+	updates := make(map[string]any, len(patch)+2)
+	for key, value := range patch {
+		updates[key] = value
+	}
+	updates["meta"] = gorm.Expr("COALESCE(meta, '{}'::jsonb) || CAST(? AS jsonb)", string(raw))
+	updates["updated_at"] = time.Now()
+	result := r.db.WithContext(ctx).
+		Model(&model.TokenAccount{}).
+		Where("pool = ? AND id = ? AND meta ->> ? = ?", pool, id, generationKey, expectedGeneration).
+		Updates(updates)
+	return result.RowsAffected == 1, result.Error
 }
 
 // UpdateMergingMeta atomically merges selected JSON keys while updating any

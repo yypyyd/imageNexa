@@ -18,7 +18,8 @@
 .env.local
 .env.*.local
 /backend/.env
-api_test_video.py       # hardcoded API key
+# Private manual API probe
+/api_test_video.py
 
 # ======================================================================
 # Secrets / captures / clutter — MUST NOT be published
@@ -40,6 +41,10 @@ node_modules/
 /frontend/dist/
 /frontend/.vite/
 /.playwright-cli/
+/.playwright-mcp/
+/.ace-tool/
+/.workbuddy/
+/.zcode/
 
 # Go build/module caches (regenerated)
 .gocache/

@@ -32,6 +32,7 @@ import (
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/custom"
+	"backend/internal/provider/dola"
 	"backend/internal/provider/grok"
 	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
@@ -133,6 +134,7 @@ const (
 	maxReferenceImageBytes = 20 * 1024 * 1024
 	maxReferenceVideoBytes = 200 * 1024 * 1024
 	maxReferenceAudioBytes = 50 * 1024 * 1024
+	videoGenerationTimeout = 35 * time.Minute
 )
 
 type V1Service struct {
@@ -148,6 +150,7 @@ type V1Service struct {
 	runway   *runway.Client
 	grok     *grok.Client
 	oreate   *oreate.Client
+	dola     *dola.Client
 	custom   *custom.Client
 	store    *storage.Client
 	proxyMu  sync.RWMutex
@@ -419,7 +422,7 @@ type MediaReference struct {
 	Filename    string
 }
 
-func NewV1Service(cfg *config.Config, models *repo.ModelRepository, apiKeys *APICredentialService, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, conc *ConcurrencyService, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, store *storage.Client) *V1Service {
+func NewV1Service(cfg *config.Config, models *repo.ModelRepository, apiKeys *APICredentialService, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, conc *ConcurrencyService, adobeClient *adobe.Client, bytePlusClient *byteplus.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, grokClient *grok.Client, oreateClient *oreate.Client, dolaClient *dola.Client, customClient *custom.Client, store *storage.Client) *V1Service {
 	service := &V1Service{
 		cfg:      cfg,
 		models:   models,
@@ -434,6 +437,7 @@ func NewV1Service(cfg *config.Config, models *repo.ModelRepository, apiKeys *API
 		runway:   runwayClient,
 		grok:     grokClient,
 		oreate:   oreateClient,
+		dola:     dolaClient,
 		custom:   customClient,
 		store:    store,
 		inflight: &InflightRegistry{},
@@ -491,6 +495,18 @@ func (s *V1Service) setProviderProxy(proxy string) string {
 	}
 	if s.oreate != nil {
 		s.oreate.SetProxy(proxy)
+	}
+	if s.dola != nil {
+		s.dola.SetProxy(proxy)
+		// Dola's sticky per-account exits come from a dedicated session API so the
+		// shared proxy.url stays a real proxy for every other provider.
+		sessionAPI := ""
+		if s.settings != nil {
+			if value, err := s.settings.GetValue(context.Background(), "proxy.dola.session_api"); err == nil {
+				sessionAPI = strings.TrimSpace(value)
+			}
+		}
+		s.dola.SetSessionAPI(sessionAPI)
 	}
 	return strings.TrimSpace(proxy)
 }
@@ -687,86 +703,6 @@ func unionStrings(dst, src []string) []string {
 		}
 	}
 	return dst
-}
-
-func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[string]any {
-	entry := map[string]any{
-		"id":            item.EffectiveName(),
-		"object":        "model",
-		"created":       created,
-		"owned_by":      "2api",
-		"shutdown_date": nil,
-	}
-	if !extended {
-		return entry
-	}
-	entry["kind"] = item.Type
-	entry["type"] = item.Type
-	ratios := repo.JSONRatios(item.Ratios)
-	resolutions := repo.JSONStrings(item.Resolutions)
-	// Different downstream model importers use either the explicit
-	// `supported_*` names or the shorter catalog names. Return both aliases so
-	// capability UIs do not silently drop ratios/resolutions.
-	entry["supported_ratios"] = ratios
-	entry["ratios"] = ratios
-	// Some downstream catalog importers use the public settings schema's
-	// camelCase names instead of the snake_case/OpenAI aliases above. Keep
-	// both representations in the extended model response so capabilities are
-	// not silently reduced during import (for example, Grok image ratios).
-	entry["aspectRatios"] = ratios
-	entry["supported_resolutions"] = resolutions
-	entry["resolutions"] = resolutions
-	entry["resolutionTiers"] = resolutions
-	entry["modality"] = item.Type
-	entry["name"] = item.EffectiveName()
-	operations := []string{}
-	switch item.Type {
-	case "image":
-		operations = append(operations, "generation")
-		if item.ImageToImage {
-			operations = append(operations, "edit")
-		}
-	case "video":
-		operations = append(operations, "generation")
-	case "audio":
-		operations = append(operations, "speech")
-	default:
-		operations = append(operations, "completion")
-	}
-	entry["operations"] = operations
-	// Reference-image capabilities are part of model discovery as well as
-	// request validation. Clients use these fields to render the correct number
-	// of upload slots and to distinguish ordered frames from unordered assets.
-	entry["max_reference_images"] = max(0, item.MaxReferenceImages)
-	entry["max_reference_videos"] = max(0, item.MaxReferenceVideos)
-	entry["max_reference_audios"] = max(0, item.MaxReferenceAudios)
-	entry["max_reference_media"] = max(0, item.MaxReferenceMedia)
-	entry["supports_audio_output"] = item.SupportsAudioOutput
-	entry["reference_mode"] = defaultString(strings.TrimSpace(item.ReferenceMode), "none")
-	entry["maxReferenceImages"] = max(0, item.MaxReferenceImages)
-	entry["maxReferenceVideos"] = max(0, item.MaxReferenceVideos)
-	entry["maxReferenceAudios"] = max(0, item.MaxReferenceAudios)
-	entry["maxReferenceMedia"] = max(0, item.MaxReferenceMedia)
-	entry["supportsAudioOutput"] = item.SupportsAudioOutput
-	entry["referenceMode"] = defaultString(strings.TrimSpace(item.ReferenceMode), "none")
-	entry["durations"] = repo.JSONStrings(item.Durations)
-	// Video models expose their selectable clip lengths (the /v1/videos
-	// `seconds` param) so a key holder can discover them, e.g. ["5s","8s"].
-	// Prefer the explicit durations list; fall back to the priced tiers.
-	if item.Type == "video" {
-		durations := repo.JSONStrings(item.Durations)
-		if len(durations) == 0 {
-			for d := range item.DurationPrices {
-				durations = append(durations, d)
-			}
-			sort.Strings(durations)
-		}
-		entry["supported_durations"] = durations
-		entry["durations"] = durations
-		entry["supportedDurations"] = durations
-		entry["durationTiers"] = durations
-	}
-	return entry
 }
 
 // PrepareChatCompletion validates and bills an OpenAI-compatible chat request,
@@ -1957,7 +1893,7 @@ func (s *V1Service) prepareAdminVideoTest(ctx context.Context, in V1VideoRequest
 	if err != nil {
 		return nil, err
 	}
-	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
+	genCtx, cancel := context.WithTimeout(ctx, videoGenerationTimeout)
 	defer cancel()
 	s.inflight.Add(eventID, cancel)
 	defer s.inflight.Done(eventID)
@@ -2093,7 +2029,7 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		}
 		defer s.credentialRelease(context.WithoutCancel(ctx), principal.Credential.ID, slot)
 	}
-	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
+	genCtx, cancel := context.WithTimeout(ctx, videoGenerationTimeout)
 	defer cancel()
 	s.inflight.Add(eventID, cancel)
 	defer s.inflight.Done(eventID)
@@ -2404,6 +2340,10 @@ func (s *V1Service) assetAllowedHosts(ctx context.Context, ev *model.EventLog) (
 		return staticAssetHosts("runway"), nil
 	case "oreate":
 		return staticAssetHosts("oreate"), nil
+	case "dola":
+		// Dola video artifacts rotate across ByteDance VOD hosts; an empty list
+		// keeps netguard's scheme/IP hardening as the only gate.
+		return nil, nil
 	case "custom":
 		account, err := s.tokens.Get(ctx, "custom", ev.AccountID)
 		if err != nil || account == nil {
@@ -2433,16 +2373,27 @@ func staticAssetHosts(provider string) []string {
 }
 
 func downloadPublicArtifact(ctx context.Context, rawURL string, allowedHosts []string, bearer string, kind netguard.MediaKind, maxBytes int64) ([]byte, string, error) {
+	return downloadPublicArtifactWithProxy(ctx, rawURL, allowedHosts, bearer, kind, maxBytes, "")
+}
+
+func downloadPublicArtifactWithProxy(ctx context.Context, rawURL string, allowedHosts []string, bearer string, kind netguard.MediaKind, maxBytes int64, proxyRaw string) ([]byte, string, error) {
 	assetURL, err := netguard.ValidateAssetURL(ctx, rawURL, allowedHosts)
 	if err != nil {
 		return nil, "", err
 	}
-	client, err := globalProxyHTTPClient("", 5*time.Minute)
+	client, err := globalProxyHTTPClient(proxyRaw, 5*time.Minute)
 	if err != nil {
 		return nil, "", err
 	}
-	if err := netguard.HardenHTTPClient(client, allowedHosts); err != nil {
-		return nil, "", err
+	if strings.TrimSpace(proxyRaw) == "" {
+		if err := netguard.HardenHTTPClient(client, allowedHosts); err != nil {
+			return nil, "", err
+		}
+	} else {
+		// Forward proxies resolve the destination themselves, so IP pinning cannot
+		// be applied locally. Keep the public-URL preflight above and validate every
+		// redirect before allowing the proxy to follow it.
+		client.CheckRedirect = netguard.CheckRedirect(allowedHosts)
 	}
 	originalHost := strings.ToLower(assetURL.Hostname())
 	baseRedirectCheck := client.CheckRedirect
@@ -3217,6 +3168,10 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 	retry bool,
 ) ([]byte, bool, bool, error) {
 	routeID := dispatchRouteFromContext(ctx)
+	if plan, ok := dispatchPlanFromContext(ctx); ok && pool == "dola" {
+		plan.QuotaDay = time.Now()
+		ctx = context.WithValue(ctx, dispatchRouteKey, plan)
+	}
 	fresh, validationErr := s.revalidateDispatchAccount(ctx, pool, token.ID, kind, retry)
 	if validationErr != nil {
 		return nil, errors.Is(validationErr, ErrNoProviderAccount) || routeFailoverSafe(validationErr), false, validationErr
@@ -3246,6 +3201,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			if binding, bindingErr := s.models.Routes().AccountRoute(ctx, token.ID, routeID); bindingErr == nil && strings.TrimSpace(binding.QuotaBucketKey) != "" {
 				bucketKey = strings.TrimSpace(binding.QuotaBucketKey)
 			}
+			bucketKey = dispatchQuotaBucket(plan, bucketKey)
 			if bucketKey != "" && plan.Cost > 0 {
 				unit := "credits"
 				if policy, ok := model.DecodeQuotaCostPolicy(plan.Route.QuotaCosts); ok && strings.TrimSpace(policy.Unit) != "" {
@@ -3253,6 +3209,10 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				}
 				reservation, startErr = s.models.Quotas().ReserveWithUnit(context.WithoutCancel(ctx), eventID, dispatchID, token.ID, bucketKey, unit, plan.Cost)
 				if startErr != nil {
+					if !errors.Is(startErr, repo.ErrQuotaUnavailable) {
+						recordBookkeepingError("finish failed quota reservation", s.models.Dispatch().Finish(context.WithoutCancel(ctx), dispatchID, "failed", "temporary", "", errors.New("quota reservation unavailable")))
+						return nil, false, false, startErr
+					}
 					quotaErr := providerQuotaError(pool, startErr)
 					recordBookkeepingError("finish rejected quota dispatch", s.models.Dispatch().Finish(context.WithoutCancel(ctx), dispatchID, "failed", "quota", "", publicGenerationError(quotaErr)))
 					return nil, true, false, quotaErr
@@ -3274,7 +3234,11 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 		state, failureClass := dispatchFailureClass(err)
 		if reservation != nil {
 			quotaCtx := context.WithoutCancel(ctx)
-			if errors.Is(err, byteplus.ErrRetryableTaskFailed) && !bytePlusBetaRetryVerified(err) {
+			if errors.Is(err, dola.ErrTaskAccepted) {
+				// A terminal content rejection still consumed an accepted attempt.
+				// Closing its dispatch must not refund the daily generation.
+				recordBookkeepingError("settle accepted Dola dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
+			} else if errors.Is(err, byteplus.ErrRetryableTaskFailed) && !bytePlusBetaRetryVerified(err) {
 				// The task is definitely terminal, so close its dispatch; without a
 				// no-charge proof, settle rather than refund the reservation.
 				recordBookkeepingError("settle unverified beta dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
@@ -3369,6 +3333,10 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 }
 
 func dispatchUpstreamTaskID(err error) string {
+	var dolaErr *dola.VideoSubmissionError
+	if errors.As(err, &dolaErr) {
+		return dolaErr.ConversationID
+	}
 	if err == nil {
 		return ""
 	}
@@ -3389,6 +3357,8 @@ func providerQuotaError(pool string, cause error) error {
 		return fmt.Errorf("%w: %w", grok.ErrQuotaExhausted, cause)
 	case "oreate":
 		return fmt.Errorf("%w: %w", oreate.ErrQuotaExhausted, cause)
+	case "dola":
+		return fmt.Errorf("%w: %w", dola.ErrQuotaExhausted, cause)
 	case "custom":
 		return fmt.Errorf("%w: %w", custom.ErrQuotaExhausted, cause)
 	default:
@@ -4002,16 +3972,16 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 	s.rotateRoundRobin("oreate", active)
 	s.prioritizeOreate80CreditAccounts(active, requiredCredits)
 	var videoURL string
-	data, err := s.runPoolWithFailover(ctx, eventID, "oreate", active, "video", func(token model.TokenAccount) ([]byte, error) {
+	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "oreate", active, "video", func(token model.TokenAccount) ([]byte, error) {
 		blob, meta, genErr := s.oreate.GenerateVideo(ctx, oreateAccountFromToken(token), oreate.VideoOptions{
 			ModelID: upstreamModel, Prompt: in.Prompt, Ratio: aspectRatio, Resolution: resolution,
 			Duration: durationSeconds, Audio: in.GenerateAudio, DownloadResult: false,
 			ReferenceImages: imageRefs, ReferenceVideos: videoRefs,
 		})
 		if genErr != nil {
-			if errors.Is(genErr, oreate.ErrSpamUser) {
+			if errors.Is(genErr, oreate.ErrSpamUser) || errors.Is(genErr, oreate.ErrAccountChallenge) {
 				s.quarantineOreateSpamAccount(token.ID)
-				genErr = fmt.Errorf("%w (上游只对该账号的视频风控：同一 cookie 在 Oreate 官网仍能出图，已换号重试)", genErr)
+				genErr = fmt.Errorf("%w (上游要求该账号完成视频风控验证，已隔离并换号重试)", genErr)
 			}
 			return nil, genErr
 		}
@@ -4024,7 +3994,7 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 			}
 		}
 		return blob, nil
-	}, oreateErrClass, nil, false)
+	}, oreateErrClass, nil, false, false)
 	return data, videoURL, err
 }
 
@@ -4074,6 +4044,119 @@ func (s *V1Service) dropOreateSpamQuarantined(items []model.TokenAccount) []mode
 
 func isOreateTemporaryFailover(err error) bool {
 	return errors.Is(err, oreate.ErrTemporaryUpstream) || errors.Is(err, oreate.ErrRiskControl)
+}
+
+// generateDolaVideo runs Dola's chat-transport Seedance video flow. Dola
+// exposes daily free video allowance per account with no balance endpoint, so
+// quota is observed through refusal copy and failover moves to the next
+// cookie immediately.
+func (s *V1Service) generateDolaVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
+	if s.dola == nil {
+		return nil, "", errors.New("dola client not configured")
+	}
+	if len(in.ReferenceVideos) > 0 || len(in.ReferenceAudios) > 0 {
+		return nil, "", fmt.Errorf("%w: Dola video does not accept reference videos or audio", ErrUnsupportedParams)
+	}
+	decodedImages, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
+	if err != nil {
+		return nil, "", err
+	}
+	imageRefs := make([]dola.MediaReference, 0, len(decodedImages))
+	for i, data := range decodedImages {
+		contentType := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
+		switch contentType {
+		case "image/jpeg", "image/png", "image/webp":
+		default:
+			return nil, "", fmt.Errorf("%w: Dola reference images must be JPEG, PNG, or WebP", ErrUnsupportedParams)
+		}
+		imageRefs = append(imageRefs, dola.MediaReference{Data: data, ContentType: contentType, Filename: fmt.Sprintf("reference-image-%d", i+1)})
+	}
+	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = dola.DefaultVideoModel
+	}
+	requiredCredits, err := dola.RequiredCredits(durationSeconds)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
+	}
+	ctx = withDispatchCost(ctx, float64(requiredCredits))
+	if plan, ok := dispatchPlanFromContext(ctx); !ok || !plan.QuotaTracked {
+		return nil, "", errors.New("dola: metered dispatch route required")
+	}
+	s.applyGlobalProxy(ctx)
+	items, err := s.tokens.ListByPool(ctx, "dola")
+	if err != nil {
+		return nil, "", err
+	}
+	active := make([]model.TokenAccount, 0, len(items))
+	for _, item := range items {
+		if !model.DolaAccountReady(item) || item.Status != "active" || item.Dead || item.VideoLimited || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		active = append(active, item)
+	}
+	active = pinTestAccount(items, active, in.AccountID)
+	if len(active) == 0 {
+		return nil, "", ErrNoProviderAccount
+	}
+	s.rotateRoundRobin("dola", active)
+	var videoURL string
+	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "dola", active, "video", func(token model.TokenAccount) ([]byte, error) {
+		dolaAccount := dolaAccountFromToken(token)
+		proxyURL, proxyErr := s.dola.AccountProxy(ctx, dolaAccount)
+		if proxyErr != nil {
+			return nil, fmt.Errorf("%w: %v", dola.ErrTemporaryUpstream, proxyErr)
+		}
+		blob, meta, genErr := s.dola.GenerateVideo(ctx, dolaAccount, dola.VideoOptions{
+			ModelID:         upstreamModel,
+			Prompt:          in.Prompt,
+			Ratio:           aspectRatio,
+			Duration:        durationSeconds,
+			ReferenceImages: imageRefs,
+		})
+		if genErr != nil {
+			if !errors.Is(genErr, dola.ErrTaskAccepted) && !errors.Is(genErr, dola.ErrTaskSubmissionUnknown) &&
+				(errors.Is(genErr, dola.ErrAuth) || errors.Is(genErr, dola.ErrChallenge) || errors.Is(genErr, dola.ErrVideoNotReady)) {
+				state, detail := dolaReadinessVerdict(genErr)
+				bookkeeping, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				recordBookkeepingError("invalidate Dola readiness", s.tokens.InvalidateDolaReadiness(bookkeeping, token, state, detail))
+				cancel()
+			}
+			return nil, genErr
+		}
+		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
+		if downloadResult {
+			// Dola artifacts land on rotating ByteDance VOD hosts, so the host
+			// policy stays open to any public HTTPS endpoint and netguard's
+			// IP/scheme hardening carries the SSRF defence.
+			blob, _, genErr = downloadPublicArtifactWithProxy(ctx, videoURL, nil, "", netguard.MediaVideo, netguard.MaxVideoBytes, proxyURL)
+			if genErr != nil {
+				return nil, dola.AcceptedFailure(stringValue(meta["conversation_id"]), errGeneratedArtifactUnavailable)
+			}
+		}
+		return blob, nil
+	}, dolaErrClass, nil, false, false)
+	return data, videoURL, err
+}
+
+func dolaAccountFromToken(token model.TokenAccount) dola.Account {
+	account := dola.Account{ID: token.ID, Cookie: strings.TrimSpace(token.Value)}
+	if token.Meta != nil {
+		account.UserAgent = strings.TrimSpace(stringValue(token.Meta["user_agent"]))
+	}
+	return account
+}
+
+func dolaErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	if errors.Is(err, dola.ErrChallenge) || errors.Is(err, dola.ErrTaskAccepted) || errors.Is(err, dola.ErrTaskSubmissionUnknown) {
+		// A slide challenge needs interactive verification on this exact session.
+		// Do not rotate through other accounts or resubmit the generation.
+		return false, false, false, false
+	}
+	return errors.Is(err, dola.ErrAuth),
+		errors.Is(err, dola.ErrQuotaExhausted),
+		errors.Is(err, dola.ErrTemporaryUpstream),
+		false
 }
 
 // isDead is never reported: a spam-user verdict is a reversible upstream state,
@@ -4628,27 +4711,6 @@ func byteplusNoResubmit(err error) bool {
 	return errors.Is(err, byteplus.ErrTaskAccepted) || errors.Is(err, byteplus.ErrTaskSubmissionUnknown)
 }
 
-func mapBytePlusImageError(err error) error {
-	// Explicit terminal business outcomes remain user-visible even when the task
-	// was already accepted. The no-resubmit marker controls scheduling only.
-	switch {
-	case errors.Is(err, byteplus.ErrQuotaExhausted):
-		return ErrProviderQuota
-	case errors.Is(err, byteplus.ErrRiskControl):
-		return fmt.Errorf("%w: %v", ErrContentRejected, err)
-	case errors.Is(err, byteplus.ErrInvalidParams):
-		return fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
-	case byteplusNoResubmit(err):
-		return ErrProviderTemporary
-	case errors.Is(err, byteplus.ErrAuth):
-		return ErrProviderAuth
-	case errors.Is(err, byteplus.ErrTemporaryUpstream):
-		return ErrProviderTemporary
-	default:
-		return fmt.Errorf("%w: %v", ErrProviderExecution, err)
-	}
-}
-
 func (s *V1Service) refundIfNeeded(ctx context.Context, principal *APIPrincipal, eventID string, price float64) error {
 	return nil
 }
@@ -4667,31 +4729,6 @@ func ensureReferenceSizes(inputs []string) error {
 		if (len(v)*3)/4 > maxReferenceImageBytes {
 			return ErrReferenceTooLarge
 		}
-	}
-	return nil
-}
-
-func validateVideoReferenceLimits(modelItem *model.ModelConfig, in V1VideoRequest) error {
-	imageLimit := max(0, modelItem.MaxReferenceImages)
-	videoLimit := max(0, modelItem.MaxReferenceVideos)
-	audioLimit := max(0, modelItem.MaxReferenceAudios)
-	if len(in.ReferenceImages) > imageLimit {
-		return fmt.Errorf("%w: this model accepts at most %d reference images", ErrUnsupportedParams, imageLimit)
-	}
-	if len(in.ReferenceVideos) > videoLimit {
-		return fmt.Errorf("%w: this model accepts at most %d reference videos", ErrUnsupportedParams, videoLimit)
-	}
-	if len(in.ReferenceAudios) > audioLimit {
-		return fmt.Errorf("%w: this model accepts at most %d reference audios", ErrUnsupportedParams, audioLimit)
-	}
-	if totalLimit := max(0, modelItem.MaxReferenceMedia); totalLimit > 0 {
-		total := len(in.ReferenceImages) + len(in.ReferenceVideos) + len(in.ReferenceAudios)
-		if total > totalLimit {
-			return fmt.Errorf("%w: this model accepts at most %d reference media items in total", ErrUnsupportedParams, totalLimit)
-		}
-	}
-	if in.GenerateAudio && !modelItem.SupportsAudioOutput {
-		return fmt.Errorf("%w: this model does not support generated audio", ErrUnsupportedParams)
 	}
 	return nil
 }
@@ -4883,41 +4920,6 @@ func (s *V1Service) deaiEnabled(ctx context.Context) bool {
 		return false
 	}
 	return parseBoolSetting(raw, false)
-}
-
-// modelPrice returns the charge for (kind, resolution, duration). The set of
-// supported tiers is always driven by the NORMAL prices; `agent` only overrides
-// the amount with the agent price when one is set for that tier (else it falls
-// back to the normal price).
-func modelPrice(item *model.ModelConfig, kind, resolution, duration string, agent bool) (float64, bool) {
-	if item == nil {
-		return 0, false
-	}
-	// tierPrice: normal price gates support; agent price (if present) overrides.
-	tierPrice := func(normal, agentMap map[string]any, key string) (float64, bool) {
-		nv, ok := jsonMapFloat(normal, key)
-		if !ok {
-			return 0, false
-		}
-		if agent {
-			if av, aok := jsonMapFloat(agentMap, key); aok {
-				return av, true
-			}
-		}
-		return nv, true
-	}
-	if kind == "video" {
-		rv, rok := tierPrice(item.Prices, item.PricesAgent, resolution)
-		dv, dok := tierPrice(item.DurationPrices, item.DurationPricesAgent, duration)
-		if !rok || !dok {
-			return 0, false
-		}
-		return rv + dv, true
-	}
-	if kind == "text" {
-		return tierPrice(item.Prices, item.PricesAgent, "request")
-	}
-	return tierPrice(item.Prices, item.PricesAgent, resolution)
 }
 
 func jsonMapFloat(m map[string]any, key string) (float64, bool) {

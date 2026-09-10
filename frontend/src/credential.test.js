@@ -41,6 +41,14 @@ test('distinguishes ChatGPT, Runway, and Grok JWT claims', () => {
   ])
 })
 
+test('auto-detects Dola cookies by sessionid plus s_v_web_id', () => {
+  const cookie = 'sessionid=abc; sessionid_ss=abc; s_v_web_id=verify%2Fx; msToken=ENIAMtoken; ttwid=1%7Cx'
+  const imports = parseCredentialImports(cookie)
+  assert.equal(imports.length, 1)
+  assert.equal(imports[0].provider, 'dola')
+  assert.equal(imports[0].credential, cookie)
+})
+
 test('auto-detects BytePlus, OreateAI, and Adobe cookies', () => {
   const imports = parseCredentialImports([
     'csrfToken=csrf; sessionid=session',
@@ -48,6 +56,17 @@ test('auto-detects BytePlus, OreateAI, and Adobe cookies', () => {
     'AdobeAuth=opaque; other=value',
   ].join('\n'))
   assert.deepEqual(imports.map((item) => item.provider), ['byteplus', 'oreate', 'adobe'])
+})
+
+test('recognizes Passport login-only Dola exports without a fingerprint cookie', () => {
+  const cookie = 'passport_csrf_token=test; sid_guard=guard; sid_tt=session; sessionid=session; store-idc=mya; store-country-code=hk'
+  for (const input of [cookie, JSON.stringify({ cookie }), JSON.stringify(cookie.split('; ').map(pair => {
+    const [name, value] = pair.split('='); return { name, value }
+  }))]) {
+    assert.deepEqual(parseCredentialImports(input), [{ provider: 'dola', credential: cookie }])
+  }
+  assert.notEqual(parseCredentialImports('sessionid=session; sid_tt=other; sid_guard=guard; passport_csrf_token=test; store-idc=mya')[0].provider, 'dola')
+  assert.notEqual(parseCredentialImports('sessionid=session; passport_csrf_token=test')[0].provider, 'dola')
 })
 
 test('treats a browser cookie array as one account', () => {
