@@ -100,8 +100,8 @@ onMounted(load)
   <section class="space-y-4">
     <div class="flex items-start justify-between gap-4">
       <div>
-        <h2 class="text-xl font-semibold text-white/90">统一模型与路由</h2>
-        <p class="mt-1 text-xs text-white/40">下游只看到 canonical ID；Provider 和上游模型仅用于内部调度。</p>
+        <h2 class="text-xl font-semibold text-white/90">模型与渠道</h2>
+        <p class="mt-1 text-xs text-white/40">同一产品按渠道拆成独立公开 ID；下游选择模型即选择渠道，不再跨 Provider 合并调度。</p>
       </div>
       <button class="btn-soft" :disabled="loading" @click="load"><Icon name="refresh" class="w-3.5 h-3.5" />刷新</button>
     </div>
@@ -132,7 +132,7 @@ onMounted(load)
           <span class="kind" :class="`kind-${model.kind || model.type || MODEL_KIND[model.id]}`">{{ model.kind || model.type || MODEL_KIND[model.id] }}</span>
           <div class="min-w-0 flex-1">
             <div class="font-mono text-xs text-white/90 truncate">{{ model.id }}</div>
-            <div class="mt-1 text-[10px] text-white/35">{{ (model.routes || []).filter((r) => r.enabled !== false).length }} / {{ (model.routes || []).length }} 路由已启用</div>
+            <div class="mt-1 text-[10px] text-white/35">{{ model.name }} · {{ (model.routes || []).filter((r) => r.enabled !== false).length }} / {{ (model.routes || []).length }} 路由已启用</div>
           </div>
           <button class="test-action" title="测试生成（选择具体账号）" @click="testingModel = model"><Icon name="test" class="w-3.5 h-3.5" /></button>
           <button class="switch" :class="model.enabled !== false && 'on'" :disabled="saving === `model:${model.id}`" @click="toggleModel(model)"><span></span></button>

@@ -71,7 +71,7 @@ onMounted(load)
     <div class="flex items-start justify-between gap-4">
       <div>
         <h2 class="text-xl font-semibold text-white/90">2API 运行概况</h2>
-        <p class="mt-1 text-xs text-white/40">统一模型路由、账号额度和下游 API Key 的实时摘要。</p>
+        <p class="mt-1 text-xs text-white/40">按渠道拆分的模型目录、账号额度和下游 API Key 的实时摘要。</p>
       </div>
       <button class="btn-soft" :disabled="loading" @click="load"><Icon name="refresh" class="w-3.5 h-3.5" />刷新</button>
     </div>

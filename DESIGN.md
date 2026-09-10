@@ -1,21 +1,21 @@
 # 2API Design
 
 Status: locked product architecture
-Last updated: 2026-09-10
+Last updated: 2026-09-11
 
 ## 1. Goals and boundaries
 
-2API is an OpenAI-compatible data plane plus a singleton super-administrator control plane. It exposes text, image, image-edit, and video generation while hiding provider-specific protocols, credentials, model names, and account selection.
+2API is an OpenAI-compatible data plane plus a singleton super-administrator control plane. It exposes text, image, image-edit, and video generation while hiding provider-specific protocols, credentials, upstream model names, and account selection.
 
 The design has five fixed goals:
 
 1. One downstream authentication scheme: `Authorization: Bearer sk-*`.
-2. One closed set of canonical model IDs shared by every provider route.
+2. One closed set of canonical model IDs. When the same product is offered by more than one provider, each provider has its own public ID.
 3. Model-aware, quota-aware scheduling across multiple upstream accounts.
 4. Durable dispatch and quota state that remains correct under concurrency and ambiguous upstream outcomes.
 5. One super administrator with the smallest practical web control surface.
 
-There is no public application role. The browser UI is an administrator console only. Provider adapters may evolve, but they cannot enlarge the public model catalog or introduce provider-prefixed API IDs without an explicit product migration.
+There is no public application role. The browser UI is an administrator console only. Provider adapters may evolve, but they cannot enlarge the public model catalog without an explicit product migration.
 
 ## 2. System context
 
@@ -97,19 +97,19 @@ The catalog is versioned data, not a user-extensible namespace. Startup settings
 
 ### Image
 
-`gpt-image-2`, `seedream-5.0-pro`, `seedream-5.0-lite`, `nano-banana-2`, `nano-banana-pro`, `grok-imagine-image`
+`chatgpt-gpt-image-2`, `byteplus-gpt-image-2`, `adobe-gpt-image-2`, `seedream-5.0-pro`, `seedream-5.0-lite`, `byteplus-nano-banana-2`, `adobe-nano-banana-2`, `byteplus-nano-banana-pro`, `adobe-nano-banana-pro`, `grok-imagine-image`
 
 ### Video
 
-`kling-3`, `kling-o3`, `seedance-2.0`, `seedance-2.0-fast`, `seedance-2.0-mini`, `seedance-1.5-pro`, `seedance-2.5`, `grok-imagine-video`, `firefly-video`
+`kling-3`, `kling-o3`, `adobe-seedance-2.0`, `oreate-seedance-2.0`, `adobe-seedance-2.0-fast`, `oreate-seedance-2.0-fast`, `seedance-2.0-mini`, `seedance-1.5-pro`, `oreate-seedance-2.5`, `dola-seedance-2.5`, `grok-imagine-video`, `firefly-video`
 
-A provider implementation is represented by a `ModelRoute`, not by another public model. For example, `gpt-image-2` may have ChatGPT, BytePlus, and Adobe routes, but clients always request `gpt-image-2`. Likewise, multiple providers can serve `nano-banana-2` without introducing prefixed aliases.
+A provider implementation is represented by a `ModelRoute`. When a product exists on more than one provider, clients request a provider-prefixed public ID such as `chatgpt-gpt-image-2` or `byteplus-gpt-image-2`. Single-provider products keep unprefixed IDs. Retired merged IDs such as `gpt-image-2` and `seedance-2.5` return `model_not_found`.
 
 ## 5. Routing data model
 
 ### `LogicalModel`
 
-The only model identity visible to downstream clients. It stores canonical ID, kind, display name, enabled state, ordering weight, and generation count.
+The only model identity visible to downstream clients. It stores canonical ID, kind, display name, enabled state, ordering weight, and generation count. Multi-provider products use one logical model per provider.
 
 ### `ModelRoute`
 
@@ -161,7 +161,7 @@ For each request, the scheduler performs these steps in order:
 
 When a model has multiple routes, make a non-waiting pass across them before queueing on capacity. Only full routes are revisited within one shared 90-second wait; failed routes do not enter a repeated cross-route submit loop. Single-route requests retain their bounded temporary retry, and the verified BytePlus beta chain retains its separate six-distinct-account budget. Queue polling uses jitter and batches capacity reads; per-request account snapshots refresh at most once per second, while each actual admission is revalidated. Equal ranked accounts preserve the distributed round-robin order. Concurrency cleanup uses an independent three-second context so cancelled work cannot leak a slot until its 15-minute lease expires. Capacity observation uses Redis time and never deletes leases.
 
-Provider names are never client-selectable. A Custom provider account may implement an existing canonical route, but it must bind at least one catalog model and cannot create a new public ID.
+Clients select a channel by requesting that channel's public model ID. Runway and Custom are not published as public channels in this split. Custom bindings on retired merged IDs are not cloned onto the new IDs. Custom cannot substitute the Dola-only `dola-seedance-2.5` model.
 
 ## 7. Model-aware quota scheduling
 
@@ -467,3 +467,11 @@ Dola 的发布验证重点包括请求结构、时长限制、导入识别、就
 按维护者要求移除 Go 测试源文件及专用夹具，数据库迁移合并到 `backend/internal/migrations/definitions.go`，不再保留独立 SQL 文件。合并保留原始 SQL 字节、版本、名称与 SHA-256 校验和，已有数据库继续按原规则校验和升级。新增迁移应追加版本，不能修改已应用的定义。
 
 后端 CI 改为编译、go vet 和 staticcheck；前端检查保留。Go 自动回归测试不再随源码发布，静态检查和编译不能替代行为验证。合并时已逐项核对全部 19 个迁移内容与校验和，并在移除测试源文件前通过现有迁移检查。
+
+### 2026-09-11 — Split multi-provider models onto per-channel public IDs
+
+**Change**: Stop merging multiple providers behind one public model ID. `gpt-image-2`, `nano-banana-2`, `nano-banana-pro`, `seedance-2.0`, `seedance-2.0-fast`, and `seedance-2.5` are retired. Clients now request provider-prefixed IDs such as `chatgpt-gpt-image-2`, `byteplus-nano-banana-pro`, and `oreate-seedance-2.5`. `dola-seedance-2.5` remains the only Dola video entry. Runway and Custom are not published in this split. Migration 000020 inserts the new logical models, re-points existing native ChatGPT/BytePlus/Adobe/Oreate routes (IDs unchanged), and leaves merged IDs plus leftover Runway/Custom routes as disabled tombstones when dispatch history still references them.
+
+**Reason**: Channels differ in ratio, resolution, duration, and reference limits. Unioning capabilities and failing over across providers hid those differences and made the public catalog look like a single product. Runway and Custom stay out of the public catalog until those channels are ready.
+
+**Impact**: The closed catalog is 26 models (4 text, 10 image, 12 video). Requests using a retired merged ID, `runway-nano-banana-2`, or `runway-nano-banana-pro` receive `model_not_found`. Scheduling fails over across accounts on the selected native channel only. Existing Custom bindings on merged IDs are not cloned onto the new IDs.

@@ -19,8 +19,8 @@ The product boundary is intentionally small:
 - Public `/v1` endpoints cover text, images, image edits, asynchronous image tasks, and videos.
 - There is exactly one super administrator and no public registration or end-user web application.
 - The console manages model routes, upstream accounts, API keys, logs, artifacts, banned words, and system settings.
-- The model catalog is closed. Clients neither use provider prefixes nor create model IDs.
-- Multiple providers or accounts may serve one canonical model without leaking provider details into the public API.
+- The model catalog is closed. Clients cannot create model IDs.
+- When the same product is offered by more than one provider, each channel has its own public ID instead of merging behind one `model` value.
 
 ## Authentication
 
@@ -65,7 +65,7 @@ Errors use the OpenAI shape:
 
 ## Closed Canonical Model Catalog
 
-`GET /v1/models` returns only these 19 public IDs. Provider model names and route IDs are internal adapter details and are invalid as API `model` values.
+`GET /v1/models` returns only these 26 public IDs. Channels that offer the same product are not merged. Runway and Custom are not public channels yet. Provider route IDs and upstream model names are invalid as API `model` values.
 
 ### Text (4)
 
@@ -74,30 +74,37 @@ Errors use the OpenAI shape:
 - `grok-4.5`
 - `grok-chat-fast`
 
-### Image (6)
+### Image (10)
 
-- `gpt-image-2`
+- `chatgpt-gpt-image-2`
+- `byteplus-gpt-image-2`
+- `adobe-gpt-image-2`
 - `seedream-5.0-pro`
 - `seedream-5.0-lite`
-- `nano-banana-2`
-- `nano-banana-pro`
+- `byteplus-nano-banana-2`
+- `adobe-nano-banana-2`
+- `byteplus-nano-banana-pro`
+- `adobe-nano-banana-pro`
 - `grok-imagine-image`
 
-### Video (9)
+### Video (12)
 
 - `kling-3`
 - `kling-o3`
-- `seedance-2.0`
-- `seedance-2.0-fast`
+- `adobe-seedance-2.0`
+- `oreate-seedance-2.0`
+- `adobe-seedance-2.0-fast`
+- `oreate-seedance-2.0-fast`
 - `seedance-2.0-mini`
 - `seedance-1.5-pro`
-- `seedance-2.5`
+- `oreate-seedance-2.5`
+- `dola-seedance-2.5` (Dola-only, 30 seconds)
 - `grok-imagine-video`
 - `firefly-video`
 
 ## Unified Routing and Account Scheduling
 
-Clients submit only a canonical model ID. 2API then:
+Clients submit the canonical model ID for the channel they want. 2API then:
 
 1. Filters routes by operation, aspect ratio, resolution, duration, and reference-media capabilities.
 2. Removes route-bound accounts that are disabled, cooling down, authentication-invalid, or known to lack enough quota. Eligible accounts currently at their concurrency limit stay at the tail so they can be used when a slot is released.
@@ -206,13 +213,13 @@ curl https://api.example.com/v1/images/generations \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: image-order-001" \
-  -d '{"model":"gpt-image-2","prompt":"Minimal product photography","size":"1024x1024"}'
+  -d '{"model":"chatgpt-gpt-image-2","prompt":"Minimal product photography","size":"1024x1024"}'
 
 # Image edit
 curl https://api.example.com/v1/images/edits \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Idempotency-Key: edit-order-001" \
-  -F "model=nano-banana-pro" \
+  -F "model=byteplus-nano-banana-pro" \
   -F "prompt=Replace the background with a studio backdrop" \
   -F "image=@reference.png"
 

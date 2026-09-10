@@ -34,7 +34,7 @@ Never commit the real `.env` or any provider credential. The backend imports Byt
 
 Migration definitions are compiled from `internal/migrations/definitions.go`; no separate SQL files or manual SQL execution are required. Existing migration names and checksums remain unchanged. Append new versions instead of editing applied definitions.
 
-Forward-only, checksummed migrations create administrator/API-credential identity, the 19-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Provider-account deletion cascades through its route bindings, quota buckets, and bucket-owned reservations, while event logs and nullable dispatch history remain. Startup refuses unknown or modified applied migrations. `AutoMigrate` is limited to compatible columns on retained operational tables and does not seed retired models.
+Forward-only, checksummed migrations create administrator/API-credential identity, the 26-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Provider-account deletion cascades through its route bindings, quota buckets, and bucket-owned reservations, while event logs and nullable dispatch history remain. Startup refuses unknown or modified applied migrations. `AutoMigrate` is limited to compatible columns on retained operational tables and does not seed retired models.
 
 ## Verification
 
@@ -49,13 +49,13 @@ Dola 视频只接受 `30s`，按每号每天 2 次计量。调度使用 `dola.vi
 
 每日 2 次上限按 **Dola 账号**独立计算，不是 API 用户或系统总并发限制。6 个 Dola 账号共可预占 12 次。并发槽位沿用原配置；目前浏览器提交有共享锁，生成结果轮询可重叠执行。
 
-公共模型发现：`dola-seedance-2.5` 由 000019 迁移注册，普通与 extended 模型列表均可获取。此入口仅匹配 Dola 路由（30s/720p/文生视频），不接受 custom 等其他 provider 替代；原 `seedance-2.5` 路由保持兼容。两入口共享日期额度桶，迁移保留原有绑定权限、冷却期和用量。
+公共模型发现：`dola-seedance-2.5` 由 000019 迁移注册，000020 起不再与 Oreate 的 `oreate-seedance-2.5` 合并。此入口仅匹配 Dola 路由（30s/720p/文生视频），不接受 custom 等其他 provider 替代。迁移保留原有绑定权限、冷却期和用量。
 
 ### Dola Cookie 导入与协议调度
 
 Dola 导入通过 HTTP 验证 Passport 登录态，再由 Alice 协议分配设备标识。生成请求使用本地 Node + jsdom 执行固定版本签名 SDK，通过 HTTP 提交新会话并查询成片，不启动浏览器，也不自动回退网页生成。验证只证明协议认证与签名可用，不承诺上游有额度或一定生成成功。
 
-每号默认并发 1、每天 2 次、只接受 30s/720p；两个模型入口共享次数。已提交或结果不明禁止自动重发。视频返回时检查上游实际时长，非 30 秒不会作为成功交付。账号页显示协议会话验证状态，临时失败最多 3 次、间隔 5/10 分钟重试。更新 Cookie、手动启用和重验均不重置每日次数。
+每号默认并发 1、每天 2 次、只接受 30s/720p。已提交或结果不明禁止自动重发。视频返回时检查上游实际时长，非 30 秒不会作为成功交付。账号页显示协议会话验证状态，临时失败最多 3 次、间隔 5/10 分钟重试。更新 Cookie、手动启用和重验均不重置每日次数。
 
 运行依赖 `node` 及 `scripts/dola-protocol` 内固定版本 SDK 和 npm lock；可用 `DOLA_PROTOCOL_DIR` 指定私有运行目录。签名在本地完成，不上传 Cookie 到签名服务。
 

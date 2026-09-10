@@ -14,6 +14,8 @@ const (
 var facePanelModels = map[string]bool{
 	"firefly-seedance-2":       true,
 	"firefly-seedance-2-fast":  true,
+	"adobe-seedance-2.0":       true,
+	"adobe-seedance-2.0-fast":  true,
 	"seedance20":               true,
 	"seedance20-fast":          true,
 	"sd2.0":                    true,

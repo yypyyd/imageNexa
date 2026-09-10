@@ -19,8 +19,8 @@
 - 对外提供 `/v1` 文本、图片、图片编辑、异步图片任务和视频接口。
 - 只保留一个超级管理员，不提供公开注册或公共用户前台。
 - 管理端负责模型 route、上游账号、API Key、日志、成品、违禁词和系统设置。
-- 模型目录是闭集。下游不使用 Provider 前缀，也不能自行创建模型 ID。
-- 同一个 canonical 模型可由多个 Provider/账号承载，Provider 细节不进入公共 API。
+- 模型目录是闭集。下游不能自行创建模型 ID。
+- 同一产品若有多个渠道，各自使用带渠道前缀的公开 ID，不再合并到同一个 `model` 值上。
 
 ## 鉴权
 
@@ -65,7 +65,7 @@ Authorization: Bearer sk-your-api-key
 
 ## Canonical 模型闭集
 
-`GET /v1/models` 只返回以下 20 个公共 ID。Provider 的上游模型名和 route ID 仅供内部适配，不能作为 API 的 `model` 值。
+`GET /v1/models` 只返回以下 26 个公共 ID。同一产品的多个渠道不会合并。Runway 和 Custom 暂不作为公开渠道。内部 route ID 和上游模型名不能作为 API 的 `model` 值。
 
 ### 文本（4）
 
@@ -74,31 +74,37 @@ Authorization: Bearer sk-your-api-key
 - `grok-4.5`
 - `grok-chat-fast`
 
-### 图片（6）
+### 图片（10）
 
-- `gpt-image-2`
+- `chatgpt-gpt-image-2`
+- `byteplus-gpt-image-2`
+- `adobe-gpt-image-2`
 - `seedream-5.0-pro`
 - `seedream-5.0-lite`
-- `nano-banana-2`
-- `nano-banana-pro`
+- `byteplus-nano-banana-2`
+- `adobe-nano-banana-2`
+- `byteplus-nano-banana-pro`
+- `adobe-nano-banana-pro`
 - `grok-imagine-image`
 
-### 视频（10）
+### 视频（12）
 
 - `kling-3`
 - `kling-o3`
-- `seedance-2.0`
-- `seedance-2.0-fast`
+- `adobe-seedance-2.0`
+- `oreate-seedance-2.0`
+- `adobe-seedance-2.0-fast`
+- `oreate-seedance-2.0-fast`
 - `seedance-2.0-mini`
 - `seedance-1.5-pro`
-- `seedance-2.5`
+- `oreate-seedance-2.5`
 - `dola-seedance-2.5`（Dola 专用，30 秒）
 - `grok-imagine-video`
 - `firefly-video`
 
 ## 统一路由与账号调度
 
-下游只提交 canonical 模型 ID。2API 会：
+下游只提交所选渠道的 canonical 模型 ID。2API 会：
 
 1. 按操作类型、比例、分辨率、时长和参考素材能力筛选可用 route。
 2. 在 route 绑定的账号中排除停用、冷却、鉴权失效或已知额度不足的账号；并发已满的合格账号保留在候选队尾，以便槽位释放后继续使用。
@@ -128,7 +134,7 @@ Cookie 和 ARP 都不会出现在账号列表、日志或 API 响应中。升级
 
 ## Dola 账号导入
 
-Dola（豆包国际版，dola.com）提供独立公共模型 `dola-seedance-2.5`，同时保留 `seedance-2.5` 的视频生成 route（上游即 Dreamina Seedance 2.5）。导入物是 dola.com 的完整浏览器 Cookie；Cookie 必须同时包含有效 `sessionid` 与 `s_v_web_id`（通常还带 `msToken`），粘贴到"账号"页或导入文本框即可自动识别为 Dola 凭据。同一 `sessionid` 重复导入会原位覆盖，不会新建重复账号。
+Dola（豆包国际版，dola.com）只通过公共模型 `dola-seedance-2.5` 提供视频（上游即 Dreamina Seedance 2.5），不再与 Oreate 的 `oreate-seedance-2.5` 合并。导入物是 dola.com 的完整浏览器 Cookie；Cookie 必须同时包含有效 `sessionid` 与 `s_v_web_id`（通常还带 `msToken`），粘贴到"账号"页或导入文本框即可自动识别为 Dola 凭据。同一 `sessionid` 重复导入会原位覆盖，不会新建重复账号。
 
 要求与限制：
 
@@ -230,13 +236,13 @@ curl https://api.example.com/v1/images/generations \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: image-order-001" \
-  -d '{"model":"gpt-image-2","prompt":"极简产品摄影","size":"1024x1024"}'
+  -d '{"model":"chatgpt-gpt-image-2","prompt":"极简产品摄影","size":"1024x1024"}'
 
 # 图片编辑
 curl https://api.example.com/v1/images/edits \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Idempotency-Key: edit-order-001" \
-  -F "model=nano-banana-pro" \
+  -F "model=byteplus-nano-banana-pro" \
   -F "prompt=把背景改成摄影棚" \
   -F "image=@reference.png"
 
@@ -286,13 +292,13 @@ DESIGN.md                架构、数据模型、安全边界与调度语义
 
 本项目基于 [MIT License](LICENSE) 开源。
 
-`GET /v1/models` 和 `GET /v1/models?extended=true` 均返回 `dola-seedance-2.5`。下游拉取后选择该模型即可固定使用 Dola 账号池，`POST /v1/videos` 参数为 `seconds: "30"`、`resolution: "720p"`，不接受参考媒体。原 `seedance-2.5` 保留自动路由；两个入口共享每个 Dola 账号每天 2 次额度，默认单号并发 1。
+`GET /v1/models` 和 `GET /v1/models?extended=true` 均返回 `dola-seedance-2.5`。下游拉取后选择该模型即可固定使用 Dola 账号池，`POST /v1/videos` 参数为 `seconds: "30"`、`resolution: "720p"`，不接受参考媒体。Oreate 使用独立的 `oreate-seedance-2.5`。每个 Dola 账号每天 2 次额度，默认单号并发 1。
 
 ### Dola Cookie 导入与协议调度
 
 Dola 导入通过 HTTP 验证 Passport 登录态，再由 Alice 协议分配设备标识。生成请求使用本地 Node + jsdom 执行固定版本签名 SDK，通过 HTTP 提交新会话并查询成片，不启动浏览器，也不自动回退网页生成。验证只证明协议认证与签名可用，不承诺上游有额度或一定生成成功。
 
-每号默认并发 1、每天 2 次、只接受 30s/720p；两个模型入口共享次数。已提交或结果不明禁止自动重发。视频返回时检查上游实际时长，非 30 秒不会作为成功交付。账号页显示协议会话验证状态，临时失败最多 3 次、间隔 5/10 分钟重试。更新 Cookie、手动启用和重验均不重置每日次数。
+每号默认并发 1、每天 2 次、只接受 30s/720p。已提交或结果不明禁止自动重发。视频返回时检查上游实际时长，非 30 秒不会作为成功交付。账号页显示协议会话验证状态，临时失败最多 3 次、间隔 5/10 分钟重试。更新 Cookie、手动启用和重验均不重置每日次数。
 
 运行依赖 `node` 及 `scripts/dola-protocol` 内固定版本 SDK 和 npm lock；可用 `DOLA_PROTOCOL_DIR` 指定私有运行目录。签名在本地完成，不上传 Cookie 到签名服务。
 

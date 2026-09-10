@@ -6,22 +6,29 @@ export const TEXT_MODELS = Object.freeze([
 ])
 
 export const IMAGE_MODELS = Object.freeze([
-  'gpt-image-2',
+  'chatgpt-gpt-image-2',
+  'byteplus-gpt-image-2',
+  'adobe-gpt-image-2',
   'seedream-5.0-pro',
   'seedream-5.0-lite',
-  'nano-banana-2',
-  'nano-banana-pro',
+  'byteplus-nano-banana-2',
+  'adobe-nano-banana-2',
+  'byteplus-nano-banana-pro',
+  'adobe-nano-banana-pro',
   'grok-imagine-image',
 ])
 
 export const VIDEO_MODELS = Object.freeze([
   'kling-3',
   'kling-o3',
-  'seedance-2.0',
-  'seedance-2.0-fast',
+  'adobe-seedance-2.0',
+  'oreate-seedance-2.0',
+  'adobe-seedance-2.0-fast',
+  'oreate-seedance-2.0-fast',
   'seedance-2.0-mini',
   'seedance-1.5-pro',
-  'seedance-2.5',
+  'oreate-seedance-2.5',
+  'dola-seedance-2.5',
   'grok-imagine-video',
   'firefly-video',
 ])

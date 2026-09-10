@@ -4875,7 +4875,8 @@ func resolveImageSize(item *model.ModelConfig, in V1ImageRequest) (string, strin
 
 func supportsQualityResolutionModel(modelID string) bool {
 	switch strings.ToLower(strings.TrimSpace(modelID)) {
-	case "gpt-image-2", "firefly-gpt-image-2", "lumina-gpt-image-2":
+	case "gpt-image-2", "firefly-gpt-image-2", "lumina-gpt-image-2",
+		"chatgpt-gpt-image-2", "byteplus-gpt-image-2", "adobe-gpt-image-2":
 		return true
 	default:
 		return false

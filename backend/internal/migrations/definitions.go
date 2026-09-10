@@ -1431,4 +1431,71 @@ var migrationSources = map[string]string{
 		"    'video.dola-seedance-2.5.dola',enabled,entitled,'dola.video.daily',cooldown_until\n" +
 		"FROM account_model_routes WHERE model_route_id='video.seedance-2.5.dola'\n" +
 		"ON CONFLICT (account_id,model_route_id) DO NOTHING;\n",
+	"000020_split_provider_public_models.sql": "-- Split merged multi-provider logical models into one public ID per provider.\n" +
+		"-- Native route IDs stay stable so dispatch_attempts and account bindings keep\n" +
+		"-- working. Retired merged IDs become tombstones when still referenced.\n" +
+		"-- Runway and Custom are not part of this split: leftover Runway native routes\n" +
+		"-- and custom.* bindings stay on the retired merged IDs and are disabled below.\n" +
+		"\n" +
+		"CREATE TEMP TABLE migration_000020_split (\n" +
+		"    old_logical_id VARCHAR(191) NOT NULL,\n" +
+		"    new_logical_id VARCHAR(191) NOT NULL,\n" +
+		"    kind VARCHAR(32) NOT NULL,\n" +
+		"    name VARCHAR(255) NOT NULL,\n" +
+		"    native_route_id VARCHAR(191) NOT NULL\n" +
+		");\n" +
+		"\n" +
+		"INSERT INTO migration_000020_split (old_logical_id,new_logical_id,kind,name,native_route_id) VALUES\n" +
+		" ('gpt-image-2','chatgpt-gpt-image-2','image','ChatGPT GPT Image 2','image.gpt-image-2.chatgpt'),\n" +
+		" ('gpt-image-2','byteplus-gpt-image-2','image','BytePlus GPT Image 2','image.gpt-image-2.byteplus'),\n" +
+		" ('gpt-image-2','adobe-gpt-image-2','image','Adobe GPT Image 2','image.gpt-image-2.adobe'),\n" +
+		" ('nano-banana-2','byteplus-nano-banana-2','image','BytePlus Nano Banana 2','image.nano-banana-2.byteplus'),\n" +
+		" ('nano-banana-2','adobe-nano-banana-2','image','Adobe Nano Banana 2','image.nano-banana-2.adobe'),\n" +
+		" ('nano-banana-pro','byteplus-nano-banana-pro','image','BytePlus Nano Banana Pro','image.nano-banana-pro.byteplus'),\n" +
+		" ('nano-banana-pro','adobe-nano-banana-pro','image','Adobe Nano Banana Pro','image.nano-banana-pro.adobe'),\n" +
+		" ('seedance-2.0','adobe-seedance-2.0','video','Adobe Seedance 2.0','video.seedance-2.0.adobe'),\n" +
+		" ('seedance-2.0','oreate-seedance-2.0','video','Oreate Seedance 2.0','video.seedance-2.0.oreate'),\n" +
+		" ('seedance-2.0-fast','adobe-seedance-2.0-fast','video','Adobe Seedance 2.0 Fast','video.seedance-2.0-fast.adobe'),\n" +
+		" ('seedance-2.0-fast','oreate-seedance-2.0-fast','video','Oreate Seedance 2.0 Fast','video.seedance-2.0-fast.oreate'),\n" +
+		" ('seedance-2.5','oreate-seedance-2.5','video','Oreate Seedance 2.5','video.seedance-2.5.oreate');\n" +
+		"\n" +
+		"INSERT INTO logical_models (id,kind,name,enabled,weight,generation_count,created_at,updated_at)\n" +
+		"SELECT s.new_logical_id, s.kind, s.name, COALESCE(parent.enabled, TRUE), 0, 0,\n" +
+		"       COALESCE(parent.created_at, NOW()), NOW()\n" +
+		"FROM migration_000020_split s\n" +
+		"LEFT JOIN logical_models parent ON parent.id = s.old_logical_id\n" +
+		"ON CONFLICT (id) DO NOTHING;\n" +
+		"\n" +
+		"UPDATE model_routes AS route\n" +
+		"SET logical_model_id = s.new_logical_id, updated_at = NOW()\n" +
+		"FROM migration_000020_split s\n" +
+		"WHERE route.id = s.native_route_id;\n" +
+		"\n" +
+		"UPDATE logical_models\n" +
+		"SET enabled = FALSE, updated_at = NOW()\n" +
+		"WHERE id IN (SELECT DISTINCT old_logical_id FROM migration_000020_split);\n" +
+		"\n" +
+		"UPDATE model_routes\n" +
+		"SET enabled = FALSE, updated_at = NOW()\n" +
+		"WHERE logical_model_id IN (SELECT DISTINCT old_logical_id FROM migration_000020_split);\n" +
+		"\n" +
+		"DELETE FROM account_model_routes\n" +
+		"WHERE model_route_id IN (\n" +
+		"    SELECT id FROM model_routes\n" +
+		"    WHERE logical_model_id IN (SELECT DISTINCT old_logical_id FROM migration_000020_split)\n" +
+		");\n" +
+		"\n" +
+		"DELETE FROM model_routes AS route\n" +
+		"WHERE route.logical_model_id IN (SELECT DISTINCT old_logical_id FROM migration_000020_split)\n" +
+		"AND NOT EXISTS (\n" +
+		"    SELECT 1 FROM dispatch_attempts AS attempt WHERE attempt.model_route_id = route.id\n" +
+		");\n" +
+		"\n" +
+		"DELETE FROM logical_models AS logical\n" +
+		"WHERE logical.id IN (SELECT DISTINCT old_logical_id FROM migration_000020_split)\n" +
+		"AND NOT EXISTS (\n" +
+		"    SELECT 1 FROM model_routes AS route WHERE route.logical_model_id = logical.id\n" +
+		");\n" +
+		"\n" +
+		"DROP TABLE migration_000020_split;\n",
 }

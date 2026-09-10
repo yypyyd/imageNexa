@@ -9,8 +9,9 @@ import (
 	"gorm.io/datatypes"
 )
 
-// LogicalModel is the only model identity visible to API consumers. Provider
-// names and provider-specific model ids live exclusively on ModelRoute.
+// LogicalModel is the only model identity visible to API consumers. Upstream
+// protocol names stay on ModelRoute. When the same product is offered by more
+// than one provider, each provider has its own public ID.
 type LogicalModel struct {
 	ID              string `gorm:"primaryKey;size:191"`
 	Kind            string `gorm:"size:32;index;not null"`
@@ -260,12 +261,13 @@ func secondsRange(first, last int) []string {
 	return out
 }
 
-// CanonicalRoutingCatalog is the closed public model set. Provider-specific
-// ids are internal adapter selectors unless explicitly declared as a public model.
+// CanonicalRoutingCatalog is the closed public model set. Runtime and upstream
+// ids stay on ModelRoute. Multi-provider products use `{provider}-{product}`
+// public IDs so clients select a channel explicitly; single-provider products
+// keep their unprefixed names. Runway and Custom are not public channels.
 func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 	commonImageRatios := []string{"1:1", "16:9", "9:16", "4:3", "3:4"}
 	adobeWideRatios := []string{"1:1", "5:4", "9:16", "21:9", "16:9", "4:3", "3:2", "4:5", "3:4", "2:3"}
-	runwayWideRatios := []string{"1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"}
 	seedanceRatios := []string{"16:9", "1:1", "3:4", "4:3", "9:16", "21:9"}
 	// Dola's web picker exposes a fixed ratio set on the video panel.
 	dolaRatios := []string{"16:9", "9:16", "1:1", "4:3", "3:4"}
@@ -283,10 +285,14 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 			route("text.grok-chat-fast.grok", "grok-chat-fast", "grok", "grok-chat-fast", "grok-chat-fast", 100, textProfile()),
 		}},
 
-		{Model: LogicalModel{ID: "gpt-image-2", Kind: "image", Name: "GPT Image 2", Enabled: true}, Routes: []ModelRoute{
-			route("image.gpt-image-2.chatgpt", "gpt-image-2", "chatgpt", "gpt-image-2", "gpt-image-2", 100, imageProfile(commonImageRatios, []string{"1K"}, 6)),
-			route("image.gpt-image-2.byteplus", "gpt-image-2", "byteplus", "lumina-gpt-image-2", "6824519374061285743", 90, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),
-			route("image.gpt-image-2.adobe", "gpt-image-2", "adobe", "firefly-gpt-image-2", "", 80, imageProfile(adobeWideRatios, []string{"1K", "2K", "4K"}, 6)),
+		{Model: LogicalModel{ID: "chatgpt-gpt-image-2", Kind: "image", Name: "ChatGPT GPT Image 2", Enabled: true}, Routes: []ModelRoute{
+			route("image.gpt-image-2.chatgpt", "chatgpt-gpt-image-2", "chatgpt", "gpt-image-2", "gpt-image-2", 100, imageProfile(commonImageRatios, []string{"1K"}, 6)),
+		}},
+		{Model: LogicalModel{ID: "byteplus-gpt-image-2", Kind: "image", Name: "BytePlus GPT Image 2", Enabled: true}, Routes: []ModelRoute{
+			route("image.gpt-image-2.byteplus", "byteplus-gpt-image-2", "byteplus", "lumina-gpt-image-2", "6824519374061285743", 100, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),
+		}},
+		{Model: LogicalModel{ID: "adobe-gpt-image-2", Kind: "image", Name: "Adobe GPT Image 2", Enabled: true}, Routes: []ModelRoute{
+			route("image.gpt-image-2.adobe", "adobe-gpt-image-2", "adobe", "firefly-gpt-image-2", "", 100, imageProfile(adobeWideRatios, []string{"1K", "2K", "4K"}, 6)),
 		}},
 		{Model: LogicalModel{ID: "seedream-5.0-pro", Kind: "image", Name: "Seedream 5.0 Pro", Enabled: true}, Routes: []ModelRoute{
 			route("image.seedream-5.0-pro.byteplus", "seedream-5.0-pro", "byteplus", "lumina-seedream-5.0-pro", "7657401949175693322", 100, imageProfile(commonImageRatios, []string{"1K", "2K"}, 10)),
@@ -294,15 +300,17 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 		{Model: LogicalModel{ID: "seedream-5.0-lite", Kind: "image", Name: "Seedream 5.0 Lite", Enabled: true}, Routes: []ModelRoute{
 			route("image.seedream-5.0-lite.byteplus", "seedream-5.0-lite", "byteplus", "lumina-seedream-5.0-lite", "7604761017696141358", 100, imageProfile(commonImageRatios, []string{"2K"}, 10)),
 		}},
-		{Model: LogicalModel{ID: "nano-banana-2", Kind: "image", Name: "Nano Banana 2", Enabled: true}, Routes: []ModelRoute{
-			route("image.nano-banana-2.byteplus", "nano-banana-2", "byteplus", "lumina-nano-banana-2", "8162745039814627354", 100, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),
-			route("image.nano-banana-2.runway", "nano-banana-2", "runway", "nano-banana-2", "nano-banana-2", 90, imageProfile(runwayWideRatios, []string{"1K", "2K", "4K"}, 6)),
-			route("image.nano-banana-2.adobe", "nano-banana-2", "adobe", "firefly-nano-banana-2", "", 80, imageProfile(adobeWideRatios, []string{"1K", "2K", "4K"}, 6)),
+		{Model: LogicalModel{ID: "byteplus-nano-banana-2", Kind: "image", Name: "BytePlus Nano Banana 2", Enabled: true}, Routes: []ModelRoute{
+			route("image.nano-banana-2.byteplus", "byteplus-nano-banana-2", "byteplus", "lumina-nano-banana-2", "8162745039814627354", 100, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),
 		}},
-		{Model: LogicalModel{ID: "nano-banana-pro", Kind: "image", Name: "Nano Banana Pro", Enabled: true}, Routes: []ModelRoute{
-			route("image.nano-banana-pro.byteplus", "nano-banana-pro", "byteplus", "lumina-nano-banana-pro", "8162745039814627353", 100, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),
-			route("image.nano-banana-pro.runway", "nano-banana-pro", "runway", "nano-banana-pro", "nano-banana-pro", 90, imageProfile(runwayWideRatios, []string{"1K", "2K", "4K"}, 6)),
-			route("image.nano-banana-pro.adobe", "nano-banana-pro", "adobe", "firefly-nano-banana-pro", "", 80, imageProfile(adobeWideRatios, []string{"1K", "2K", "4K"}, 6)),
+		{Model: LogicalModel{ID: "adobe-nano-banana-2", Kind: "image", Name: "Adobe Nano Banana 2", Enabled: true}, Routes: []ModelRoute{
+			route("image.nano-banana-2.adobe", "adobe-nano-banana-2", "adobe", "firefly-nano-banana-2", "", 100, imageProfile(adobeWideRatios, []string{"1K", "2K", "4K"}, 6)),
+		}},
+		{Model: LogicalModel{ID: "byteplus-nano-banana-pro", Kind: "image", Name: "BytePlus Nano Banana Pro", Enabled: true}, Routes: []ModelRoute{
+			route("image.nano-banana-pro.byteplus", "byteplus-nano-banana-pro", "byteplus", "lumina-nano-banana-pro", "8162745039814627353", 100, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),
+		}},
+		{Model: LogicalModel{ID: "adobe-nano-banana-pro", Kind: "image", Name: "Adobe Nano Banana Pro", Enabled: true}, Routes: []ModelRoute{
+			route("image.nano-banana-pro.adobe", "adobe-nano-banana-pro", "adobe", "firefly-nano-banana-pro", "", 100, imageProfile(adobeWideRatios, []string{"1K", "2K", "4K"}, 6)),
 		}},
 		{Model: LogicalModel{ID: "grok-imagine-image", Kind: "image", Name: "Grok Imagine Image", Enabled: true}, Routes: []ModelRoute{
 			route("image.grok-imagine-image.grok", "grok-imagine-image", "grok", "grok-imagine-image", "grok-imagine-image", 100, imageProfile([]string{"2:3", "3:2", "1:1", "9:16", "16:9"}, []string{"1K"}, 0)),
@@ -313,13 +321,17 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 		{Model: LogicalModel{ID: "kling-o3", Kind: "video", Name: "Kling O3", Enabled: true}, Routes: []ModelRoute{
 			route("video.kling-o3.adobe", "kling-o3", "adobe", "firefly-kling-o3", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"720p", "1080p"}, secondsRange(3, 15), 1, 1, 0, 0, true, "frame")),
 		}},
-		{Model: LogicalModel{ID: "seedance-2.0", Kind: "video", Name: "Seedance 2.0", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-2.0.adobe", "seedance-2.0", "adobe", "firefly-seedance-2", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
-			route("video.seedance-2.0.oreate", "seedance-2.0", "oreate", "oreate-seedance-2.0", "seedance-2.0", 90, videoProfile(seedanceRatios, []string{"480p", "720p", "1080p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
+		{Model: LogicalModel{ID: "adobe-seedance-2.0", Kind: "video", Name: "Adobe Seedance 2.0", Enabled: true}, Routes: []ModelRoute{
+			route("video.seedance-2.0.adobe", "adobe-seedance-2.0", "adobe", "firefly-seedance-2", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
 		}},
-		{Model: LogicalModel{ID: "seedance-2.0-fast", Kind: "video", Name: "Seedance 2.0 Fast", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-2.0-fast.adobe", "seedance-2.0-fast", "adobe", "firefly-seedance-2-fast", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
-			route("video.seedance-2.0-fast.oreate", "seedance-2.0-fast", "oreate", "oreate-seedance-2.0-fast", "seedance-2.0-fast", 90, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
+		{Model: LogicalModel{ID: "oreate-seedance-2.0", Kind: "video", Name: "Oreate Seedance 2.0", Enabled: true}, Routes: []ModelRoute{
+			route("video.seedance-2.0.oreate", "oreate-seedance-2.0", "oreate", "oreate-seedance-2.0", "seedance-2.0", 100, videoProfile(seedanceRatios, []string{"480p", "720p", "1080p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
+		}},
+		{Model: LogicalModel{ID: "adobe-seedance-2.0-fast", Kind: "video", Name: "Adobe Seedance 2.0 Fast", Enabled: true}, Routes: []ModelRoute{
+			route("video.seedance-2.0-fast.adobe", "adobe-seedance-2.0-fast", "adobe", "firefly-seedance-2-fast", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
+		}},
+		{Model: LogicalModel{ID: "oreate-seedance-2.0-fast", Kind: "video", Name: "Oreate Seedance 2.0 Fast", Enabled: true}, Routes: []ModelRoute{
+			route("video.seedance-2.0-fast.oreate", "oreate-seedance-2.0-fast", "oreate", "oreate-seedance-2.0-fast", "seedance-2.0-fast", 100, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
 		}},
 		{Model: LogicalModel{ID: "seedance-2.0-mini", Kind: "video", Name: "Seedance 2.0 Mini", Enabled: true}, Routes: []ModelRoute{
 			route("video.seedance-2.0-mini.oreate", "seedance-2.0-mini", "oreate", "oreate-seedance-2.0-mini", "seedance-2.0-mini", 100, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
@@ -327,12 +339,9 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 		{Model: LogicalModel{ID: "seedance-1.5-pro", Kind: "video", Name: "Seedance 1.5 Pro", Enabled: true}, Routes: []ModelRoute{
 			route("video.seedance-1.5-pro.oreate", "seedance-1.5-pro", "oreate", "oreate-seedance-1.5-pro", "seedance-1.5-pro", 100, videoProfile(seedanceRatios, []string{"480p", "720p", "1080p"}, []string{"5s", "10s"}, 2, 0, 0, 2, true, "frame")),
 		}},
-		{Model: LogicalModel{ID: "seedance-2.5", Kind: "video", Name: "Seedance 2.5", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-2.5.oreate", "seedance-2.5", "oreate", "oreate-seedance-2.5", "seedance-2.5", 100, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s", "20s", "30s"}, 9, 3, 0, 12, true, "asset")),
-			route("video.seedance-2.5.dola", "seedance-2.5", "dola", "dola-seedance-2.5", "seedance_v2.5", 80, videoProfile(dolaRatios, []string{"720p"}, []string{"30s"}, 1, 0, 0, 1, true, "frame")),
+		{Model: LogicalModel{ID: "oreate-seedance-2.5", Kind: "video", Name: "Oreate Seedance 2.5", Enabled: true}, Routes: []ModelRoute{
+			route("video.seedance-2.5.oreate", "oreate-seedance-2.5", "oreate", "oreate-seedance-2.5", "seedance-2.5", 100, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s", "20s", "30s"}, 9, 3, 0, 12, true, "asset")),
 		}},
-		// This explicit public model pins downstream requests to the Dola pool.
-		// The generic Seedance route remains available and shares the daily bucket.
 		{Model: LogicalModel{ID: DolaPublicVideoModel, Kind: "video", Name: "Dola Seedance 2.5", Enabled: true}, Routes: []ModelRoute{
 			route("video.dola-seedance-2.5.dola", DolaPublicVideoModel, "dola", "dola-seedance-2.5", "seedance_v2.5", 100, videoProfile(dolaRatios, []string{"720p"}, []string{"30s"}, 0, 0, 0, 0, true, "")),
 		}},
