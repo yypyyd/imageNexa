@@ -20,7 +20,7 @@
 - 只保留一个超级管理员，不提供公开注册或公共用户前台。
 - 管理端负责模型 route、上游账号、API Key、日志、成品、违禁词和系统设置。
 - 模型目录是闭集。下游不能自行创建模型 ID。
-- 同一产品若有多个渠道，各自使用带渠道前缀的公开 ID，不再合并到同一个 `model` 值上。
+- 同一产品若有多个渠道，各自使用带渠道前缀的公开 ID；ChatGPT 的 GPT Image 2 使用未加前缀的 `gpt-image-2`。
 
 ## 鉴权
 
@@ -76,7 +76,7 @@ Authorization: Bearer sk-your-api-key
 
 ### 图片（10）
 
-- `chatgpt-gpt-image-2`
+- `gpt-image-2`
 - `byteplus-gpt-image-2`
 - `adobe-gpt-image-2`
 - `seedream-5.0-pro`
@@ -231,7 +231,7 @@ curl https://api.example.com/v1/images/generations \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: image-order-001" \
-  -d '{"model":"chatgpt-gpt-image-2","prompt":"极简产品摄影","size":"1024x1024"}'
+  -d '{"model":"gpt-image-2","prompt":"极简产品摄影","size":"1024x1024"}'
 
 # 图片编辑
 curl https://api.example.com/v1/images/edits \

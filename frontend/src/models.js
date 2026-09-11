@@ -6,7 +6,7 @@ export const TEXT_MODELS = Object.freeze([
 ])
 
 export const IMAGE_MODELS = Object.freeze([
-  'chatgpt-gpt-image-2',
+  'gpt-image-2',
   'byteplus-gpt-image-2',
   'adobe-gpt-image-2',
   'seedream-5.0-pro',

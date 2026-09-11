@@ -20,7 +20,7 @@ The product boundary is intentionally small:
 - There is exactly one super administrator and no public registration or end-user web application.
 - The console manages model routes, upstream accounts, API keys, logs, artifacts, banned words, and system settings.
 - The model catalog is closed. Clients cannot create model IDs.
-- When the same product is offered by more than one provider, each channel has its own public ID instead of merging behind one `model` value.
+- When the same product is offered by more than one provider, each channel has its own public ID. ChatGPT's GPT Image 2 uses the unprefixed `gpt-image-2`.
 
 ## Authentication
 
@@ -76,7 +76,7 @@ Errors use the OpenAI shape:
 
 ### Image (10)
 
-- `chatgpt-gpt-image-2`
+- `gpt-image-2`
 - `byteplus-gpt-image-2`
 - `adobe-gpt-image-2`
 - `seedream-5.0-pro`
@@ -208,7 +208,7 @@ curl https://api.example.com/v1/images/generations \
   -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: image-order-001" \
-  -d '{"model":"chatgpt-gpt-image-2","prompt":"Minimal product photography","size":"1024x1024"}'
+  -d '{"model":"gpt-image-2","prompt":"Minimal product photography","size":"1024x1024"}'
 
 # Image edit
 curl https://api.example.com/v1/images/edits \

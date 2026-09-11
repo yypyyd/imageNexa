@@ -15,7 +15,7 @@ const examples = computed(() => ({
     "stream": false
   }'`,
   image: `curl ${base.value}/v1/images/generations \\\n  -H "Authorization: Bearer sk-your-api-key" \\\n  -H "Content-Type: application/json" \\\n  -H "Idempotency-Key: image-order-001" \\\n  -d '{
-    "model": "chatgpt-gpt-image-2",
+    "model": "gpt-image-2",
     "prompt": "A minimal product photograph",
     "n": 1,
     "size": "1024x1024"
@@ -62,7 +62,7 @@ async function copy(name) {
 
     <article id="models" class="doc-section">
       <div class="doc-title"><span class="get">GET</span><code>/v1/models</code></div>
-      <p class="doc-text">只返回下表 {{ TEXT_MODELS.length + IMAGE_MODELS.length + VIDEO_MODELS.length }} 个闭集 ID，<code>owned_by</code> 固定为 <code>2api</code>。默认返回严格 OpenAI 模型对象；需要比例、分辨率等 2API 能力字段时显式使用 <code>?extended=true</code>。同一产品若有多个渠道，公开 ID 带渠道前缀（例如 <code>chatgpt-gpt-image-2</code> 与 <code>byteplus-gpt-image-2</code>）。内部 route 和上游模型 ID 不能作为请求的 <code>model</code> 值。</p>
+      <p class="doc-text">只返回下表 {{ TEXT_MODELS.length + IMAGE_MODELS.length + VIDEO_MODELS.length }} 个闭集 ID，<code>owned_by</code> 固定为 <code>2api</code>。默认返回严格 OpenAI 模型对象；需要比例、分辨率等 2API 能力字段时显式使用 <code>?extended=true</code>。同一产品若有多个渠道，公开 ID 带渠道前缀（例如 <code>gpt-image-2</code> 与 <code>byteplus-gpt-image-2</code>）。内部 route 和上游模型 ID 不能作为请求的 <code>model</code> 值。</p>
       <div class="grid lg:grid-cols-3 gap-3">
         <div class="model-group"><h4>文本 · {{ TEXT_MODELS.length }}</h4><code v-for="id in TEXT_MODELS" :key="id">{{ id }}</code></div>
         <div class="model-group"><h4>图片 · {{ IMAGE_MODELS.length }}</h4><code v-for="id in IMAGE_MODELS" :key="id">{{ id }}</code></div>

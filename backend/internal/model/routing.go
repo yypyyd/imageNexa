@@ -263,8 +263,8 @@ func secondsRange(first, last int) []string {
 
 // CanonicalRoutingCatalog is the closed public model set. Runtime and upstream
 // ids stay on ModelRoute. Multi-provider products use `{provider}-{product}`
-// public IDs so clients select a channel explicitly; single-provider products
-// keep their unprefixed names. Oreate, Runway, and Custom are not public channels.
+// public IDs so clients select a channel explicitly; ChatGPT's GPT Image 2 uses
+// the unprefixed `gpt-image-2` ID. Oreate, Runway, and Custom are not public.
 func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 	commonImageRatios := []string{"1:1", "16:9", "9:16", "4:3", "3:4"}
 	adobeWideRatios := []string{"1:1", "5:4", "9:16", "21:9", "16:9", "4:3", "3:2", "4:5", "3:4", "2:3"}
@@ -284,8 +284,8 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 			route("text.grok-chat-fast.grok", "grok-chat-fast", "grok", "grok-chat-fast", "grok-chat-fast", 100, textProfile()),
 		}},
 
-		{Model: LogicalModel{ID: "chatgpt-gpt-image-2", Kind: "image", Name: "ChatGPT GPT Image 2", Enabled: true}, Routes: []ModelRoute{
-			route("image.gpt-image-2.chatgpt", "chatgpt-gpt-image-2", "chatgpt", "gpt-image-2", "gpt-image-2", 100, imageProfile(commonImageRatios, []string{"1K"}, 6)),
+		{Model: LogicalModel{ID: "gpt-image-2", Kind: "image", Name: "ChatGPT GPT Image 2", Enabled: true}, Routes: []ModelRoute{
+			route("image.gpt-image-2.chatgpt", "gpt-image-2", "chatgpt", "gpt-image-2", "gpt-image-2", 100, imageProfile(commonImageRatios, []string{"1K"}, 6)),
 		}},
 		{Model: LogicalModel{ID: "byteplus-gpt-image-2", Kind: "image", Name: "BytePlus GPT Image 2", Enabled: true}, Routes: []ModelRoute{
 			route("image.gpt-image-2.byteplus", "byteplus-gpt-image-2", "byteplus", "lumina-gpt-image-2", "6824519374061285743", 100, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),

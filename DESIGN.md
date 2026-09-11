@@ -97,13 +97,13 @@ The catalog is versioned data, not a user-extensible namespace. Startup settings
 
 ### Image
 
-`chatgpt-gpt-image-2`, `byteplus-gpt-image-2`, `adobe-gpt-image-2`, `seedream-5.0-pro`, `seedream-5.0-lite`, `byteplus-nano-banana-2`, `adobe-nano-banana-2`, `byteplus-nano-banana-pro`, `adobe-nano-banana-pro`, `grok-imagine-image`
+`gpt-image-2`, `byteplus-gpt-image-2`, `adobe-gpt-image-2`, `seedream-5.0-pro`, `seedream-5.0-lite`, `byteplus-nano-banana-2`, `adobe-nano-banana-2`, `byteplus-nano-banana-pro`, `adobe-nano-banana-pro`, `grok-imagine-image`
 
 ### Video
 
 `kling-3`, `kling-o3`, `adobe-seedance-2.0`, `adobe-seedance-2.0-fast`, `dola-seedance-2.5`, `grok-imagine-video`, `firefly-video`
 
-A provider implementation is represented by a `ModelRoute`. When a product exists on more than one provider, clients request a provider-prefixed public ID such as `chatgpt-gpt-image-2` or `byteplus-gpt-image-2`. Single-provider products keep unprefixed IDs. Retired merged IDs such as `gpt-image-2` and `seedance-2.5` return `model_not_found`.
+A provider implementation is represented by a `ModelRoute`. When a product exists on more than one provider, clients request a provider-prefixed public ID such as `byteplus-gpt-image-2`. ChatGPT's GPT Image 2 uses the unprefixed `gpt-image-2`. Retired IDs such as `chatgpt-gpt-image-2` and `seedance-2.5` return `model_not_found`.
 
 ## 5. Routing data model
 
@@ -512,3 +512,11 @@ Dola 的发布验证重点包括请求结构、时长限制、导入识别、就
 **Impact**: Concurrent generations on distinct accounts receive distinct IPs from the same extract batch. The same account keeps its IP until TTL or a failure rotation. Operators paste extract links per channel instead of duplicating a Dola-only session API field.
 
 **Security decision**: Extract API URLs and leased proxy endpoints are stored and used like other proxy settings. They are never logged. Account lease keys are truncated hashes or durable account IDs, not raw cookies or JWTs.
+
+### 2026-09-12 — Restore `gpt-image-2` as the ChatGPT public ID
+
+**Change**: The ChatGPT image channel is public again as `gpt-image-2`. `chatgpt-gpt-image-2` is retired. BytePlus and Adobe stay on `byteplus-gpt-image-2` and `adobe-gpt-image-2`. Migration 000022 reuses logical model `gpt-image-2` when a 000020 tombstone still exists, re-points `image.gpt-image-2.chatgpt`, copies generation count from the prefixed row, and deletes `chatgpt-gpt-image-2` when no leftover routes reference it. Historical `event_logs.model` values are rewritten.
+
+**Reason**: The ChatGPT product name is the unprefixed OpenAI ID; the `chatgpt-` prefix was redundant next to already-prefixed sibling channels.
+
+**Impact**: `/v1/models`, request validation, and the administrator console show `gpt-image-2`. Clients still sending `chatgpt-gpt-image-2` receive `model_not_found`. The catalog remains 21 models (4 text, 10 image, 7 video). The ChatGPT route ID is unchanged, so account bindings and dispatch history stay valid.

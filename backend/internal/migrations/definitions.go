@@ -1582,4 +1582,50 @@ var migrationSources = map[string]string{
 		"  AND NOT EXISTS (\n" +
 		"      SELECT 1 FROM model_routes AS route WHERE route.logical_model_id = logical.id\n" +
 		");\n",
+	"000022_chatgpt_gpt_image_unprefixed.sql": "-- Restore gpt-image-2 as the ChatGPT-only public ID. Native route\n" +
+		"-- image.gpt-image-2.chatgpt stays stable. BytePlus and Adobe keep prefixed IDs.\n" +
+		"-- chatgpt-gpt-image-2 becomes a tombstone when leftover routes still reference it.\n" +
+		"\n" +
+		"INSERT INTO logical_models (id, kind, name, enabled, weight, generation_count, created_at, updated_at)\n" +
+		"SELECT 'gpt-image-2',\n" +
+		"       'image',\n" +
+		"       COALESCE(src.name, existing.name, 'ChatGPT GPT Image 2'),\n" +
+		"       TRUE,\n" +
+		"       COALESCE(src.weight, existing.weight, 0),\n" +
+		"       COALESCE(src.generation_count, existing.generation_count, 0),\n" +
+		"       COALESCE(src.created_at, existing.created_at, NOW()),\n" +
+		"       NOW()\n" +
+		"FROM (SELECT 1) AS dummy\n" +
+		"LEFT JOIN logical_models src ON src.id = 'chatgpt-gpt-image-2'\n" +
+		"LEFT JOIN logical_models existing ON existing.id = 'gpt-image-2'\n" +
+		"ON CONFLICT (id) DO UPDATE SET\n" +
+		"    name = EXCLUDED.name,\n" +
+		"    kind = 'image',\n" +
+		"    enabled = TRUE,\n" +
+		"    weight = EXCLUDED.weight,\n" +
+		"    generation_count = EXCLUDED.generation_count,\n" +
+		"    updated_at = NOW();\n" +
+		"\n" +
+		"UPDATE model_routes\n" +
+		"SET logical_model_id = 'gpt-image-2', updated_at = NOW()\n" +
+		"WHERE id = 'image.gpt-image-2.chatgpt';\n" +
+		"\n" +
+		"UPDATE model_routes\n" +
+		"SET enabled = FALSE, updated_at = NOW()\n" +
+		"WHERE logical_model_id = 'gpt-image-2'\n" +
+		"  AND id <> 'image.gpt-image-2.chatgpt';\n" +
+		"\n" +
+		"UPDATE event_logs\n" +
+		"SET model = 'gpt-image-2'\n" +
+		"WHERE model = 'chatgpt-gpt-image-2';\n" +
+		"\n" +
+		"UPDATE logical_models\n" +
+		"SET enabled = FALSE, updated_at = NOW()\n" +
+		"WHERE id = 'chatgpt-gpt-image-2';\n" +
+		"\n" +
+		"DELETE FROM logical_models AS logical\n" +
+		"WHERE logical.id = 'chatgpt-gpt-image-2'\n" +
+		"  AND NOT EXISTS (\n" +
+		"      SELECT 1 FROM model_routes AS route WHERE route.logical_model_id = logical.id\n" +
+		");\n",
 }
