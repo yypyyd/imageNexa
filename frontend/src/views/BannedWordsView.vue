@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import Icon from '../components/Icon.vue'
+import Pager from '../components/Pager.vue'
 import { api, jsonBody, listOf } from '../api'
 import { copyText } from '../utils/clipboard'
 
@@ -14,8 +15,8 @@ const importOpen = ref(false)
 const importText = ref('')
 const page = ref(1)
 const total = ref(0)
-const limit = 50
-const pages = computed(() => Math.max(1, Math.ceil(total.value / limit)))
+const limit = ref(50)
+const pages = computed(() => Math.max(1, Math.ceil(total.value / limit.value)))
 const toast = ref('')
 const selected = ref(new Set())
 let toastTimer = null
@@ -23,7 +24,7 @@ const allSelected = computed(() => tab.value === 'words' && rows.value.length > 
 
 async function load() {
   loading.value = true
-  const params = new URLSearchParams({ page: String(page.value), limit: String(limit), offset: String((page.value - 1) * limit) })
+  const params = new URLSearchParams({ page: String(page.value), limit: String(limit.value), offset: String((page.value - 1) * limit.value) })
   if (query.value.trim()) params.set('q', query.value.trim())
   const response = await api(`/${tab.value === 'words' ? 'banned-words' : 'banned-word-hits'}?${params}`)
   if (response.ok) {
@@ -36,6 +37,20 @@ async function load() {
 
 function switchTab(value) { tab.value = value; page.value = 1; query.value = ''; selected.value = new Set(); load() }
 function search() { page.value = 1; load() }
+function goTo(target) {
+  const next = Math.max(1, Math.min(pages.value, Number(target) || 1))
+  if (next === page.value) return
+  page.value = next
+  load()
+}
+
+function changeLimit(value) {
+  const next = Number(value) || limit.value
+  if (next === limit.value) return
+  limit.value = next
+  page.value = 1
+  load()
+}
 
 function toggleSelected(id) {
   const next = new Set(selected.value)
@@ -144,7 +159,7 @@ onMounted(load)
       </div>
     </div>
 
-    <div class="flex justify-between items-center text-xs text-white/35"><span>共 {{ total }} 条</span><div class="flex gap-2 items-center"><button class="btn-soft" :disabled="page <= 1" @click="page--;load()">上一页</button><span>{{ page }} / {{ pages }}</span><button class="btn-soft" :disabled="page >= pages" @click="page++;load()">下一页</button></div></div>
+    <Pager :page="page" :pages="pages" :total="total" :limit="limit" @update:page="goTo" @update:limit="changeLimit" />
 
     <div v-if="importOpen" class="modal-bg" @click.self="importOpen = false"><form class="modal-card" @submit.prevent="importWords"><div class="flex justify-between"><h3 class="font-semibold text-white/90">批量导入违禁词</h3><button type="button" @click="importOpen = false"><Icon name="close" class="w-4 h-4" /></button></div><textarea v-model="importText" rows="10" class="field resize-y" placeholder="每行一个词，重复项由服务端去重" /><button class="btn-primary justify-center">导入</button></form></div>
     <div v-if="toast" class="toast">{{ toast }}</div>

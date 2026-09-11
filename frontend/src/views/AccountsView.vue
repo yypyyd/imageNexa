@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import Icon from '../components/Icon.vue'
 import SelectMenu from '../components/SelectMenu.vue'
 import AccountTestModal from '../components/AccountTestModal.vue'
+import Pager from '../components/Pager.vue'
 import { api, jsonBody, listOf } from '../api'
 import { ACCOUNT_PROVIDERS } from '../models'
 import { parseCredentialFile, parseCredentialImports, uniqueCredentialImports } from '../credential'
@@ -18,7 +19,7 @@ const total = ref(0)
 const providerCounts = ref({})
 const providerHealth = ref({})
 const page = ref(1)
-const limit = 20
+const limit = ref(20)
 const query = ref('')
 const provider = ref('')
 const status = ref('')
@@ -33,7 +34,6 @@ const fileNames = ref([])
 const importStatus = ref('')
 const importStatusError = ref(false)
 const selected = ref(new Set())
-const expanded = ref(new Set())
 
 const importItems = computed(() => uniqueCredentialImports([
   ...parseCredentialImports(importForm.credential),
@@ -45,21 +45,12 @@ const detectedProviders = computed(() => {
   return counts
 })
 
-const pages = computed(() => Math.max(1, Math.ceil(total.value / limit)))
+const pages = computed(() => Math.max(1, Math.ceil(total.value / limit.value)))
 const allSelected = computed(() => accounts.value.length > 0 && accounts.value.every((account) => selected.value.has(account.id)))
 const deadCount = computed(() => Object.values(providerHealth.value).reduce((sum, counts) => sum + Number(counts?.dead || 0), 0))
-const pageItems = computed(() => {
-  const last = pages.value
-  if (last <= 7) return Array.from({ length: last }, (_, index) => index + 1)
-  const wanted = new Set([1, last, page.value - 1, page.value, page.value + 1])
-  if (page.value <= 4) [2, 3, 4, 5].forEach((value) => wanted.add(value))
-  if (page.value >= last - 3) [last - 4, last - 3, last - 2, last - 1].forEach((value) => wanted.add(value))
-  const ordered = [...wanted].filter((value) => value >= 1 && value <= last).sort((a, b) => a - b)
-  return ordered.flatMap((value, index) => index > 0 && value - ordered[index - 1] > 1 ? [`gap-${value}`, value] : [value])
-})
 
 function listURL() {
-  const params = new URLSearchParams({ page: String(page.value), limit: String(limit) })
+  const params = new URLSearchParams({ page: String(page.value), limit: String(limit.value) })
   if (provider.value) params.set('provider', provider.value)
   if (status.value) params.set('status', status.value)
   if (query.value.trim()) params.set('q', query.value.trim())
@@ -102,6 +93,14 @@ function goTo(target) {
   load()
 }
 
+function changeLimit(value) {
+  const next = Number(value) || limit.value
+  if (next === limit.value) return
+  limit.value = next
+  page.value = 1
+  load()
+}
+
 function toggleSelected(id) {
   const next = new Set(selected.value)
   next.has(id) ? next.delete(id) : next.add(id)
@@ -113,20 +112,6 @@ function toggleSelectAll() {
   if (allSelected.value) accounts.value.forEach((account) => next.delete(account.id))
   else accounts.value.forEach((account) => next.add(account.id))
   selected.value = next
-}
-
-function toggleExpanded(id) {
-  const next = new Set(expanded.value)
-  next.has(id) ? next.delete(id) : next.add(id)
-  expanded.value = next
-}
-
-function enabledRoutes(account) {
-  return (account.routes || []).filter((route) => route.enabled !== false)
-}
-
-function routeTitle(account) {
-  return enabledRoutes(account).map((route) => route.model_id || route.logical_model_id).join('、')
 }
 
 function firstQuota(account) {
@@ -147,7 +132,8 @@ function quotaValue(value, unit) {
 function fmtTime(value) {
   if (!value) return '—'
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
 function statusLabel(value) {
@@ -173,18 +159,6 @@ async function patchAccount(account, patch, key) {
 async function toggleAccount(account) {
   if (account.provider !== 'dola' && !['active', 'disabled'].includes(account.status)) return
   await patchAccount(account, { status: account.status === 'disabled' ? 'active' : 'disabled' }, 'status')
-}
-
-async function toggleAccountRoute(account, route) {
-  const old = route.enabled !== false
-  route.enabled = !old
-  busy.value = `${account.id}:route:${route.id}`
-  const response = await api(`/accounts/${encodeURIComponent(account.id)}/routes/${encodeURIComponent(route.id)}`, jsonBody('PATCH', { enabled: !old }))
-  if (!response.ok) {
-    route.enabled = old
-    error.value = response.error
-  }
-  busy.value = ''
 }
 
 async function refreshQuota(account) {
@@ -320,7 +294,7 @@ onUnmounted(() => clearInterval(readinessTimer))
     <div class="flex items-start justify-between gap-4">
       <div>
         <h2 class="text-xl font-semibold text-white/90">上游账号调度</h2>
-        <p class="mt-1 text-xs text-white/40">账号按 route 授权和真实额度桶调度；每次生成都会刷新额度。</p>
+        <p class="mt-1 text-xs text-white/40">账号按真实额度桶调度；每次生成都会刷新额度。</p>
       </div>
       <div class="flex items-center gap-2">
         <button v-if="selected.size" class="btn-soft danger" :disabled="busy === 'delete-selected'" @click="removeSelected"><Icon name="trash" class="w-3.5 h-3.5" />删除选中 ({{ selected.size }})</button>
@@ -345,81 +319,65 @@ onUnmounted(() => clearInterval(readinessTimer))
     </div>
 
     <div class="card overflow-hidden">
-      <div class="px-4 py-3 flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06]">
-        <div class="text-xs text-white/45">匹配 <strong class="text-sm text-white/85 tabular-nums">{{ total }}</strong> 个账号 <span class="ml-2">每页 {{ limit }} 个</span></div>
-        <nav class="pagination" aria-label="账号分页">
-          <button :disabled="page <= 1" @click="goTo(page - 1)">上一页</button>
-          <template v-for="item in pageItems" :key="item">
-            <span v-if="typeof item !== 'number'">…</span>
-            <button v-else :class="item === page && 'on'" :aria-current="item === page ? 'page' : undefined" @click="goTo(item)">{{ item }}</button>
-          </template>
-          <button :disabled="page >= pages" @click="goTo(page + 1)">下一页</button>
-        </nav>
-      </div>
-
-      <div class="overflow-x-auto">
-        <table class="account-table">
-          <thead><tr><th class="check-cell"><input type="checkbox" class="chk" :checked="allSelected" title="全选当前页" @change="toggleSelectAll" /></th><th>账号</th><th>Provider</th><th>Route 授权</th><th>额度</th><th>运行统计</th><th>时间</th><th>并发</th><th>权重</th><th>状态</th><th class="text-right">操作</th></tr></thead>
-          <tbody>
-            <tr v-if="loading"><td colspan="11" class="empty-cell">正在加载账号…</td></tr>
-            <tr v-else-if="!accounts.length"><td colspan="11" class="empty-cell">没有匹配的账号</td></tr>
-            <template v-for="account in accounts" v-else :key="account.id">
-            <tr>
-              <td class="check-cell"><input type="checkbox" class="chk" :checked="selected.has(account.id)" :aria-label="`选择 ${account.label || account.id}`" @change="toggleSelected(account.id)" /></td>
-              <td class="account-cell">
-                <strong :title="account.label || account.email || account.id">{{ account.label || account.email || account.id }}</strong>
-                <span :title="account.email || account.id">{{ account.email || account.id }}</span>
-              </td>
-              <td><span class="provider">{{ account.provider }}</span></td>
-              <td class="routes-cell" :title="routeTitle(account)">
-                <button class="route-summary" title="展开并编辑该账号的 Route 授权" @click="toggleExpanded(account.id)"><span :class="expanded.has(account.id) && 'rotate-90'">›</span><b>{{ enabledRoutes(account).length }}</b> / {{ (account.routes || []).length }} 个可用</button>
-                <div class="route-preview">
-                  <span v-for="route in enabledRoutes(account).slice(0, 2)" :key="route.id">{{ route.model_id || route.logical_model_id }}</span>
-                  <span v-if="enabledRoutes(account).length > 2">+{{ enabledRoutes(account).length - 2 }}</span>
-                </div>
-              </td>
-              <td class="quota-cell">
-                <template v-if="firstQuota(account)">
-                  <div class="quota-line"><span :title="firstQuota(account).name">{{ firstQuota(account).name }}</span><b>{{ quotaValue(firstQuota(account).remaining, firstQuota(account).unit) }}</b></div>
-                  <div class="quota-bar"><span :style="{ width: `${quotaPercent(firstQuota(account))}%` }"></span></div>
-                  <small>共 {{ quotaValue(firstQuota(account).total, firstQuota(account).unit) }}<template v-if="(account.quota_buckets || []).length > 1"> · {{ account.quota_buckets.length }} 个额度桶</template></small>
-                </template>
-                <span v-else class="text-white/30">未获取</span>
-              </td>
-              <td class="stats-cell"><div><b>{{ account.active_jobs || 0 }}</b> 在途</div><small><span class="ok">{{ account.success_total || 0 }} 成功</span> · <span :class="Number(account.fail_total || 0) > 0 && 'bad'">{{ account.fail_total || 0 }} 失败</span></small></td>
-              <td class="time-cell"><div title="最后使用">用 {{ fmtTime(account.last_used_at) }}</div><small title="导入/创建时间">建 {{ fmtTime(account.created_at) }}</small><small v-if="account.provider === 'byteplus'" :class="{ warn: account.session_state === 'expiring', bad: account.session_state === 'expired' }" :title="sessionLabel(account)">{{ sessionLabel(account) }} {{ fmtTime(account.session_expires_at) }}</small></td>
-              <td>
-                <div class="job-count">运行中 {{ account.active_jobs || 0 }}</div>
-                <input type="number" min="0" max="1000" class="compact-input" :value="account.max_concurrency || 0" title="账号并发，0 表示使用 Provider 默认值" @change="patchAccount(account,{max_concurrency:Number($event.target.value)},'concurrency')" />
-              </td>
-              <td><input type="number" min="-1000" max="1000" class="compact-input" :value="account.weight ?? 0" title="调度权重，高的优先" @change="patchAccount(account,{weight:Number($event.target.value)},'weight')" /></td>
-              <td><span class="status" :class="`status-${account.status}`">{{ statusLabel(account.status) }}</span><div v-if="account.provider === 'dola'" class="text-xs mt-1" :class="account.readiness === 'ready' ? 'ok' : 'warn'" :title="account.readiness_detail">{{ dolaReadinessLabel(account) }}</div><small v-if="account.provider === 'dola' && account.readiness_detail && account.readiness !== 'ready'" class="block max-w-48 text-white/50">{{ account.readiness_detail }}</small><div v-if="account.image_limited || account.video_limited" class="limit-flags"><span v-if="account.image_limited">图片限额</span><span v-if="account.video_limited">视频限额</span></div></td>
-              <td><div class="flex items-center gap-1 justify-end">
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th class="check-cell"><input type="checkbox" class="chk" :checked="allSelected" title="全选当前页" @change="toggleSelectAll" /></th>
+            <th>账号</th>
+            <th>Provider</th>
+            <th>额度</th>
+            <th>统计</th>
+            <th>时间</th>
+            <th>并发</th>
+            <th>权重</th>
+            <th>状态</th>
+            <th class="text-right">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-if="loading"><td colspan="10" class="empty-cell">正在加载账号…</td></tr>
+          <tr v-else-if="!accounts.length"><td colspan="10" class="empty-cell">没有匹配的账号</td></tr>
+          <tr v-for="account in accounts" v-else :key="account.id">
+            <td class="check-cell"><input type="checkbox" class="chk" :checked="selected.has(account.id)" :aria-label="`选择 ${account.label || account.id}`" @change="toggleSelected(account.id)" /></td>
+            <td class="account-cell">
+              <strong :title="account.label || account.email || account.id">{{ account.label || account.email || account.id }}</strong>
+              <span :title="account.email || account.id">{{ account.email || account.id }}</span>
+            </td>
+            <td><span class="provider">{{ account.provider }}</span></td>
+            <td class="quota-cell">
+              <template v-if="firstQuota(account)">
+                <div class="quota-line" :title="firstQuota(account).name"><b>{{ quotaValue(firstQuota(account).remaining) }}</b><span>/ {{ quotaValue(firstQuota(account).total, firstQuota(account).unit) }}</span></div>
+                <div class="quota-bar"><span :style="{ width: `${quotaPercent(firstQuota(account))}%` }"></span></div>
+              </template>
+              <span v-else class="muted">未获取</span>
+            </td>
+            <td class="stats-cell"><div><b>{{ account.active_jobs || 0 }}</b> 在途</div><small><span class="ok">{{ account.success_total || 0 }}</span> / <span :class="Number(account.fail_total || 0) > 0 && 'bad'">{{ account.fail_total || 0 }}</span></small></td>
+            <td class="time-cell"><div title="最后使用">{{ fmtTime(account.last_used_at) }}</div><small title="导入/创建时间">{{ fmtTime(account.created_at) }}</small><small v-if="account.provider === 'byteplus'" :class="{ warn: account.session_state === 'expiring', bad: account.session_state === 'expired' }" :title="sessionLabel(account)">{{ sessionLabel(account) }} {{ fmtTime(account.session_expires_at) }}</small></td>
+            <td>
+              <input type="number" min="0" max="1000" class="compact-input" :value="account.max_concurrency || 0" title="账号并发，0 表示使用 Provider 默认值" @change="patchAccount(account,{max_concurrency:Number($event.target.value)},'concurrency')" />
+            </td>
+            <td>
+              <input type="number" min="-1000" max="1000" class="compact-input" :value="account.weight ?? 0" title="调度权重，高的优先" @change="patchAccount(account,{weight:Number($event.target.value)},'weight')" />
+            </td>
+            <td class="status-cell">
+              <span class="status" :class="`status-${account.status}`">{{ statusLabel(account.status) }}</span>
+              <div v-if="account.provider === 'dola'" class="dola-ready" :class="account.readiness === 'ready' ? 'ok' : 'warn'" :title="account.readiness_detail">{{ dolaReadinessLabel(account) }}</div>
+              <div v-if="account.image_limited || account.video_limited" class="limit-flags"><span v-if="account.image_limited">图片限额</span><span v-if="account.video_limited">视频限额</span></div>
+            </td>
+            <td>
+              <div class="row-actions">
                 <button class="icon-btn test-action" title="账号能力测试" @click="testingAccount = account"><Icon name="test" class="w-3.5 h-3.5" /></button>
                 <button class="icon-btn" :title="account.provider === 'dola' ? '重新验证协议会话（不生成视频）' : '校验账号并刷新真实额度'" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
                 <button class="switch" :class="(account.provider === 'dola' ? account.status !== 'disabled' : account.status === 'active') && 'on'" :disabled="account.provider !== 'dola' && !['active','disabled'].includes(account.status)" :title="account.status === 'disabled' ? '启用账号' : (account.provider === 'dola' || account.status === 'active' ? '停用账号' : `${statusLabel(account.status)}状态不可手动切换`)" @click="toggleAccount(account)"><span></span></button>
                 <button class="icon-btn danger" title="删除账号" @click="removeAccount(account)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
-              </div></td>
-            </tr>
-            <tr v-if="expanded.has(account.id)" class="detail-row">
-              <td colspan="11">
-                <div class="detail-grid">
-                  <section><h4>Route 授权</h4><div class="route-list"><label v-for="route in account.routes || []" :key="route.id"><span><code>{{ route.model_id || route.logical_model_id }}</code><small>{{ route.route_id }}</small></span><button class="switch" :class="route.enabled !== false && 'on'" :disabled="busy === `${account.id}:route:${route.id}`" @click="toggleAccountRoute(account, route)"><span></span></button></label><p v-if="!(account.routes || []).length">该账号没有绑定 canonical route</p></div></section>
-                  <section><h4>全部额度桶</h4><div class="bucket-list"><div v-for="bucket in account.quota_buckets || []" :key="bucket.name"><code>{{ bucket.name }}</code><b>{{ quotaValue(bucket.remaining, bucket.unit) }} / {{ quotaValue(bucket.total, bucket.unit) }}</b><small>预留 {{ quotaValue(bucket.reserved, bucket.unit) }} · 重置 {{ fmtTime(bucket.reset_at) }} · 刷新 {{ fmtTime(bucket.refreshed_at) }}</small></div><p v-if="!(account.quota_buckets || []).length">尚未获取额度</p></div></section>
-                  <section><h4>失败与限制</h4><div class="health-detail"><div><span>累计成功</span><b class="ok">{{ account.success_total || 0 }}</b></div><div><span>累计失败</span><b :class="Number(account.fail_total || 0) > 0 && 'bad'">{{ account.fail_total || 0 }}</b></div><div><span>连续账号失败</span><b :class="Number(account.consecutive_failures || 0) > 0 && 'bad'">{{ account.consecutive_failures || 0 }}</b></div><div><span>上游服务失败</span><b :class="Number(account.upstream_failures || 0) > 0 && 'warn'">{{ account.upstream_failures || 0 }}</b></div></div></section>
-                </div>
-              </td>
-            </tr>
-            </template>
-          </tbody>
-        </table>
-      </div>
-
-      <div v-if="total > limit" class="px-4 py-3 flex items-center justify-between gap-3 border-t border-white/[0.06] text-xs text-white/40">
-        <span>第 {{ page }} / {{ pages }} 页</span>
-        <nav class="pagination" aria-label="账号底部分页"><button :disabled="page <= 1" @click="goTo(page - 1)">上一页</button><button :disabled="page >= pages" @click="goTo(page + 1)">下一页</button></nav>
-      </div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
+
+    <Pager :page="page" :pages="pages" :total="total" :limit="limit" @update:page="goTo" @update:limit="changeLimit" />
 
     <div v-if="importing" class="modal-bg" @click.self="closeImportModal">
       <form class="modal-card" @submit.prevent="importAccount">
@@ -478,28 +436,28 @@ onUnmounted(() => clearInterval(readinessTimer))
 .file-picker { display:flex;align-items:center;gap:.5rem;border:1px dashed rgb(255 255 255 / .18);border-radius:.65rem;padding:.6rem .7rem;color:rgb(255 255 255 / .58);background:rgb(255 255 255 / .05);font-size:.65rem }
 .file-picker .btn-soft { color:rgb(255 255 255 / .9);background:rgb(139 92 246 / .2);box-shadow:inset 0 0 0 1px rgb(167 139 250 / .35) }
 .file-picker .btn-soft:hover { color:white;background:rgb(139 92 246 / .32) }
-.account-table { width: 100%; min-width: 1680px; table-layout: fixed; border-collapse: collapse; font-size: .72rem; }
-.account-table th { padding: .65rem .75rem; color: var(--fg-3); background: var(--surface-2); font-size: .62rem; font-weight: 600; letter-spacing: .04em; text-align: left; }
-.account-table td { padding: .7rem .75rem; color: var(--fg-2); vertical-align: middle; border-top: 1px solid var(--hairline); }
+.account-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: .72rem; }
+.account-table th { padding: .65rem .7rem; color: var(--fg-3); background: var(--surface-2); font-size: .62rem; font-weight: 600; letter-spacing: .04em; text-align: left; }
+.account-table td { padding: .65rem .7rem; color: var(--fg-2); vertical-align: middle; border-top: 1px solid var(--hairline); }
 .account-table tbody tr { transition: background-color .15s ease; }
 .account-table tbody tr:hover { background: var(--hover); }
-.account-table th:nth-child(1){width:3%}.account-table th:nth-child(2){width:15%}.account-table th:nth-child(3){width:7%}.account-table th:nth-child(4){width:15%}.account-table th:nth-child(5){width:14%}.account-table th:nth-child(6){width:9%}.account-table th:nth-child(7){width:15%}.account-table th:nth-child(8){width:7%}.account-table th:nth-child(9){width:6%}.account-table th:nth-child(10){width:7%}.account-table th:nth-child(11){width:10%}
+.account-table th:nth-child(1){width:3%}.account-table th:nth-child(2){width:18%}.account-table th:nth-child(3){width:8%}.account-table th:nth-child(4){width:14%}.account-table th:nth-child(5){width:8%}.account-table th:nth-child(6){width:12%}.account-table th:nth-child(7){width:7%}.account-table th:nth-child(8){width:7%}.account-table th:nth-child(9){width:8%}.account-table th:nth-child(10){width:15%}
 .check-cell{text-align:center!important}.chk{width:.9rem;height:.9rem;accent-color:rgb(124 58 237)}
+.account-cell { min-width: 0; }
 .account-cell strong,.account-cell span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.account-cell strong { color: var(--fg); font-size: .74rem; font-weight: 600; }.account-cell span { margin-top: .25rem; color: var(--fg-3); font-size: .62rem; }
-.route-summary{display:flex;align-items:center;gap:.35rem;color:var(--fg-3);font-size:.62rem}.route-summary>span{font-size:1rem;transition:transform .15s}.route-summary b{color:var(--fg);font-size:.72rem}
-.route-preview { display: flex; align-items: center; gap: .25rem; min-width: 0; margin-top: .35rem; overflow: hidden; }
-.route-preview span { flex: none; max-width: 7.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 999px; padding: .13rem .38rem; color: rgb(5 150 105); background: rgb(16 185 129 / .1); font: 500 .55rem ui-monospace,SFMono-Regular,monospace; }
-.quota-line { display:flex;align-items:center;justify-content:space-between;gap:.5rem;font-size:.58rem;color:var(--fg-3) }.quota-line span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.quota-line b{flex:none;color:var(--fg-2);font-weight:600}
-.quota-bar { height:.25rem;margin-top:.4rem;border-radius:999px;overflow:hidden;background:var(--surface-2) }.quota-bar span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,rgb(139 92 246),rgb(34 211 238))}
-.quota-cell small { display:block;margin-top:.3rem;color:var(--fg-faint);font-size:.56rem }
-.job-count { margin-bottom:.3rem;color:var(--fg-3);font-size:.58rem }
-.stats-cell div{color:var(--fg-3);font-size:.62rem}.stats-cell b{color:var(--fg);font-size:.78rem}.stats-cell small,.time-cell small{display:block;margin-top:.28rem;color:var(--fg-faint);font-size:.56rem}.stats-cell .ok{color:rgb(16 185 129)}.stats-cell .bad{color:rgb(244 63 94)}.time-cell div{color:var(--fg-2);font-size:.59rem;white-space:nowrap}
-.detail-row:hover{background:transparent!important}.detail-row>td{padding:0 1rem 1rem!important}.detail-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;border-radius:.7rem;padding:1rem;background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--hairline)}.detail-grid h4{margin-bottom:.6rem;color:var(--fg);font-size:.66rem;font-weight:600}.route-list,.bucket-list{display:grid;gap:.4rem}.route-list label,.bucket-list>div{display:flex;align-items:center;gap:.75rem;border-radius:.55rem;padding:.55rem .65rem;background:var(--surface)}.route-list label>span{display:flex;min-width:0;flex:1;flex-direction:column}.route-list code,.bucket-list code{color:var(--fg-2);font-size:.6rem}.route-list small,.bucket-list small{margin-top:.2rem;color:var(--fg-faint);font-size:.53rem}.bucket-list>div{align-items:flex-start;flex-direction:column}.bucket-list b{color:var(--fg-2);font-size:.62rem}.route-list p,.bucket-list p{color:var(--fg-3);font-size:.62rem}.health-detail{display:grid;grid-template-columns:1fr 1fr;gap:.4rem}.health-detail>div{display:flex;align-items:center;justify-content:space-between;gap:.5rem;border-radius:.55rem;padding:.65rem;background:var(--surface);font-size:.6rem}.health-detail span{color:var(--fg-3)}.health-detail b{color:var(--fg)}.health-detail .ok{color:rgb(16 185 129)}.health-detail .bad{color:rgb(244 63 94)}.health-detail .warn{color:rgb(245 158 11)}@media(max-width:1200px){.detail-grid{grid-template-columns:1fr 1fr}.detail-grid section:last-child{grid-column:1/-1}}@media(max-width:900px){.detail-grid{grid-template-columns:1fr}.detail-grid section:last-child{grid-column:auto}}
-.limit-flags{display:flex;flex-direction:column;align-items:flex-start;gap:.2rem;margin-top:.3rem}.limit-flags span{border-radius:999px;padding:.12rem .38rem;color:rgb(252 211 77);background:rgb(245 158 11 / .1);font-size:.52rem;white-space:nowrap}
-.compact-input { width:4.25rem;border:1px solid var(--hairline);border-radius:.45rem;padding:.3rem .45rem;color:var(--fg);background:var(--surface);font-size:.68rem;outline:none }
+.account-cell strong { color: var(--fg); font-size: .74rem; font-weight: 600; }
+.account-cell span { margin-top: .22rem; color: var(--fg-3); font-size: .62rem; }
+.quota-cell { min-width: 0; }
+.quota-line { display:flex;align-items:baseline;justify-content:space-between;gap:.35rem;min-width:0;font-size:.62rem;color:var(--fg-3) }.quota-line span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.quota-line b{flex:none;color:var(--fg-2);font-weight:600}
+.quota-bar { height:.25rem;margin-top:.35rem;border-radius:999px;overflow:hidden;background:var(--surface-2) }.quota-bar span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,rgb(139 92 246),rgb(34 211 238))}
+.muted { color: var(--fg-3); }
+.stats-cell div{color:var(--fg-3);font-size:.62rem}.stats-cell b{color:var(--fg);font-size:.78rem}.stats-cell small,.time-cell small{display:block;margin-top:.22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg-faint);font-size:.56rem}.ok{color:rgb(16 185 129)}.bad{color:rgb(244 63 94)}.warn{color:rgb(245 158 11)}.time-cell{min-width:0}.time-cell div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg-2);font-size:.62rem}
+.status-cell { min-width: 0; }
+.dola-ready { margin-top: .22rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .55rem; }
+.limit-flags{display:flex;flex-direction:column;align-items:flex-start;gap:.2rem;margin-top:.25rem}.limit-flags span{border-radius:999px;padding:.1rem .32rem;color:rgb(252 211 77);background:rgb(245 158 11 / .1);font-size:.5rem;white-space:nowrap}
+.compact-input { width: 4rem; max-width: 100%; border:1px solid var(--hairline);border-radius:.45rem;padding:.28rem .4rem;color:var(--fg);background:var(--surface);font-size:.68rem;outline:none }
 .compact-input:focus { border-color:rgb(139 92 246 / .65);box-shadow:0 0 0 2px rgb(139 92 246 / .12) }
+.row-actions { display:flex;align-items:center;justify-content:flex-end;gap:.25rem;flex-wrap:nowrap }
 .empty-cell { height:10rem;text-align:center;color:var(--fg-3)!important }
-.pagination { display:flex;align-items:center;gap:.25rem }.pagination button{min-width:1.8rem;height:1.8rem;padding:0 .5rem;border-radius:.45rem;color:var(--fg-2);background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--hairline);font-size:.65rem}.pagination button:hover:not(:disabled){color:var(--fg);background:var(--hover)}.pagination button.on{color:white;background:rgb(124 58 237);box-shadow:none}.pagination button:disabled{opacity:.35}.pagination span{padding:0 .2rem;color:var(--fg-faint)}
 .modal-bg { position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:1rem;background:rgb(0 0 0 / .65);backdrop-filter:blur(6px) }.modal-card{width:100%;max-width:42rem;display:flex;flex-direction:column;gap:1rem;border-radius:1rem;padding:1.25rem;color:rgb(255 255 255 / .7);background:#11131a;box-shadow:0 24px 80px rgb(0 0 0 / .45),inset 0 0 0 1px rgb(255 255 255 / .08)}
 </style>

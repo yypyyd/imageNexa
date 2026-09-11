@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import Icon from '../components/Icon.vue'
 import MediaLightbox from '../components/MediaLightbox.vue'
+import Pager from '../components/Pager.vue'
 import { api, apiURL, listOf } from '../api'
 import { ALL_MODELS } from '../models'
 import { copyText } from '../utils/clipboard'
@@ -13,7 +14,7 @@ const loading = ref(true)
 const error = ref('')
 const total = ref(0)
 const page = ref(1)
-const limit = 30
+const limit = ref(20)
 const credentialId = ref('')
 const model = ref('')
 const status = ref('')
@@ -24,10 +25,10 @@ const preview = ref(null)
 const toast = ref('')
 let toastTimer = null
 
-const pages = computed(() => Math.max(1, Math.ceil(total.value / limit)))
+const pages = computed(() => Math.max(1, Math.ceil(total.value / limit.value)))
 
 function buildURL() {
-  const params = new URLSearchParams({ page: String(page.value), limit: String(limit) })
+  const params = new URLSearchParams({ page: String(page.value), limit: String(limit.value) })
   if (credentialId.value) params.set('credential_id', credentialId.value)
   if (model.value) params.set('model', model.value)
   if (kind.value) params.set('kind', kind.value)
@@ -60,7 +61,20 @@ function switchTab(value) {
 }
 
 function search() { page.value = 1; load() }
-function go(delta) { page.value = Math.max(1, Math.min(pages.value, page.value + delta)); load() }
+function goTo(target) {
+  const next = Math.max(1, Math.min(pages.value, Number(target) || 1))
+  if (next === page.value) return
+  page.value = next
+  load()
+}
+
+function changeLimit(value) {
+  const next = Number(value) || limit.value
+  if (next === limit.value) return
+  limit.value = next
+  page.value = 1
+  load()
+}
 
 function flash(message) {
   toast.value = message
@@ -203,9 +217,7 @@ onMounted(() => { loadCredentials(); load() })
       </div>
     </div>
 
-    <div class="flex items-center justify-between text-xs text-white/35">
-      <span>共 {{ total }} 条</span><div class="flex items-center gap-2"><button class="btn-soft" :disabled="page <= 1" @click="go(-1)">上一页</button><span>{{ page }} / {{ pages }}</span><button class="btn-soft" :disabled="page >= pages" @click="go(1)">下一页</button></div>
-    </div>
+    <Pager :page="page" :pages="pages" :total="total" :limit="limit" @update:page="goTo" @update:limit="changeLimit" />
 
     <MediaLightbox v-if="preview && mediaURL(preview)" :src="mediaURL(preview)" :kind="preview.kind === 'video' || String(preview.mime_type).startsWith('video/') ? 'video' : 'image'" :prompt="preview.prompt || ''" :meta="[preview.model,keyName(preview)].filter(Boolean).join(' · ')" :meta-sub="[requestParams(preview),fmtSize(preview.size_bytes),fmtTime(preview.created_at)].filter((value) => value && value !== '—').join(' · ')" @close="preview = null" />
     <div v-if="toast" class="toast">{{ toast }}</div>
