@@ -77,9 +77,9 @@ func (c *Client) proxyValue() string {
 	return c.proxy
 }
 
-// IsGrokToken reports whether a JWT looks like a Grok website "sso" cookie: a
-// payload whose ONLY claim is "session_id". That disambiguates it from a runway
-// token (id + sso claims) or a chatgpt token (openai.com claims).
+// IsGrokToken reports whether a JWT looks like a Grok website "sso" cookie.
+// The website session always carries session_id. Extra claims are allowed so
+// newer sso cookies still import; OpenAI claims are rejected.
 func IsGrokToken(token string) bool {
 	claims := decodeJWTPayload(token)
 	if len(claims) == 0 {
@@ -88,16 +88,31 @@ func IsGrokToken(token string) bool {
 	if _, ok := claims["session_id"]; !ok {
 		return false
 	}
-	// Reject tokens that ALSO carry other-provider markers.
 	for k := range claims {
-		if k == "session_id" {
-			continue
-		}
-		if k == "sso" || k == "id" || strings.HasPrefix(k, "https://api.openai.com/") {
+		if strings.HasPrefix(k, "https://api.openai.com/") {
 			return false
 		}
 	}
 	return true
+}
+
+// IsGrokOAuthToken reports whether a JWT is an xAI / Grok CLI OAuth access
+// token. Those are not website sso cookies and cannot drive grok.com media.
+func IsGrokOAuthToken(token string) bool {
+	if IsGrokToken(token) {
+		return false
+	}
+	claims := decodeJWTPayload(token)
+	if len(claims) == 0 {
+		return false
+	}
+	for k := range claims {
+		if strings.HasPrefix(k, "https://api.openai.com/") {
+			return false
+		}
+	}
+	iss := strings.ToLower(stringValue(claims["iss"]) + " " + stringValue(claims["issuer"]))
+	return strings.Contains(iss, "x.ai") || strings.Contains(iss, "grok.com")
 }
 
 // SessionIDFromToken returns the sso session id (for dedup / display).

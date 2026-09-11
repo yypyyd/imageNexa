@@ -65,7 +65,7 @@ Authorization: Bearer sk-your-api-key
 
 ## Canonical 模型闭集
 
-`GET /v1/models` 只返回以下 26 个公共 ID。同一产品的多个渠道不会合并。Runway 和 Custom 暂不作为公开渠道。内部 route ID 和上游模型名不能作为 API 的 `model` 值。
+`GET /v1/models` 只返回以下 21 个公共 ID。同一产品的多个渠道不会合并。Oreate、Runway 和 Custom 已退出公开目录。内部 route ID 和上游模型名不能作为 API 的 `model` 值。
 
 ### 文本（4）
 
@@ -87,17 +87,12 @@ Authorization: Bearer sk-your-api-key
 - `adobe-nano-banana-pro`
 - `grok-imagine-image`
 
-### 视频（12）
+### 视频（7）
 
 - `kling-3`
 - `kling-o3`
 - `adobe-seedance-2.0`
-- `oreate-seedance-2.0`
 - `adobe-seedance-2.0-fast`
-- `oreate-seedance-2.0-fast`
-- `seedance-2.0-mini`
-- `seedance-1.5-pro`
-- `oreate-seedance-2.5`
 - `dola-seedance-2.5`（Dola 专用，30 秒）
 - `grok-imagine-video`
 - `firefly-video`
@@ -134,7 +129,7 @@ Cookie 和 ARP 都不会出现在账号列表、日志或 API 响应中。升级
 
 ## Dola 账号导入
 
-Dola（豆包国际版，dola.com）只通过公共模型 `dola-seedance-2.5` 提供视频（上游即 Dreamina Seedance 2.5），不再与 Oreate 的 `oreate-seedance-2.5` 合并。导入物是 dola.com 的完整浏览器 Cookie；Cookie 必须同时包含有效 `sessionid` 与 `s_v_web_id`（通常还带 `msToken`），粘贴到"账号"页或导入文本框即可自动识别为 Dola 凭据。同一 `sessionid` 重复导入会原位覆盖，不会新建重复账号。
+Dola（豆包国际版，dola.com）只通过公共模型 `dola-seedance-2.5` 提供视频（上游即 Dreamina Seedance 2.5）。导入物是 dola.com 的完整浏览器 Cookie；Cookie 必须同时包含有效 `sessionid` 与 `s_v_web_id`（通常还带 `msToken`），粘贴到"账号"页或导入文本框即可自动识别为 Dola 凭据。同一 `sessionid` 重复导入会原位覆盖，不会新建重复账号。
 
 要求与限制：
 
@@ -292,7 +287,7 @@ DESIGN.md                架构、数据模型、安全边界与调度语义
 
 本项目基于 [MIT License](LICENSE) 开源。
 
-`GET /v1/models` 和 `GET /v1/models?extended=true` 均返回 `dola-seedance-2.5`。下游拉取后选择该模型即可固定使用 Dola 账号池，`POST /v1/videos` 参数为 `seconds: "30"`、`resolution: "720p"`，不接受参考媒体。Oreate 使用独立的 `oreate-seedance-2.5`。每个 Dola 账号每天 2 次额度，默认单号并发 1。
+`GET /v1/models` 和 `GET /v1/models?extended=true` 均返回 `dola-seedance-2.5`。下游拉取后选择该模型即可固定使用 Dola 账号池，`POST /v1/videos` 参数为 `seconds: "30"`、`resolution: "720p"`，不接受参考媒体。每个 Dola 账号每天 2 次额度，默认单号并发 1。
 
 ### Dola Cookie 导入与协议调度
 

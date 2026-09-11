@@ -260,6 +260,8 @@ func safeAdminValidationMessage(err error) (string, bool) {
 		"not a runway token",
 		"sso token required",
 		"not a grok sso token",
+		"this token is grok, not chatgpt",
+		"grok 需要网站 sso Cookie，不能导入 Sub2API/CPA 的 OAuth access_token",
 		"not an OreateAI cookie",
 		"base_url required",
 		"base_url and key required",

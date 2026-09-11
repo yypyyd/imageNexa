@@ -9,22 +9,17 @@ const (
 	maxReferencePixels = 100_000_000
 )
 
-// facePanelModels are the Adobe and Oreate Seedance routes that accept image
-// references and receive the local Pigo face-panel transform.
+// facePanelModels are the Adobe Seedance routes that accept image references
+// and receive the local Pigo face-panel transform.
 var facePanelModels = map[string]bool{
-	"firefly-seedance-2":       true,
-	"firefly-seedance-2-fast":  true,
-	"adobe-seedance-2.0":       true,
-	"adobe-seedance-2.0-fast":  true,
-	"seedance20":               true,
-	"seedance20-fast":          true,
-	"sd2.0":                    true,
-	"sd2.0-fast":               true,
-	"oreate-seedance-1.5-pro":  true,
-	"oreate-seedance-2.0-mini": true,
-	"oreate-seedance-2.0-fast": true,
-	"oreate-seedance-2.0":      true,
-	"oreate-seedance-2.5":      true,
+	"firefly-seedance-2":      true,
+	"firefly-seedance-2-fast": true,
+	"adobe-seedance-2.0":      true,
+	"adobe-seedance-2.0-fast": true,
+	"seedance20":              true,
+	"seedance20-fast":         true,
+	"sd2.0":                   true,
+	"sd2.0-fast":              true,
 }
 
 // facePanelTransformEnabled 是人脸遮罩网格的总开关：置为 false 时所有模型都收到

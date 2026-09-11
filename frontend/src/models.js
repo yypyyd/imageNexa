@@ -22,12 +22,7 @@ export const VIDEO_MODELS = Object.freeze([
   'kling-3',
   'kling-o3',
   'adobe-seedance-2.0',
-  'oreate-seedance-2.0',
   'adobe-seedance-2.0-fast',
-  'oreate-seedance-2.0-fast',
-  'seedance-2.0-mini',
-  'seedance-1.5-pro',
-  'oreate-seedance-2.5',
   'dola-seedance-2.5',
   'grok-imagine-video',
   'firefly-video',
@@ -46,7 +41,6 @@ export const ACCOUNT_PROVIDERS = Object.freeze([
   'byteplus',
   'adobe',
   'grok',
-  'oreate',
   'dola',
 ])
 

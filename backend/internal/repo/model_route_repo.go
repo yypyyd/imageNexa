@@ -150,7 +150,7 @@ func (r *ModelRouteRepository) ListRoutes(ctx context.Context, logicalID string,
 	}
 	var items []model.ModelRoute
 	query := r.db.WithContext(ctx).Where("logical_model_id = ?", logicalID).Order("priority desc, weight desc, id asc")
-	query = query.Where("id IN ? OR (provider = ? AND id = ?)", canonicalRouteIDs(), "custom", "custom."+logicalID)
+	query = query.Where("id IN ?", canonicalRouteIDs())
 	if enabledOnly {
 		query = query.Where("enabled = ?", true)
 	}

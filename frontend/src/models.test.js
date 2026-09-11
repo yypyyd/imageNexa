@@ -5,9 +5,9 @@ import { ACCOUNT_PROVIDERS, ALL_MODELS, IMAGE_MODELS, MODEL_KIND, TEXT_MODELS, V
 test('canonical model catalog is closed and unique', () => {
   assert.equal(TEXT_MODELS.length, 4)
   assert.equal(IMAGE_MODELS.length, 10)
-  assert.equal(VIDEO_MODELS.length, 12)
-  assert.equal(new Set(ALL_MODELS).size, 26)
-  assert.equal(Object.keys(MODEL_KIND).length, 26)
+  assert.equal(VIDEO_MODELS.length, 7)
+  assert.equal(new Set(ALL_MODELS).size, 21)
+  assert.equal(Object.keys(MODEL_KIND).length, 21)
 })
 
 test('multi-provider products are split into per-channel public ids', () => {
@@ -31,21 +31,26 @@ test('multi-provider products are split into per-channel public ids', () => {
   assert.equal(isCanonicalModel('runway-nano-banana-2'), false)
   assert.equal(isCanonicalModel('runway-nano-banana-pro'), false)
   assert.equal(isCanonicalModel('seedance-2.0'), false)
+  assert.equal(isCanonicalModel('oreate-seedance-2.0'), false)
+  assert.equal(isCanonicalModel('oreate-seedance-2.0-fast'), false)
+  assert.equal(isCanonicalModel('oreate-seedance-2.5'), false)
+  assert.equal(isCanonicalModel('seedance-2.0-mini'), false)
+  assert.equal(isCanonicalModel('seedance-1.5-pro'), false)
   assert.equal(isCanonicalModel('seedance-2.5'), false)
   assert.equal(isCanonicalModel('lumina-image'), false)
   assert.equal(isCanonicalModel('firefly-image-5'), false)
   assert.equal(isCanonicalModel('krea-image'), false)
 })
 
-test('account console hides deferred runway and custom pools', () => {
+test('account console hides retired oreate, runway, and custom pools', () => {
   assert.deepEqual(ACCOUNT_PROVIDERS, [
     'chatgpt',
     'byteplus',
     'adobe',
     'grok',
-    'oreate',
     'dola',
   ])
+  assert.equal(ACCOUNT_PROVIDERS.includes('oreate'), false)
   assert.equal(ACCOUNT_PROVIDERS.includes('runway'), false)
   assert.equal(ACCOUNT_PROVIDERS.includes('custom'), false)
 })

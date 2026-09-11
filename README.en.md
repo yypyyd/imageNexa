@@ -65,7 +65,7 @@ Errors use the OpenAI shape:
 
 ## Closed Canonical Model Catalog
 
-`GET /v1/models` returns only these 26 public IDs. Channels that offer the same product are not merged. Runway and Custom are not public channels yet. Provider route IDs and upstream model names are invalid as API `model` values.
+`GET /v1/models` returns only these 21 public IDs. Channels that offer the same product are not merged. Oreate, Runway, and Custom are not public channels. Provider route IDs and upstream model names are invalid as API `model` values.
 
 ### Text (4)
 
@@ -87,17 +87,12 @@ Errors use the OpenAI shape:
 - `adobe-nano-banana-pro`
 - `grok-imagine-image`
 
-### Video (12)
+### Video (7)
 
 - `kling-3`
 - `kling-o3`
 - `adobe-seedance-2.0`
-- `oreate-seedance-2.0`
 - `adobe-seedance-2.0-fast`
-- `oreate-seedance-2.0-fast`
-- `seedance-2.0-mini`
-- `seedance-1.5-pro`
-- `oreate-seedance-2.5`
 - `dola-seedance-2.5` (Dola-only, 30 seconds)
 - `grok-imagine-video`
 - `firefly-video`

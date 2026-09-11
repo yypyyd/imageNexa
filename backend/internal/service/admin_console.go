@@ -960,7 +960,7 @@ func normalizeAdminProvider(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "openai", "chatgpt":
 		return "chatgpt"
-	case "adobe", "byteplus", "runway", "grok", "oreate", "dola", "custom":
+	case "adobe", "byteplus", "grok", "dola":
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return ""

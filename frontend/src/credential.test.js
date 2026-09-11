@@ -41,6 +41,73 @@ test('distinguishes ChatGPT and Grok JWT claims and ignores Runway', () => {
   ])
 })
 
+test('does not classify Sub2API Grok accounts as ChatGPT', () => {
+  const sso = jwt({ session_id: 'grok-session' })
+  const oauth = jwt({ iss: 'https://auth.x.ai', sub: 'user-1', client_id: 'grok-cli' })
+  const input = JSON.stringify({
+    type: 'sub2api-data',
+    version: 1,
+    accounts: [
+      { platform: 'grok', type: 'oauth', credentials: { sso } },
+      { platform: 'grok', type: 'oauth', credentials: { access_token: oauth, refresh_token: 'refresh' } },
+    ],
+  })
+  assert.deepEqual(parseCredentialImports(input).map((item) => item.provider), ['grok', 'grok'])
+})
+
+test('keeps ChatGPT Sub2API accounts on ChatGPT', () => {
+  const accessToken = jwt({ 'https://api.openai.com/profile': { email: 'user@example.com' } })
+  const input = JSON.stringify({
+    type: 'sub2api-data',
+    accounts: [{
+      platform: 'openai',
+      type: 'oauth',
+      credentials: { access_token: accessToken, auth_mode: 'chatgpt' },
+    }],
+  })
+  assert.deepEqual(parseCredentialImports(input), [{ provider: 'chatgpt', credential: accessToken }])
+})
+
+test('treats xAI access tokens as Grok even without a platform field', () => {
+  const oauth = jwt({ iss: 'https://auth.x.ai', sub: 'user-2' })
+  assert.deepEqual(parseCredentialImports(JSON.stringify({ access_token: oauth })), [
+    { provider: 'grok', credential: oauth },
+  ])
+})
+
+test('does not treat Sub2API Grok OAuth exports as ChatGPT', () => {
+  const grokSSO = jwt({ session_id: 'session-281' })
+  const grokOAuth = jwt({ iss: 'https://auth.x.ai', sub: 'user-1', client_id: 'grok-cli' })
+  const input = JSON.stringify({
+    type: 'sub2api-data',
+    version: 1,
+    accounts: [
+      { platform: 'grok', type: 'oauth', name: 'a@x.ai', credentials: { access_token: grokOAuth } },
+      { platform: 'grok', type: 'oauth', credentials: { sso: grokSSO, access_token: grokOAuth } },
+    ],
+  })
+  const items = parseCredentialImports(input)
+  assert.deepEqual(items.map((item) => item.provider), ['grok', 'grok'])
+  assert.equal(items[1].credential, grokSSO)
+})
+
+test('still imports Sub2API ChatGPT accounts as ChatGPT', () => {
+  const accessToken = jwt({ 'https://api.openai.com/profile': { email: 'user@example.com' } })
+  const items = parseCredentialImports(JSON.stringify({
+    type: 'sub2api-data',
+    accounts: [{
+      platform: 'openai',
+      credentials: { access_token: accessToken, auth_mode: 'chatgpt' },
+    }],
+  }))
+  assert.deepEqual(items, [{ provider: 'chatgpt', credential: accessToken }])
+})
+
+test('classifies xAI issuer JWTs as Grok even without session_id', () => {
+  const token = jwt({ iss: 'https://auth.x.ai', sub: 'acct' })
+  assert.deepEqual(parseCredentialImports(token).map((item) => item.provider), ['grok'])
+})
+
 test('auto-detects Dola cookies by sessionid plus s_v_web_id', () => {
   const cookie = 'sessionid=abc; sessionid_ss=abc; s_v_web_id=verify%2Fx; msToken=ENIAMtoken; ttwid=1%7Cx'
   const imports = parseCredentialImports(cookie)
@@ -49,13 +116,13 @@ test('auto-detects Dola cookies by sessionid plus s_v_web_id', () => {
   assert.equal(imports[0].credential, cookie)
 })
 
-test('auto-detects BytePlus, OreateAI, and Adobe cookies', () => {
+test('auto-detects BytePlus and Adobe cookies and ignores OreateAI', () => {
   const imports = parseCredentialImports([
     'csrfToken=csrf; sessionid=session',
     'OUID=user; ouss=session',
     'AdobeAuth=opaque; other=value',
   ].join('\n'))
-  assert.deepEqual(imports.map((item) => item.provider), ['byteplus', 'oreate', 'adobe'])
+  assert.deepEqual(imports.map((item) => item.provider), ['byteplus', 'adobe'])
 })
 
 test('recognizes Passport login-only Dola exports without a fingerprint cookie', () => {
@@ -113,16 +180,15 @@ test('parses and deduplicates account JSON files from a ZIP', () => {
   assert.deepEqual(parseCredentialFileBytes(archive, 'accounts.zip'), [{ provider: 'chatgpt', credential: token }])
 })
 
-test('does not retain OreateAI export passwords', () => {
+test('rejects OreateAI exports from account import', () => {
   const exported = {
     cookie: 'OUID=device-id; ouss=session-cookie',
     email: 'oreate@example.com',
     password: 'must-not-survive',
   }
   const items = parseCredentialImports(JSON.stringify(exported))
-  assert.equal(items[0].provider, 'oreate')
+  assert.deepEqual(items, [])
   assert.equal(JSON.stringify(items).includes(exported.password), false)
-  assert.equal(JSON.stringify(items).includes('password'), false)
 })
 
 test('does not misclassify an isolated csrf cookie as BytePlus', () => {

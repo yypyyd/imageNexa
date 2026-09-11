@@ -24,7 +24,6 @@ const PROVIDER_LABELS = {
   chatgpt: 'ChatGPT',
   dola: 'Dola (豆包国际版)',
   grok: 'Grok',
-  oreate: 'OreateAI',
 }
 
 const visibleProviders = computed(() => Object.keys(providers).filter((pool) => ACCOUNT_PROVIDERS.includes(pool)).sort())

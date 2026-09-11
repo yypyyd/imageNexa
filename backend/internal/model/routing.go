@@ -264,11 +264,10 @@ func secondsRange(first, last int) []string {
 // CanonicalRoutingCatalog is the closed public model set. Runtime and upstream
 // ids stay on ModelRoute. Multi-provider products use `{provider}-{product}`
 // public IDs so clients select a channel explicitly; single-provider products
-// keep their unprefixed names. Runway and Custom are not public channels.
+// keep their unprefixed names. Oreate, Runway, and Custom are not public channels.
 func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 	commonImageRatios := []string{"1:1", "16:9", "9:16", "4:3", "3:4"}
 	adobeWideRatios := []string{"1:1", "5:4", "9:16", "21:9", "16:9", "4:3", "3:2", "4:5", "3:4", "2:3"}
-	seedanceRatios := []string{"16:9", "1:1", "3:4", "4:3", "9:16", "21:9"}
 	// Dola's web picker exposes a fixed ratio set on the video panel.
 	dolaRatios := []string{"16:9", "9:16", "1:1", "4:3", "3:4"}
 	return []CanonicalModelDefinition{
@@ -324,23 +323,8 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 		{Model: LogicalModel{ID: "adobe-seedance-2.0", Kind: "video", Name: "Adobe Seedance 2.0", Enabled: true}, Routes: []ModelRoute{
 			route("video.seedance-2.0.adobe", "adobe-seedance-2.0", "adobe", "firefly-seedance-2", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
 		}},
-		{Model: LogicalModel{ID: "oreate-seedance-2.0", Kind: "video", Name: "Oreate Seedance 2.0", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-2.0.oreate", "oreate-seedance-2.0", "oreate", "oreate-seedance-2.0", "seedance-2.0", 100, videoProfile(seedanceRatios, []string{"480p", "720p", "1080p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
-		}},
 		{Model: LogicalModel{ID: "adobe-seedance-2.0-fast", Kind: "video", Name: "Adobe Seedance 2.0 Fast", Enabled: true}, Routes: []ModelRoute{
 			route("video.seedance-2.0-fast.adobe", "adobe-seedance-2.0-fast", "adobe", "firefly-seedance-2-fast", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
-		}},
-		{Model: LogicalModel{ID: "oreate-seedance-2.0-fast", Kind: "video", Name: "Oreate Seedance 2.0 Fast", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-2.0-fast.oreate", "oreate-seedance-2.0-fast", "oreate", "oreate-seedance-2.0-fast", "seedance-2.0-fast", 100, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
-		}},
-		{Model: LogicalModel{ID: "seedance-2.0-mini", Kind: "video", Name: "Seedance 2.0 Mini", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-2.0-mini.oreate", "seedance-2.0-mini", "oreate", "oreate-seedance-2.0-mini", "seedance-2.0-mini", 100, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s"}, 9, 3, 0, 12, true, "asset")),
-		}},
-		{Model: LogicalModel{ID: "seedance-1.5-pro", Kind: "video", Name: "Seedance 1.5 Pro", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-1.5-pro.oreate", "seedance-1.5-pro", "oreate", "oreate-seedance-1.5-pro", "seedance-1.5-pro", 100, videoProfile(seedanceRatios, []string{"480p", "720p", "1080p"}, []string{"5s", "10s"}, 2, 0, 0, 2, true, "frame")),
-		}},
-		{Model: LogicalModel{ID: "oreate-seedance-2.5", Kind: "video", Name: "Oreate Seedance 2.5", Enabled: true}, Routes: []ModelRoute{
-			route("video.seedance-2.5.oreate", "oreate-seedance-2.5", "oreate", "oreate-seedance-2.5", "seedance-2.5", 100, videoProfile(seedanceRatios, []string{"480p", "720p"}, []string{"5s", "10s", "20s", "30s"}, 9, 3, 0, 12, true, "asset")),
 		}},
 		{Model: LogicalModel{ID: DolaPublicVideoModel, Kind: "video", Name: "Dola Seedance 2.5", Enabled: true}, Routes: []ModelRoute{
 			route("video.dola-seedance-2.5.dola", DolaPublicVideoModel, "dola", "dola-seedance-2.5", "seedance_v2.5", 100, videoProfile(dolaRatios, []string{"720p"}, []string{"30s"}, 0, 0, 0, 0, true, "")),
@@ -368,8 +352,9 @@ func IsCanonicalRoute(route ModelRoute) bool {
 	if route.LogicalModelID == DolaPublicVideoModel && route.Provider != "dola" {
 		return false
 	}
-	if route.Provider == "custom" {
-		return IsCanonicalModelID(route.LogicalModelID) && route.ID == "custom."+route.LogicalModelID
+	switch route.Provider {
+	case "oreate", "runway", "custom":
+		return false
 	}
 	for _, definition := range CanonicalRoutingCatalog() {
 		for _, candidate := range definition.Routes {

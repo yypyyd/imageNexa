@@ -302,6 +302,9 @@ func (s *TokenService) ImportChatGPTToken(ctx context.Context, accessToken, toke
 	if accessToken == "" {
 		return nil, errors.New("access_token required")
 	}
+	if grok.IsGrokToken(accessToken) || grok.IsGrokOAuthToken(accessToken) {
+		return nil, errors.New("this token is grok, not chatgpt")
+	}
 	// Land as pending and return instantly; a background worker probes quota and
 	// flips the row active/dead (Python import_chatgpt_token). pending tokens are
 	// not schedulable — the pool only hands out status=="active".
@@ -1116,6 +1119,9 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 	ssoToken = strings.TrimPrefix(ssoToken, "sso=")
 	if ssoToken == "" {
 		return nil, errors.New("sso token required")
+	}
+	if grok.IsGrokOAuthToken(ssoToken) {
+		return nil, errors.New("grok 需要网站 sso Cookie，不能导入 Sub2API/CPA 的 OAuth access_token")
 	}
 	if !grok.IsGrokToken(ssoToken) {
 		return nil, errors.New("not a grok sso token")

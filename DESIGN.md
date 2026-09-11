@@ -101,7 +101,7 @@ The catalog is versioned data, not a user-extensible namespace. Startup settings
 
 ### Video
 
-`kling-3`, `kling-o3`, `adobe-seedance-2.0`, `oreate-seedance-2.0`, `adobe-seedance-2.0-fast`, `oreate-seedance-2.0-fast`, `seedance-2.0-mini`, `seedance-1.5-pro`, `oreate-seedance-2.5`, `dola-seedance-2.5`, `grok-imagine-video`, `firefly-video`
+`kling-3`, `kling-o3`, `adobe-seedance-2.0`, `adobe-seedance-2.0-fast`, `dola-seedance-2.5`, `grok-imagine-video`, `firefly-video`
 
 A provider implementation is represented by a `ModelRoute`. When a product exists on more than one provider, clients request a provider-prefixed public ID such as `chatgpt-gpt-image-2` or `byteplus-gpt-image-2`. Single-provider products keep unprefixed IDs. Retired merged IDs such as `gpt-image-2` and `seedance-2.5` return `model_not_found`.
 
@@ -474,4 +474,12 @@ Dola 的发布验证重点包括请求结构、时长限制、导入识别、就
 
 **Reason**: Channels differ in ratio, resolution, duration, and reference limits. Unioning capabilities and failing over across providers hid those differences and made the public catalog look like a single product. Runway and Custom stay out of the public catalog until those channels are ready.
 
-**Impact**: The closed catalog is 26 models (4 text, 10 image, 12 video). Requests using a retired merged ID, `runway-nano-banana-2`, or `runway-nano-banana-pro` receive `model_not_found`. Scheduling fails over across accounts on the selected native channel only. Existing Custom bindings on merged IDs are not cloned onto the new IDs. The administrator console, settings provider switches, and credential import omit Runway and Custom.
+**Impact**: The closed catalog became 26 models (4 text, 10 image, 12 video). Requests using a retired merged ID, `runway-nano-banana-2`, or `runway-nano-banana-pro` receive `model_not_found`. Scheduling fails over across accounts on the selected native channel only. Existing Custom bindings on merged IDs are not cloned onto the new IDs. The administrator console, settings provider switches, and credential import omit Runway and Custom.
+
+### 2026-09-11 — Retire Oreate, Runway, and Custom
+
+**Change**: Remove Oreate, Runway, and Custom from the public catalog, administrator account console, settings switches, and credential import. Migration 000021 deletes leftover `provider_accounts` in those pools (cookies and keys included), disables leftover routes, and drops unreferenced routes/models. Dispatch history is retained.
+
+**Reason**: These three channels are no longer operated. Leftover accounts and public IDs were still visible after earlier deferrals.
+
+**Impact**: The closed catalog is 21 models (4 text, 10 image, 7 video). Requests for `oreate-seedance-*`, `seedance-2.0-mini`, `seedance-1.5-pro`, Runway IDs, or Custom bindings receive `model_not_found`. Seedance video remains on Adobe and Dola.

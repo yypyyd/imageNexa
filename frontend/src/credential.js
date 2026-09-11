@@ -34,13 +34,54 @@ function looksLikeJWT(value) {
   return parts.length === 3 && parts.every((part) => part.length > 4 && /^[A-Za-z0-9_-]+$/.test(part))
 }
 
+function jwtHeader(value) {
+  try {
+    let header = String(value || '').replace(/^Bearer\s+/i, '').trim().split('.')[0]
+    if (!header) return null
+    header = header.replace(/-/g, '+').replace(/_/g, '/')
+    header += '='.repeat((4 - header.length % 4) % 4)
+    return JSON.parse(atob(header))
+  } catch {
+    return null
+  }
+}
+
 function jwtProvider(value) {
   const claims = decodeJWTPayload(value)
   if (!claims || typeof claims !== 'object') return 'chatgpt'
-  const hasOpenAIClaims = Object.keys(claims).some((key) => key.startsWith('https://api.openai.com/'))
-  if (!hasOpenAIClaims && 'sso' in claims && claims.id != null) return 'runway'
-  if (!hasOpenAIClaims && !('sso' in claims) && claims.id == null && 'session_id' in claims) return 'grok'
+  if (Object.keys(claims).some((key) => key.startsWith('https://api.openai.com/'))) return 'chatgpt'
+  const iss = String(claims.iss || claims.issuer || '').toLowerCase()
+  if (iss.includes('x.ai') || iss.includes('grok.com')) return 'grok'
+  const typ = String(jwtHeader(value)?.typ || '').toLowerCase()
+  if (typ === 'at+jwt') return 'grok'
+  if ('session_id' in claims) return 'grok'
+  if ('sso' in claims && claims.id != null) return 'runway'
   return 'chatgpt'
+}
+
+function declaredPlatform(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const fields = [value.platform, value.provider, value.channel, value.source]
+  for (const raw of fields) {
+    const name = String(raw || '').toLowerCase().trim()
+    if (name === 'grok' || name === 'xai' || name === 'x.ai' || name === 'grok.com') return 'grok'
+    if (name === 'openai' || name === 'chatgpt' || name === 'codex') return 'chatgpt'
+    if (name === 'adobe' || name === 'firefly') return 'adobe'
+    if (name === 'byteplus' || name === 'lumina') return 'byteplus'
+    if (name === 'dola') return 'dola'
+  }
+  const type = String(value.type || '').toLowerCase().trim()
+  if (type === 'xai') return 'grok'
+  if (type === 'codex') return 'chatgpt'
+  return ''
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const text = String(value ?? '').trim()
+    if (text) return text
+  }
+  return ''
 }
 
 function cookieFromObject(value) {
@@ -113,45 +154,77 @@ function classifyString(value) {
 
 function chatGPTCredentials(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-
-  if (Array.isArray(value.accounts)) {
-    const items = []
-    for (const account of value.accounts) {
-      const parsed = parseJSONValue(account)
-      items.push(...parsed)
-    }
-    return items
-  }
+  if (declaredPlatform(value) === 'grok') return null
 
   if (value.credentials && typeof value.credentials === 'object') {
-    const platform = String(value.platform || '').toLowerCase()
     const mode = String(value.credentials.auth_mode || '').toLowerCase()
-    if (platform === 'openai' || mode === 'chatgpt' || mode === 'agentidentity' || 'access_token' in value.credentials) {
+    const platform = declaredPlatform(value)
+    if (platform === 'chatgpt' || mode === 'chatgpt' || mode === 'agentidentity') {
       return value.credentials.access_token ? classifyString(value.credentials.access_token) : []
     }
   }
 
   const type = String(value.type || '').toLowerCase()
   const mode = String(value.auth_mode || '').toLowerCase()
-  if (type === 'codex' || mode === 'chatgpt' || mode === 'agentidentity' || 'access_token' in value) {
+  if (type === 'codex' || mode === 'chatgpt' || mode === 'agentidentity' || declaredPlatform(value) === 'chatgpt') {
     return value.access_token ? classifyString(value.access_token) : []
   }
+  if (typeof value.access_token === 'string' && value.access_token.trim()) {
+    return classifyString(value.access_token)
+  }
   return null
+}
+
+function grokSecret(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const creds = value.credentials && typeof value.credentials === 'object' && !Array.isArray(value.credentials)
+    ? value.credentials
+    : {}
+  const extra = value.extra && typeof value.extra === 'object' && !Array.isArray(value.extra)
+    ? value.extra
+    : {}
+  return firstNonEmpty(
+    value.sso, value.sso_token, value['sso-rw'],
+    creds.sso, creds.sso_token, creds['sso-rw'],
+    extra.sso, extra.sso_token, extra['sso-rw'],
+    ssoFromCookie(cookieFromObject(value)),
+    ssoFromCookie(cookieFromObject(creds)),
+    ssoFromCookie(value.cookie),
+    ssoFromCookie(creds.cookie),
+    creds.access_token, value.access_token, value.token, creds.token, creds.key, value.key,
+  )
+}
+
+function ssoFromCookie(cookie) {
+  return String(cookie || '').match(/(?:^|;\s*)sso=([^;]+)/i)?.[1]?.trim() || ''
 }
 
 function grokCredentials(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const keys = Object.keys(value).filter((key) => /^sso[\w-]*$/i.test(key) && Array.isArray(value[key]))
-  if (!keys.length) return null
-
-  const items = []
-  for (const key of keys) {
-    for (const entry of value[key]) {
-      const token = typeof entry === 'string' ? entry : entry?.token || entry?.sso || entry?.value
-      if (token) items.push(...classifyString(token))
+  if (keys.length) {
+    const items = []
+    for (const key of keys) {
+      for (const entry of value[key]) {
+        const token = typeof entry === 'string' ? entry : entry?.token || entry?.sso || entry?.value
+        if (token) items.push(...classifyString(token))
+      }
     }
+    if (declaredPlatform(value) === 'grok') {
+      return items.map((item) => (item.provider === 'runway' ? item : { ...item, provider: 'grok' }))
+    }
+    return items.filter((item) => item.provider === 'grok')
   }
-  return items.filter((item) => item.provider === 'grok')
+
+  const platform = declaredPlatform(value)
+  const secret = grokSecret(value)
+  if (platform === 'grok') {
+    return secret ? classifyString(secret).map((item) => (item.provider === 'runway' ? item : { ...item, provider: 'grok' })) : []
+  }
+  if (secret && jwtProvider(secret.replace(/^Bearer\s+/i, '').replace(/^sso=/i, '').trim()) === 'grok') {
+    return classifyString(secret)
+  }
+  return null
 }
 
 function parseJSONValue(value) {
@@ -159,6 +232,10 @@ function parseJSONValue(value) {
     return classifyString(value.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '))
   }
   if (Array.isArray(value)) return value.flatMap((item) => parseJSONValue(item))
+
+  if (value && typeof value === 'object' && Array.isArray(value.accounts)) {
+    return value.accounts.flatMap((item) => parseJSONValue(item))
+  }
 
   const grok = grokCredentials(value)
   if (grok !== null) return grok

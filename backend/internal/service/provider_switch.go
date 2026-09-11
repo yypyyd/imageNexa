@@ -16,11 +16,12 @@ func providerSettingKey(pool string) string {
 	return "provider." + pool + ".enabled"
 }
 
-// deferredAccountProviders stay in the token pool map so leftover rows can be
-// inspected, but they are not console-visible, importable, or schedulable.
+// deferredAccountProviders stay in the token pool map so leftover adapter code
+// can compile, but they are not console-visible, importable, or schedulable.
 var deferredAccountProviders = map[string]bool{
 	"runway": true,
 	"custom": true,
+	"oreate": true,
 }
 
 func isDeferredAccountProvider(pool string) bool {
@@ -79,6 +80,9 @@ func filterEnabledProviderRoutes(ctx context.Context, settings settingValueReade
 	decisions := map[string]bool{}
 	out := make([]model.ModelRoute, 0, len(routes))
 	for _, route := range routes {
+		if isDeferredAccountProvider(route.Provider) {
+			continue
+		}
 		enabled, seen := decisions[route.Provider]
 		if !seen {
 			var err error

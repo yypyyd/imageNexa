@@ -8,7 +8,7 @@ import { ACCOUNT_PROVIDERS } from '../models'
 import { parseCredentialFile, parseCredentialImports, uniqueCredentialImports } from '../credential'
 
 const ALLOWED_PROVIDERS = ACCOUNT_PROVIDERS
-const PROVIDER_OPTIONS = ALLOWED_PROVIDERS.map((value) => ({ value, label: value === 'chatgpt' ? 'ChatGPT' : value === 'oreate' ? 'OreateAI' : value === 'dola' ? 'Dola' : value[0].toUpperCase() + value.slice(1) }))
+const PROVIDER_OPTIONS = ALLOWED_PROVIDERS.map((value) => ({ value, label: value === 'chatgpt' ? 'ChatGPT' : value === 'dola' ? 'Dola' : value[0].toUpperCase() + value.slice(1) }))
 const PROVIDER_LABELS = Object.fromEntries(PROVIDER_OPTIONS.map((option) => [option.value, option.label]))
 
 const accounts = ref([])
@@ -424,7 +424,7 @@ onUnmounted(() => clearInterval(readinessTimer))
     <div v-if="importing" class="modal-bg" @click.self="closeImportModal">
       <form class="modal-card" @submit.prevent="importAccount">
         <div class="flex items-center justify-between"><h3 class="font-semibold text-white/90">导入账号</h3><button type="button" @click="closeImportModal"><Icon name="close" class="w-4 h-4" /></button></div>
-        <p class="text-[11px] leading-5 text-white/45">自动识别 CPA / Sub2API JSON、ChatGPT / Grok JWT、Adobe / BytePlus / Dola Cookie、OreateAI 账号 JSON，以及多行混合凭据。全粘进来即可，无需任何前缀或平台选择。</p>
+        <p class="text-[11px] leading-5 text-white/45">自动识别 CPA / Sub2API JSON、ChatGPT / Grok JWT、Adobe / BytePlus / Dola Cookie，以及多行混合凭据。全粘进来即可，无需任何前缀或平台选择。</p>
 
         <input ref="fileInput" type="file" accept=".json,.zip,application/json,application/zip" multiple class="hidden" @change="selectImportFiles" />
         <div class="file-picker">

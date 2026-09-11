@@ -1498,4 +1498,88 @@ var migrationSources = map[string]string{
 		");\n" +
 		"\n" +
 		"DROP TABLE migration_000020_split;\n",
+	"000021_retire_oreate_runway_custom.sql": "-- Retire Oreate, Runway, and Custom. Delete leftover accounts and credentials.\n" +
+		"-- Dispatch history stays; account_id is nulled by ON DELETE SET NULL. Routes\n" +
+		"-- still referenced by dispatch_attempts remain as disabled tombstones.\n" +
+		"\n" +
+		"DO $migration$\n" +
+		"BEGIN\n" +
+		"    IF to_regclass('public.refresh_profiles') IS NOT NULL THEN\n" +
+		"        DELETE FROM refresh_profiles\n" +
+		"        WHERE pool IN ('oreate','runway','custom')\n" +
+		"           OR id IN (SELECT id FROM provider_accounts WHERE pool IN ('oreate','runway','custom'));\n" +
+		"    END IF;\n" +
+		"    IF to_regclass('public.site_settings') IS NOT NULL THEN\n" +
+		"        DELETE FROM site_settings\n" +
+		"        WHERE key IN (\n" +
+		"            'provider.oreate.enabled',\n" +
+		"            'provider.runway.enabled',\n" +
+		"            'provider.custom.enabled'\n" +
+		"        );\n" +
+		"    END IF;\n" +
+		"END\n" +
+		"$migration$;\n" +
+		"\n" +
+		"DELETE FROM provider_accounts\n" +
+		"WHERE pool IN ('oreate','runway','custom');\n" +
+		"\n" +
+		"UPDATE model_routes\n" +
+		"SET enabled = FALSE, updated_at = NOW()\n" +
+		"WHERE provider IN ('oreate','runway','custom');\n" +
+		"\n" +
+		"UPDATE logical_models AS logical\n" +
+		"SET enabled = FALSE, updated_at = NOW()\n" +
+		"WHERE EXISTS (\n" +
+		"    SELECT 1 FROM model_routes route\n" +
+		"    WHERE route.logical_model_id = logical.id\n" +
+		"      AND route.provider IN ('oreate','runway','custom')\n" +
+		")\n" +
+		"AND NOT EXISTS (\n" +
+		"    SELECT 1 FROM model_routes route\n" +
+		"    WHERE route.logical_model_id = logical.id\n" +
+		"      AND route.provider NOT IN ('oreate','runway','custom')\n" +
+		"      AND route.enabled = TRUE\n" +
+		");\n" +
+		"\n" +
+		"UPDATE logical_models\n" +
+		"SET enabled = FALSE, updated_at = NOW()\n" +
+		"WHERE id IN (\n" +
+		"    'oreate-seedance-2.0',\n" +
+		"    'oreate-seedance-2.0-fast',\n" +
+		"    'oreate-seedance-2.5',\n" +
+		"    'seedance-2.0-mini',\n" +
+		"    'seedance-1.5-pro',\n" +
+		"    'runway-nano-banana-2',\n" +
+		"    'runway-nano-banana-pro',\n" +
+		"    'runway-gen-4.5',\n" +
+		"    'runway-gen-4-turbo'\n" +
+		");\n" +
+		"\n" +
+		"DELETE FROM account_model_routes\n" +
+		"WHERE model_route_id IN (\n" +
+		"    SELECT id FROM model_routes WHERE provider IN ('oreate','runway','custom')\n" +
+		");\n" +
+		"\n" +
+		"DELETE FROM model_routes AS route\n" +
+		"WHERE route.provider IN ('oreate','runway','custom')\n" +
+		"AND NOT EXISTS (\n" +
+		"    SELECT 1 FROM dispatch_attempts AS attempt WHERE attempt.model_route_id = route.id\n" +
+		");\n" +
+		"\n" +
+		"DELETE FROM logical_models AS logical\n" +
+		"WHERE logical.enabled = FALSE\n" +
+		"  AND logical.id IN (\n" +
+		"    'oreate-seedance-2.0',\n" +
+		"    'oreate-seedance-2.0-fast',\n" +
+		"    'oreate-seedance-2.5',\n" +
+		"    'seedance-2.0-mini',\n" +
+		"    'seedance-1.5-pro',\n" +
+		"    'runway-nano-banana-2',\n" +
+		"    'runway-nano-banana-pro',\n" +
+		"    'runway-gen-4.5',\n" +
+		"    'runway-gen-4-turbo'\n" +
+		"  )\n" +
+		"  AND NOT EXISTS (\n" +
+		"      SELECT 1 FROM model_routes AS route WHERE route.logical_model_id = logical.id\n" +
+		");\n",
 }
