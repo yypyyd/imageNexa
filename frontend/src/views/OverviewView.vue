@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import Icon from '../components/Icon.vue'
 import { api, apiURL, listOf } from '../api'
+import { ACCOUNT_PROVIDERS } from '../models'
 
 const loading = ref(true)
 const error = ref('')
@@ -21,7 +22,7 @@ const totals = computed(() => ({
 const last24 = computed(() => overview.value.last_24h || {})
 const hourly = computed(() => overview.value.hourly || [])
 const hourMax = computed(() => Math.max(1, ...hourly.value.map((bucket) => Number(bucket.text || 0) + Number(bucket.image || 0) + Number(bucket.video || 0))))
-const providerRows = computed(() => Object.entries(overview.value.provider_health || {}).map(([name, counts]) => ({
+const providerRows = computed(() => Object.entries(overview.value.provider_health || {}).filter(([name]) => ACCOUNT_PROVIDERS.includes(name)).map(([name, counts]) => ({
   name,
   ...counts,
   total: Object.values(counts || {}).reduce((sum, value) => sum + Number(value || 0), 0),

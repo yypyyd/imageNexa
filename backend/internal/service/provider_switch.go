@@ -16,11 +16,25 @@ func providerSettingKey(pool string) string {
 	return "provider." + pool + ".enabled"
 }
 
+// deferredAccountProviders stay in the token pool map so leftover rows can be
+// inspected, but they are not console-visible, importable, or schedulable.
+var deferredAccountProviders = map[string]bool{
+	"runway": true,
+	"custom": true,
+}
+
+func isDeferredAccountProvider(pool string) bool {
+	return deferredAccountProviders[strings.ToLower(strings.TrimSpace(pool))]
+}
+
 // SchedulableProviders lists every provider pool an administrator may toggle.
 // The order is stable so the settings API and the console render consistently.
 func SchedulableProviders() []string {
 	out := make([]string, 0, len(validTokenPools))
 	for pool := range validTokenPools {
+		if deferredAccountProviders[pool] {
+			continue
+		}
 		out = append(out, pool)
 	}
 	sort.Strings(out)

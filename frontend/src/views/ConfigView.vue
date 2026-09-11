@@ -1,7 +1,8 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, computed } from 'vue'
 import Icon from '../components/Icon.vue'
 import { api, apiURL, jsonBody } from '../api'
+import { ACCOUNT_PROVIDERS } from '../models'
 
 const loading = ref(true)
 const saving = ref(false)
@@ -21,12 +22,12 @@ const PROVIDER_LABELS = {
   adobe: 'Adobe Firefly',
   byteplus: 'BytePlus',
   chatgpt: 'ChatGPT',
-  custom: '自定义上游',
   dola: 'Dola (豆包国际版)',
   grok: 'Grok',
   oreate: 'OreateAI',
-  runway: 'Runway',
 }
+
+const visibleProviders = computed(() => Object.keys(providers).filter((pool) => ACCOUNT_PROVIDERS.includes(pool)).sort())
 
 function providerLabel(pool) {
   return PROVIDER_LABELS[pool] || pool[0].toUpperCase() + pool.slice(1)
@@ -73,7 +74,7 @@ function toggleProvider(pool) {
   providers[pool] = !providers[pool]
 }
 
-const disabledCount = () => Object.values(providers).filter((enabled) => !enabled).length
+const disabledCount = () => visibleProviders.value.filter((pool) => !providers[pool]).length
 
 async function checkHealth(name) {
   health[name] = null
@@ -117,11 +118,11 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
           <span v-if="disabledCount()" class="badge-off">{{ disabledCount() }} 个已停用</span>
         </div>
         <div class="provider-grid">
-          <label v-for="pool in Object.keys(providers).sort()" :key="pool" class="provider-row" :class="!providers[pool] && 'off'">
+          <label v-for="pool in visibleProviders" :key="pool" class="provider-row" :class="!providers[pool] && 'off'">
             <span><strong>{{ providerLabel(pool) }}</strong><code>{{ pool }}</code></span>
             <button type="button" class="switch" :class="providers[pool] && 'on'" :aria-label="`${providers[pool] ? '停用' : '启用'} ${providerLabel(pool)}`" :title="providers[pool] ? '点击停用该平台' : '点击启用该平台'" @click="toggleProvider(pool)"><span></span></button>
           </label>
-          <p v-if="!Object.keys(providers).length && !loading" class="hint">未获取到平台列表。</p>
+          <p v-if="!visibleProviders.length && !loading" class="hint">未获取到平台列表。</p>
         </div>
         <span class="hint">若某个模型的全部平台都被关闭，该模型的请求会返回 <code>provider_disabled</code>，而不会白跑上游重试。</span>
       </div>

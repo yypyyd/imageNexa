@@ -30,12 +30,8 @@ var imageMarkdownPattern = regexp.MustCompile(`!\[[^\]]*\]\((https?://[^\s)]+)\)
 type imageRequest struct {
 	ClientType  string         `json:"clientType"`
 	Type        string         `json:"type"`
-	FocusID     string         `json:"focusId"`
-	ChatID      string         `json:"chatId"`
 	ChatType    string         `json:"chatType"`
 	From        string         `json:"from"`
-	ChatTitle   string         `json:"chatTitle"`
-	IsFirst     bool           `json:"isFirst"`
 	Messages    []videoMessage `json:"messages"`
 	ImageConfig imageConfig    `json:"imageConfig"`
 	JT          string         `json:"jt"`
@@ -62,13 +58,9 @@ func (c *Client) ClaimFirstImageBonus(ctx context.Context, account Account) (str
 	if c.signer == nil {
 		return "", errors.New("oreate: signer not configured")
 	}
-	// The token only works from the exit IP that minted it, so the chat and the
-	// stream both leave through the signing page's proxy session.
+	// The token only works from the exit IP that minted it, so the stream
+	// leaves through the signing page's proxy session.
 	sig, err := c.signHot(ctx, account)
-	if err != nil {
-		return "", err
-	}
-	chatID, err := c.createChat(ctx, account, "aiImage", sig.Proxy)
 	if err != nil {
 		return "", err
 	}
@@ -79,8 +71,8 @@ func (c *Client) ClaimFirstImageBonus(ctx context.Context, account Account) (str
 		account.Cookie = mergeCookies(account.Cookie, sig.Cookie)
 	}
 	payload := imageRequest{
-		ClientType: "pc", Type: "chat", FocusID: chatID, ChatID: chatID,
-		ChatType: "aiImage", From: "home", ChatTitle: "Unnamed Session", IsFirst: true,
+		ClientType: "pc", Type: "chat",
+		ChatType: "aiImage", From: "home",
 		Messages:    []videoMessage{{Role: "user", Content: firstImagePrompt, Attachments: []videoAttachment{}}},
 		ImageConfig: imageConfig{ModelName: firstImageModel, Ratio: firstImageRatio, Resolution: firstImageResolution},
 		JT:          sig.JT, UA: account.UserAgent, JSEnv: "h5",

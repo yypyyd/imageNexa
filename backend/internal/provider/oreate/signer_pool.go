@@ -22,7 +22,7 @@ import (
 // Oreate refuses a generation that was not requested by a real signed page, so
 // the browser both mints the token and posts the request. Opening a page for
 // every generation cost 14 to 16 seconds of navigation, which is why pages are
-// kept warm here: a submit is then just the two fetches the site makes. A page
+// kept warm here: a submit is then just the stream fetch the site makes. A page
 // belongs to one account and pins one proxy session for its whole life, because
 // the token is only valid for that account from that exit IP.
 const (
@@ -520,17 +520,25 @@ func (page *signerPage) prepare(account Account) error {
 		return fmt.Errorf("oreate signer: cookie setup: %w", err)
 	}
 	navErr := navigateSignerPage(ctx)
-	if err := chromedp.Run(ctx, chromedp.Poll(`typeof window.paris_21a851acb0 === "object"`, nil,
-		chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(25*time.Second))); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Poll(parisReadyJS, nil,
+		chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(parisReadyTimeout))); err != nil {
 		diagnostics := browserRuntimeDiagnostics(ctx)
+		log.Printf("oreate signer: Paris runtime not ready (%s)", diagnostics)
 		if navErr != nil {
-			return fmt.Errorf("oreate signer: page navigation: %w (%s)", navErr, diagnostics)
+			return fmt.Errorf("%w: oreate signer: page navigation: %v (%s)", ErrTemporaryUpstream, navErr, diagnostics)
 		}
-		return fmt.Errorf("oreate signer: Paris runtime: %w (%s)", err, diagnostics)
+		return fmt.Errorf("%w: oreate signer: Paris runtime (%s)", ErrTemporaryUpstream, diagnostics)
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`true`, nil)); err != nil {
+		return fmt.Errorf("%w: oreate signer: page context lost: %v", ErrTemporaryUpstream, err)
+	}
+	if err := chromedp.Run(ctx, signerCookieActions(page.account)...); err != nil {
+		log.Printf("oreate signer: cookie refresh skipped: %s", clipSignerLog(err))
 	}
 	browserCookie, err := browserOreateCookieHeader(ctx)
 	if err != nil {
-		return fmt.Errorf("oreate signer: cookie capture: %w", err)
+		log.Printf("oreate signer: cookie capture skipped: %s", clipSignerLog(err))
+		return nil
 	}
 	page.captureBrowserCookies(browserCookie)
 	return nil
@@ -555,15 +563,15 @@ func (page *signerPage) mint(ctx context.Context) (Signature, error) {
 		return Signature{}, err
 	}
 	defer cancel()
-	if err := chromedp.Run(runCtx, chromedp.Evaluate(hotMintScript, nil)); err != nil {
-		return Signature{}, fmt.Errorf("oreate signer: Banti dispatch: %w", err)
+	if err := chromedp.Run(runCtx, chromedp.Evaluate(mintBantiEvaluateJS(), nil)); err != nil {
+		return Signature{}, fmt.Errorf("%w: oreate signer: Banti dispatch: %v", ErrTemporaryUpstream, err)
 	}
 	var jt string
 	if err := chromedp.Run(runCtx,
 		chromedp.Poll(`window.__oreateSignerJT`, &jt,
 			chromedp.WithPollingInterval(25*time.Millisecond), chromedp.WithPollingTimeout(bantiResponseTimeout)),
 	); err != nil {
-		return Signature{}, fmt.Errorf("oreate signer: Banti response: %w", err)
+		return Signature{}, fmt.Errorf("%w: oreate signer: Banti response: %v", ErrTemporaryUpstream, err)
 	}
 	page.mints++
 	jt = strings.TrimSpace(jt)
@@ -589,16 +597,16 @@ func (page *signerPage) submit(ctx context.Context, quotedPayload string) (video
 	defer cancel()
 	started := time.Now()
 	if err := chromedp.Run(runCtx, chromedp.Evaluate(inPageSubmitScript(quotedPayload), nil)); err != nil {
-		return videoSubmitResult{}, fmt.Errorf("oreate signer: submit dispatch: %w", err)
+		return videoSubmitResult{}, fmt.Errorf("%w: oreate signer: submit dispatch: %v", ErrTemporaryUpstream, err)
 	}
 	pollErr := chromedp.Run(runCtx, chromedp.Poll(`window.__oreateSubmit && window.__oreateSubmit.done === true`, nil,
 		chromedp.WithPollingInterval(250*time.Millisecond), chromedp.WithPollingTimeout(inPageRenderWait)))
 	var result videoSubmitResult
 	if err := chromedp.Run(runCtx, chromedp.Evaluate(`window.__oreateSubmit || {}`, &result)); err != nil {
 		if pollErr != nil {
-			return videoSubmitResult{}, fmt.Errorf("oreate signer: submit stream: %w", pollErr)
+			return videoSubmitResult{}, fmt.Errorf("%w: oreate signer: submit stream: %v", ErrTemporaryUpstream, pollErr)
 		}
-		return videoSubmitResult{}, fmt.Errorf("oreate signer: submit state: %w", err)
+		return videoSubmitResult{}, fmt.Errorf("%w: oreate signer: submit state: %v", ErrTemporaryUpstream, err)
 	}
 	if pollErr != nil && result.Failure == "" {
 		result.Failure = pollErr.Error()
@@ -608,8 +616,8 @@ func (page *signerPage) submit(ctx context.Context, quotedPayload string) (video
 	}
 	result.Cookie = page.account.Cookie
 	page.mints++
-	log.Printf("oreate inpage submit: submits=%d elapsed=%s chat=%s", page.mints,
-		time.Since(started).Round(time.Millisecond), result.ChatID)
+	log.Printf("oreate inpage submit: submits=%d elapsed=%s status=%d failure=%s", page.mints,
+		time.Since(started).Round(time.Millisecond), result.Status, clipSignerLog(fmt.Errorf("%s", result.Failure)))
 	return result, nil
 }
 
@@ -631,19 +639,6 @@ func (page *signerPage) runContext(ctx context.Context, budget time.Duration) (c
 func (page *signerPage) usable() bool {
 	return !page.stale.Load() && page.ctx.Err() == nil && page.mints < signerPageMaxMints && time.Since(page.opened) < signerPageMaxAge
 }
-
-// hotMintScript mints one token on a page that is already loaded. The token is
-// published on the window so the Go side can poll for it, and a non-empty value
-// means the Banti report the site requires went through.
-const hotMintScript = `window.__oreateSignerJT = "";
-	window.paris_21a851acb0.getBantiInstance((instanceError, instance) => {
-		if (instanceError || !instance) return;
-		if (instance.options) instance.options.reportTimeout = 20000;
-		window.paris_21a851acb0.sendBantiReport({subid: ""}, (reportError, response) => {
-			if (reportError) return;
-			window.__oreateSignerJT = response && response.htj && response.htj.jt || "";
-		});
-	}); true`
 
 // stickyProxyURL pins the proxy to one exit IP by labelling the session in the
 // user name, which is how rotating residential pools expose sticky sessions.

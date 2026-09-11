@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +23,7 @@ import (
 const maxBantiJTLength = 4096
 
 const (
-	signerTimeout          = 75 * time.Second
+	signerTimeout          = 90 * time.Second
 	bantiResponseTimeout   = 25 * time.Second
 	signerNavigateAttempts = 3
 )
@@ -292,52 +293,30 @@ func (s *chromiumSigner) signOnce(parent context.Context, path string, account A
 	}
 	navErr := navigateSignerPage(browserCtx)
 	pageDiagnostics := browserRuntimeDiagnostics(browserCtx)
-	if err := chromedp.Run(browserCtx, chromedp.Poll(`typeof window.paris_21a851acb0 === "object"`, nil,
-		chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(25*time.Second))); err != nil {
+	if err := chromedp.Run(browserCtx, chromedp.Poll(parisReadyJS, nil,
+		chromedp.WithPollingInterval(100*time.Millisecond), chromedp.WithPollingTimeout(parisReadyTimeout))); err != nil {
+		log.Printf("oreate signer: Paris runtime not ready (%s)", pageDiagnostics)
 		if navErr != nil {
-			return Signature{}, fmt.Errorf("oreate signer: page navigation: %w (%s)", navErr, pageDiagnostics)
+			return Signature{}, fmt.Errorf("%w: oreate signer: page navigation: %v (%s)", ErrTemporaryUpstream, navErr, pageDiagnostics)
 		}
-		return Signature{}, fmt.Errorf("oreate signer: Paris runtime: %w (%s)", err, pageDiagnostics)
+		return Signature{}, fmt.Errorf("%w: oreate signer: Paris runtime (%s)", ErrTemporaryUpstream, pageDiagnostics)
 	}
 	var jt, browserCookie string
 	reportWaiter.arm()
-	if err := chromedp.Run(browserCtx, chromedp.Evaluate(`window.__oreateSignerJT = "";
-			window.__oreateSignerDiag = {startedAt: performance.now()};
-			window.paris_21a851acb0.getBantiInstance((_instanceError, instance) => {
-				const diag = window.__oreateSignerDiag;
-				diag.instanceAt = performance.now();
-				diag.instanceError = Boolean(_instanceError);
-				diag.instancePresent = Boolean(instance);
-				diag.optionsPresent = Boolean(instance && instance.options);
-				diag.reportTimeoutBefore = Number(instance && instance.options && instance.options.reportTimeout) || 0;
-				if (instance && instance.options) instance.options.reportTimeout = 20000;
-				diag.reportTimeoutAfter = Number(instance && instance.options && instance.options.reportTimeout) || 0;
-				diag.instanceSend = Boolean(instance && typeof instance.sendBantiReport === "function");
-				diag.globalSend = typeof window.paris_21a851acb0.sendBantiReport === "function";
-				diag.sendAt = performance.now();
-				window.paris_21a851acb0.sendBantiReport({subid: ""}, (_error, response) => {
-					const jt = response && response.htj && response.htj.jt || "";
-					diag.callbackAt = performance.now();
-					diag.callbackError = Boolean(_error);
-					diag.responsePresent = Boolean(response);
-					diag.htjPresent = Boolean(response && response.htj);
-					diag.jtLength = typeof jt === "string" ? jt.length : 0;
-					window.__oreateSignerJT = jt;
-				});
-			}); true`, nil)); err != nil {
-		return Signature{}, fmt.Errorf("oreate signer: Banti dispatch: %w", err)
+	if err := chromedp.Run(browserCtx, chromedp.Evaluate(mintBantiDispatchJS(), nil)); err != nil {
+		return Signature{}, fmt.Errorf("%w: oreate signer: Banti dispatch: %v", ErrTemporaryUpstream, err)
 	}
 	if err := chromedp.Run(browserCtx,
 		chromedp.Poll(`window.__oreateSignerJT`, &jt,
 			chromedp.WithPollingInterval(25*time.Millisecond), chromedp.WithPollingTimeout(bantiResponseTimeout)),
 	); err != nil {
 		s.reportRuntimeProbe(browserCtx)
-		return Signature{}, fmt.Errorf("oreate signer: Banti response: %w", err)
+		return Signature{}, fmt.Errorf("%w: oreate signer: Banti response: %v", ErrTemporaryUpstream, err)
 	}
 	browserCookie, _ = browserOreateCookieHeader(browserCtx)
 	s.reportRuntimeProbe(browserCtx)
 	if err := reportWaiter.wait(browserCtx, bantiResponseTimeout); err != nil {
-		return Signature{}, fmt.Errorf("oreate signer: Banti report: %w", err)
+		return Signature{}, fmt.Errorf("%w: oreate signer: Banti report: %v", ErrTemporaryUpstream, err)
 	}
 	account = s.observedAccount(account, browserCookie)
 	return Signature{JT: strings.TrimSpace(jt), BID: account.BID, Cookie: account.Cookie}, nil
@@ -405,11 +384,6 @@ func (w *bantiReportWaiter) wait(ctx context.Context, timeout time.Duration) err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-func isBantiReportURL(raw string) bool {
-	parsed, err := url.Parse(raw)
-	return err == nil && strings.EqualFold(parsed.Hostname(), "banti.oreateai.com") && parsed.EscapedPath() == "/dr"
 }
 
 func (s *chromiumSigner) reportRuntimeProbe(ctx context.Context) {
@@ -491,10 +465,23 @@ func browserRuntimeDiagnostics(ctx context.Context) string {
 	_ = chromedp.Run(ctx, chromedp.Evaluate(`JSON.stringify({
 		title: document.title || "",
 		ready: document.readyState || "",
+		href: (function(){ try { var u = new URL(location.href); return u.origin + u.pathname; } catch (e) { return ""; } })(),
 		scripts: document.scripts ? document.scripts.length : 0,
+		scriptHosts: (function(){
+			var hosts = {};
+			if (!document.scripts) return [];
+			for (var i = 0; i < document.scripts.length; i++) {
+				var src = document.scripts[i].src || "";
+				if (!src) continue;
+				try { hosts[new URL(src, location.href).host] = true; } catch (e) {}
+			}
+			return Object.keys(hosts).slice(0, 20);
+		})(),
 		bodyBytes: document.body && document.body.innerText ? document.body.innerText.length : 0,
 		parisKeys: Object.getOwnPropertyNames(window).filter((key) => /paris/i.test(key)).slice(0, 20),
-		bantiKeys: Object.getOwnPropertyNames(window).filter((key) => /banti/i.test(key)).slice(0, 20)
+		cacheCount: window.PARIS_INSTANCE_CACHE ? Object.keys(window.PARIS_INSTANCE_CACHE).length : 0,
+		bantiKeys: Object.getOwnPropertyNames(window).filter((key) => /banti/i.test(key)).slice(0, 20),
+		riskKeys: Object.getOwnPropertyNames(window).filter((key) => /banti|htj|captcha|verify|risk|guard|token/i.test(key)).slice(0, 30)
 	})`, &diagnostics))
 	if strings.TrimSpace(diagnostics) == "" {
 		return "diagnostics-unavailable"

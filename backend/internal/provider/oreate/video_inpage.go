@@ -35,17 +35,14 @@ type videoSubmitter interface {
 }
 
 // videoSubmitResult is what the page observed for one submit: the SSE text read
-// through the rendered result or a terminal failure, plus the chat and any
-// page-side failure that ended the read early.
+// through the rendered result or a terminal failure, plus any page-side
+// failure that ended the read early.
 type videoSubmitResult struct {
 	Status  int    `json:"status"`
-	ChatID  string `json:"chatId"`
 	Stream  string `json:"stream"`
 	Failure string `json:"failure"`
 	Done    bool   `json:"done"`
-	// Proxy is the session the submitting page egresses through, which the chat
-	// polling then reuses so the whole generation is seen from one exit IP. The
-	// page fills the rest of this struct, so it must stay out of the JSON.
+	// Proxy is the session the submitting page egresses through.
 	Proxy  string `json:"-"`
 	Cookie string `json:"-"`
 }
@@ -136,11 +133,11 @@ func readCgroupValue(path string) int64 {
 	return value
 }
 
-// SubmitVideo mints a Banti token on a warm page of this account and runs both
-// the create-chat and the stream request as fetches on that same page. The
-// payload is the request the caller built; chatId, focusId, jt and bid are
-// filled in by the page because only the page owns those values. The page keeps
-// reading the response until the clip or a terminal failure arrives.
+// SubmitVideo mints a Banti token on a warm page of this account and posts the
+// stream request as a fetch on that same page. The payload is the request the
+// caller built; jt and bid are filled in by the page because only the page owns
+// those values. The page keeps reading the response until the clip or a
+// terminal failure arrives.
 func (s *chromiumSigner) SubmitVideo(ctx context.Context, account Account, payload []byte) (videoSubmitResult, error) {
 	account = account.normalized()
 	if account.Cookie == "" {
@@ -153,50 +150,32 @@ func (s *chromiumSigner) SubmitVideo(ctx context.Context, account Account, paylo
 	return s.pool.submit(ctx, account, string(quoted))
 }
 
-// inPageSubmitScript runs the website's own request sequence: mint the Banti
-// token, create the aiVideo chat, then read the event stream until the rendered
-// clip or a terminal error arrives. Failures are kept on the state object
-// instead of rejecting so the collected stream survives.
+// inPageSubmitScript mints the Banti token and reads the event stream until
+// the rendered clip or a terminal error arrives. Failures are kept on the
+// state object instead of rejecting so the collected stream survives.
 func inPageSubmitScript(quotedPayload string) string {
-	return `window.__oreateSubmit = {done: false, status: 0, chatId: "", stream: "", failure: ""};
+	return parisHelperJS + `window.__oreateSubmit = {done: false, status: 0, stream: "", failure: ""};
 		(async () => {
 			const state = window.__oreateSubmit;
-			try {
-				const jt = await new Promise((resolve, reject) => {
-					const timer = setTimeout(() => reject(new Error("banti timeout")), ` +
+			const mintJT = (subid) => new Promise((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error("banti timeout")), ` +
 		strconv.Itoa(int(bantiResponseTimeout/time.Millisecond)) + `);
-					window.paris_21a851acb0.getBantiInstance((instanceError, instance) => {
-						if (instanceError || !instance) {
-							clearTimeout(timer);
-							reject(new Error("banti instance"));
-							return;
-						}
-						if (instance.options) instance.options.reportTimeout = 20000;
-						window.paris_21a851acb0.sendBantiReport({subid: ""}, (reportError, response) => {
-							clearTimeout(timer);
-							if (reportError) {
-								reject(new Error("banti report"));
-								return;
-							}
-							resolve(response && response.htj && response.htj.jt || "");
-						});
-					});
+				window.oreateSendBantiReport({subid: subid || ""}, (reportError, response, fallback) => {
+					clearTimeout(timer);
+					if (reportError) {
+						reject(new Error("banti report"));
+						return;
+					}
+					resolve((response && response.htj && response.htj.jt) || fallback || "");
 				});
-				if (!jt) throw new Error("banti token empty");
-				const chatResponse = await fetch("/oreate/create/chat", {
-					method: "POST",
-					credentials: "include",
-					headers: {"content-type": "application/json", "client-type": "pc", "locale": "zh-CN"},
-					body: JSON.stringify({type: "aiVideo"}),
-				});
-				const chat = await chatResponse.json();
-				const chatId = chat && chat.data && chat.data.chatId || "";
-				state.chatId = chatId;
-				if (!chatId) throw new Error("create chat: " + JSON.stringify(chat).slice(0, 200));
+			});
+			try {
+				const minted = await Promise.all([mintJT("sse"), window.oreateGetAcsToken()]);
+				const sseJT = minted[0];
+				const acs = minted[1] || "600";
+				if (!sseJT) throw new Error("banti token empty");
 				const payload = JSON.parse(` + quotedPayload + `);
-				payload.jt = jt;
-				payload.chatId = chatId;
-				payload.focusId = chatId;
+				payload.jt = sseJT;
 				payload.ua = navigator.userAgent;
 				payload.extra.bid = (document.cookie.match(/__bid_n=([^;]*)/) || [])[1] || payload.extra.bid || "";
 				const response = await fetch("/oreate/sse/stream", {
@@ -206,6 +185,8 @@ func inPageSubmitScript(quotedPayload string) string {
 						"content-type": "application/json",
 						"client-type": "pc",
 						"locale": "zh-CN",
+						"Acs-Token": acs,
+						"JS-Token": sseJT,
 						"accept": "text/event-stream",
 					},
 					body: JSON.stringify(payload),
@@ -239,14 +220,45 @@ func inPageSubmitScript(quotedPayload string) string {
 // the SSE consumer expects, and reports the failures that never reached a stream.
 func inPageStreamStatus(result videoSubmitResult) (int, error) {
 	if result.Status == 0 {
-		failure := strings.TrimSpace(result.Failure)
-		if failure == "" {
-			failure = "stream request did not start"
-		}
-		return 0, fmt.Errorf("%w: browser submit: %s", ErrTemporaryUpstream, failure)
+		return 0, classifyInPageFailure(result.Failure)
 	}
 	if result.Status == http.StatusUnauthorized || result.Status == http.StatusForbidden {
 		return result.Status, ErrAuth
 	}
 	return result.Status, nil
+}
+
+func classifyInPageFailure(failure string) error {
+	failure = strings.TrimSpace(failure)
+	if failure == "" {
+		failure = "stream request did not start"
+	}
+	if code := extractInPageStatusCode(failure); code != 0 {
+		return classifyUpstreamError(code, failure)
+	}
+	lower := strings.ToLower(failure)
+	if strings.Contains(failure, "请输入验证码") || strings.Contains(lower, "captcha") || strings.Contains(lower, "verification code") {
+		return classifyUpstreamError(7350001, failure)
+	}
+	return fmt.Errorf("%w: browser submit: %s", ErrTemporaryUpstream, failure)
+}
+
+func extractInPageStatusCode(failure string) int {
+	search := failure
+	if i := strings.Index(failure, `"status"`); i >= 0 {
+		search = failure[i:]
+	}
+	code := 0
+	if _, err := fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(afterJSONKey(search, `"code"`), ":")), "%d", &code); err == nil {
+		return code
+	}
+	return 0
+}
+
+func afterJSONKey(raw, key string) string {
+	i := strings.Index(raw, key)
+	if i < 0 {
+		return ""
+	}
+	return raw[i+len(key):]
 }

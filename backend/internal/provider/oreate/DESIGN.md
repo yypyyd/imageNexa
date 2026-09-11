@@ -31,8 +31,7 @@ V1 service
   -> Chromium loads the official AI-video page
   -> Paris/Banti runtime produces an opaque jt
   -> signer waits for the matching /dr request to finish with 2xx
-  -> HTTP client creates an Oreate video chat
-  -> HTTP client submits the Seedance SSE request with jt and BID
+  -> signed page submits the Seedance SSE request with JS-Token (subid sse), Acs-Token, jt and BID
   -> parser returns the final HTTPS artifact URL
   -> gateway records success and exposes /v1/videos/{id}/content
 ```
@@ -229,7 +228,9 @@ risk-control hosts.
 ## Known Limitations
 
 - Website endpoints, model names, and Banti JavaScript are undocumented and can
-  change without notice.
+  change without notice. The signer waits for `PARIS_INSTANCE_CACHE` or any
+  `window.paris_*` instance that exposes `sendBantiReport`, not a hardcoded
+  global name.
 - Signer latency includes page load and the full Banti report, and transient
   proxy failures may consume the bounded account-pool retry window.
 - The proxy bridge currently supports authenticated HTTP and HTTPS proxies;
@@ -238,6 +239,21 @@ risk-control hosts.
   hostname allowlist.
 
 ## Change History
+
+### 2026-09-11 - SSE-only submit
+
+- Video and first-image bonus post only `/oreate/sse/stream` from the signed
+  page, with the official `JS-Token` / `Acs-Token` headers and Banti subid `sse`.
+
+### 2026-09-11 - Live Paris instance discovery
+
+- Wait for `PARIS_INSTANCE_CACHE` or any `window.paris_*` Banti instance instead
+  of the hardcoded `paris_21a851acb0` global the current frontend no longer
+  assigns before its 3MB errorMonitor bundle finishes.
+- Accept the official `sendBantiReport` fallback token argument and Banti
+  report hosts under `*.oreateai.com`.
+- Log a credential-free signer verdict when the runtime is missing so the next
+  frontend change is visible in backend logs.
 
 ### 2026-08-19 - First-use bonus claimed at import
 

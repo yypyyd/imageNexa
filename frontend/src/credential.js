@@ -2,6 +2,9 @@
  * Preserve simple token/cookie input as text, while allowing complete browser
  * exports and provider credential bundles to reach the API as structured JSON.
  */
+import { strFromU8, unzipSync } from 'fflate'
+import { ACCOUNT_PROVIDERS } from './models.js'
+
 export function parseCredentialInput(value) {
   const trimmed = String(value ?? '').trim()
   if (!trimmed) return ''
@@ -199,7 +202,7 @@ function parseJSONValue(value) {
 export function uniqueCredentialImports(items) {
   const seen = new Set()
   return items.filter((item) => {
-    if (!item?.provider || item.credential == null) return false
+    if (!item?.provider || item.credential == null || !ACCOUNT_PROVIDERS.includes(item.provider)) return false
     const key = `${item.provider}\u0000${typeof item.credential === 'string' ? item.credential : JSON.stringify(item.credential)}`
     if (seen.has(key)) return false
     seen.add(key)
@@ -270,7 +273,6 @@ export async function parseCredentialFile(file) {
   if (!file) return []
   return parseCredentialFileBytes(new Uint8Array(await file.arrayBuffer()), file.name)
 }
-import { strFromU8, unzipSync } from 'fflate'
 
 const MAX_IMPORT_FILE_BYTES = 20 * 1024 * 1024
 const MAX_ZIP_ENTRY_BYTES = 2 * 1024 * 1024

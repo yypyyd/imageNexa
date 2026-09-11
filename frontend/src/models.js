@@ -41,6 +41,15 @@ export const MODEL_KIND = Object.freeze(Object.fromEntries([
 
 export const ALL_MODELS = Object.freeze(Object.keys(MODEL_KIND))
 
+export const ACCOUNT_PROVIDERS = Object.freeze([
+  'chatgpt',
+  'byteplus',
+  'adobe',
+  'grok',
+  'oreate',
+  'dola',
+])
+
 export function isCanonicalModel(id) {
   return Object.hasOwn(MODEL_KIND, id)
 }

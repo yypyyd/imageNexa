@@ -32,12 +32,12 @@ test('auto-detects ChatGPT account exports without a provider choice', () => {
   assert.deepEqual(parseCredentialImports(input), [{ provider: 'chatgpt', credential: accessToken }])
 })
 
-test('distinguishes ChatGPT, Runway, and Grok JWT claims', () => {
+test('distinguishes ChatGPT and Grok JWT claims and ignores Runway', () => {
   const chatgpt = jwt({ 'https://api.openai.com/auth': { user_id: 'u1' } })
   const runway = jwt({ id: 123, sso: true })
   const grok = jwt({ session_id: 'session-1' })
   assert.deepEqual(parseCredentialImports(`${chatgpt}\n${runway}\n${grok}`).map((item) => item.provider), [
-    'chatgpt', 'runway', 'grok',
+    'chatgpt', 'grok',
   ])
 })
 

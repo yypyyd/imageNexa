@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ALL_MODELS, IMAGE_MODELS, MODEL_KIND, TEXT_MODELS, VIDEO_MODELS, isCanonicalModel } from './models.js'
+import { ACCOUNT_PROVIDERS, ALL_MODELS, IMAGE_MODELS, MODEL_KIND, TEXT_MODELS, VIDEO_MODELS, isCanonicalModel } from './models.js'
 
 test('canonical model catalog is closed and unique', () => {
   assert.equal(TEXT_MODELS.length, 4)
@@ -35,4 +35,17 @@ test('multi-provider products are split into per-channel public ids', () => {
   assert.equal(isCanonicalModel('lumina-image'), false)
   assert.equal(isCanonicalModel('firefly-image-5'), false)
   assert.equal(isCanonicalModel('krea-image'), false)
+})
+
+test('account console hides deferred runway and custom pools', () => {
+  assert.deepEqual(ACCOUNT_PROVIDERS, [
+    'chatgpt',
+    'byteplus',
+    'adobe',
+    'grok',
+    'oreate',
+    'dola',
+  ])
+  assert.equal(ACCOUNT_PROVIDERS.includes('runway'), false)
+  assert.equal(ACCOUNT_PROVIDERS.includes('custom'), false)
 })

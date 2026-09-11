@@ -3,11 +3,11 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import Icon from '../components/Icon.vue'
 import SelectMenu from '../components/SelectMenu.vue'
 import AccountTestModal from '../components/AccountTestModal.vue'
-import CustomAccountModal from '../components/CustomAccountModal.vue'
 import { api, jsonBody, listOf } from '../api'
+import { ACCOUNT_PROVIDERS } from '../models'
 import { parseCredentialFile, parseCredentialImports, uniqueCredentialImports } from '../credential'
 
-const ALLOWED_PROVIDERS = ['chatgpt', 'byteplus', 'adobe', 'runway', 'grok', 'oreate', 'dola', 'custom']
+const ALLOWED_PROVIDERS = ACCOUNT_PROVIDERS
 const PROVIDER_OPTIONS = ALLOWED_PROVIDERS.map((value) => ({ value, label: value === 'chatgpt' ? 'ChatGPT' : value === 'oreate' ? 'OreateAI' : value === 'dola' ? 'Dola' : value[0].toUpperCase() + value.slice(1) }))
 const PROVIDER_LABELS = Object.fromEntries(PROVIDER_OPTIONS.map((option) => [option.value, option.label]))
 
@@ -25,7 +25,6 @@ const status = ref('')
 const busy = ref('')
 const importing = ref(false)
 const testingAccount = ref(null)
-const customAccount = ref(undefined)
 const allModels = ref([])
 const importForm = reactive({ credential: '', weight: 0 })
 const fileInput = ref(null)
@@ -306,11 +305,6 @@ function closeImportModal() {
   clearImportFiles()
 }
 
-async function customSaved() {
-  customAccount.value = undefined
-  await load()
-}
-
 let readinessTimer
 onMounted(() => {
   load(); loadModels()
@@ -331,7 +325,6 @@ onUnmounted(() => clearInterval(readinessTimer))
       <div class="flex items-center gap-2">
         <button v-if="selected.size" class="btn-soft danger" :disabled="busy === 'delete-selected'" @click="removeSelected"><Icon name="trash" class="w-3.5 h-3.5" />删除选中 ({{ selected.size }})</button>
         <button v-if="deadCount" class="btn-soft danger" :disabled="busy === 'delete-dead'" @click="removeDeadAccounts"><Icon name="trash" class="w-3.5 h-3.5" />删除异常账号 ({{ deadCount }})</button>
-        <button class="btn-soft" @click="customAccount = null"><Icon name="plus" class="w-3.5 h-3.5" />添加自定义上游</button>
         <button class="btn-primary" @click="importing = true"><Icon name="plus" class="w-3.5 h-3.5" />导入账号</button>
       </div>
     </div>
@@ -403,7 +396,6 @@ onUnmounted(() => clearInterval(readinessTimer))
               <td><span class="status" :class="`status-${account.status}`">{{ statusLabel(account.status) }}</span><div v-if="account.provider === 'dola'" class="text-xs mt-1" :class="account.readiness === 'ready' ? 'ok' : 'warn'" :title="account.readiness_detail">{{ dolaReadinessLabel(account) }}</div><small v-if="account.provider === 'dola' && account.readiness_detail && account.readiness !== 'ready'" class="block max-w-48 text-white/50">{{ account.readiness_detail }}</small><div v-if="account.image_limited || account.video_limited" class="limit-flags"><span v-if="account.image_limited">图片限额</span><span v-if="account.video_limited">视频限额</span></div></td>
               <td><div class="flex items-center gap-1 justify-end">
                 <button class="icon-btn test-action" title="账号能力测试" @click="testingAccount = account"><Icon name="test" class="w-3.5 h-3.5" /></button>
-                <button v-if="account.provider === 'custom'" class="icon-btn" title="编辑自定义上游" @click="customAccount = account"><Icon name="config" class="w-3.5 h-3.5" /></button>
                 <button class="icon-btn" :title="account.provider === 'dola' ? '重新验证协议会话（不生成视频）' : '校验账号并刷新真实额度'" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
                 <button class="switch" :class="(account.provider === 'dola' ? account.status !== 'disabled' : account.status === 'active') && 'on'" :disabled="account.provider !== 'dola' && !['active','disabled'].includes(account.status)" :title="account.status === 'disabled' ? '启用账号' : (account.provider === 'dola' || account.status === 'active' ? '停用账号' : `${statusLabel(account.status)}状态不可手动切换`)" @click="toggleAccount(account)"><span></span></button>
                 <button class="icon-btn danger" title="删除账号" @click="removeAccount(account)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
@@ -432,7 +424,7 @@ onUnmounted(() => clearInterval(readinessTimer))
     <div v-if="importing" class="modal-bg" @click.self="closeImportModal">
       <form class="modal-card" @submit.prevent="importAccount">
         <div class="flex items-center justify-between"><h3 class="font-semibold text-white/90">导入账号</h3><button type="button" @click="closeImportModal"><Icon name="close" class="w-4 h-4" /></button></div>
-        <p class="text-[11px] leading-5 text-white/45">自动识别 CPA / Sub2API JSON、ChatGPT / Runway / Grok JWT、Adobe / BytePlus / Dola Cookie、OreateAI 账号 JSON，以及多行混合凭据。全粘进来即可，无需任何前缀或平台选择。</p>
+        <p class="text-[11px] leading-5 text-white/45">自动识别 CPA / Sub2API JSON、ChatGPT / Grok JWT、Adobe / BytePlus / Dola Cookie、OreateAI 账号 JSON，以及多行混合凭据。全粘进来即可，无需任何前缀或平台选择。</p>
 
         <input ref="fileInput" type="file" accept=".json,.zip,application/json,application/zip" multiple class="hidden" @change="selectImportFiles" />
         <div class="file-picker">
@@ -457,7 +449,6 @@ onUnmounted(() => clearInterval(readinessTimer))
     </div>
 
     <AccountTestModal v-if="testingAccount" :account="testingAccount" :models="allModels" @close="testingAccount = null" />
-    <CustomAccountModal v-if="customAccount !== undefined" :account="customAccount" :models="allModels" @close="customAccount = undefined" @saved="customSaved" />
 
   </section>
 </template>

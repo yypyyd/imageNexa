@@ -161,7 +161,7 @@ For each request, the scheduler performs these steps in order:
 
 When a model has multiple routes, make a non-waiting pass across them before queueing on capacity. Only full routes are revisited within one shared 90-second wait; failed routes do not enter a repeated cross-route submit loop. Single-route requests retain their bounded temporary retry, and the verified BytePlus beta chain retains its separate six-distinct-account budget. Queue polling uses jitter and batches capacity reads; per-request account snapshots refresh at most once per second, while each actual admission is revalidated. Equal ranked accounts preserve the distributed round-robin order. Concurrency cleanup uses an independent three-second context so cancelled work cannot leak a slot until its 15-minute lease expires. Capacity observation uses Redis time and never deletes leases.
 
-Clients select a channel by requesting that channel's public model ID. Runway and Custom are not published as public channels in this split. Custom bindings on retired merged IDs are not cloned onto the new IDs. Custom cannot substitute the Dola-only `dola-seedance-2.5` model.
+Clients select a channel by requesting that channel's public model ID. Runway and Custom are not published as public channels, and they are hidden from the administrator account console, import, and provider switches until those channels are ready. Custom cannot substitute the Dola-only `dola-seedance-2.5` model.
 
 ## 7. Model-aware quota scheduling
 
@@ -474,4 +474,4 @@ Dola 的发布验证重点包括请求结构、时长限制、导入识别、就
 
 **Reason**: Channels differ in ratio, resolution, duration, and reference limits. Unioning capabilities and failing over across providers hid those differences and made the public catalog look like a single product. Runway and Custom stay out of the public catalog until those channels are ready.
 
-**Impact**: The closed catalog is 26 models (4 text, 10 image, 12 video). Requests using a retired merged ID, `runway-nano-banana-2`, or `runway-nano-banana-pro` receive `model_not_found`. Scheduling fails over across accounts on the selected native channel only. Existing Custom bindings on merged IDs are not cloned onto the new IDs.
+**Impact**: The closed catalog is 26 models (4 text, 10 image, 12 video). Requests using a retired merged ID, `runway-nano-banana-2`, or `runway-nano-banana-pro` receive `model_not_found`. Scheduling fails over across accounts on the selected native channel only. Existing Custom bindings on merged IDs are not cloned onto the new IDs. The administrator console, settings provider switches, and credential import omit Runway and Custom.

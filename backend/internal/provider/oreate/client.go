@@ -1,6 +1,6 @@
 // Package oreate implements the OreateAI website provider. OreateAI does not
-// expose an OpenAI-compatible API: requests use a website cookie, create an AI
-// video chat, attach a Banti risk token, and consume a server-sent event stream.
+// expose an OpenAI-compatible API: requests use a website cookie, attach a
+// Banti risk token, and consume a server-sent event stream.
 package oreate
 
 import (

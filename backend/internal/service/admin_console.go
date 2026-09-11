@@ -439,7 +439,7 @@ func safeCustomMeta(account model.TokenAccount, key string) string {
 
 func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountImportInput) (map[string]any, error) {
 	provider := normalizeAdminProvider(input.Provider)
-	if provider == "" {
+	if provider == "" || isDeferredAccountProvider(provider) {
 		return nil, errors.New("unsupported provider")
 	}
 	credential := credentialMap(input.Credential)

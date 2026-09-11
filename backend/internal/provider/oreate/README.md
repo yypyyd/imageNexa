@@ -15,19 +15,16 @@ the authenticated website flow and its browser-generated Banti signature.
   scenes with the same attachment metadata as the official frontend.
 - Parse MP4/MOV movie headers and enforce Oreate's 2-15 second aggregate
   reference-video window without adding an `ffprobe` runtime dependency.
-- Create an AI video chat, obtain a fresh Banti `jt`, submit the SSE generation
-  request, parse the final artifact URL, and optionally download the MP4. The
-  chat creation and the submit run as fetches inside a warm signed page, because
-  risk control refuses a generation that a browser did not request: an A/B run
+- Obtain a fresh Banti `jt`, submit the SSE generation request from a warm
+  signed page, parse the final artifact URL, and optionally download the MP4.
+  Risk control refuses a generation that a browser did not request: an A/B run
   in production had every in-page submit accepted and 20 of 21 Go submits
   refused as spam users, with a freshly minted token and the same exit IP. The
   page is released as soon as upstream accepts the job and the render itself is
   followed from Go, over the sticky proxy session of the submitting page so the
   generation is seen from one exit IP.
-- Resolve the generation by reading the chat back: the assistant message
-  reports the finished clip or the upstream giving up, so a refused render
-  fails in seconds instead of holding a browser until the stream timeout. The
-  `logId` CDN path stays as the last fallback for a chat that cannot be read.
+- Resolve a dropped stream from the `logId` CDN path when the page already
+  collected a log identifier.
 - Classify authentication, quota, content, risk-control, and temporary upstream
   failures for the shared account-pool retry policy.
 - Route browser and submit traffic through the configured global proxy without
@@ -42,10 +39,14 @@ repository layers.
 
 - Go standard-library HTTP and SSE primitives.
 - `chromedp` and CDP network events for the official browser-side signer.
-- A Chromium runtime selected by `OREATE_CHROME` in production. Signed pages
-  stay open between generations, so a submit costs one Banti report and two
-  fetches (about a second) instead of a page load (about fifteen), and pages are
-  never shared across accounts or used by two submits at once. The pool size is
+  The signer waits for `PARIS_INSTANCE_CACHE` or any `window.paris_*` instance
+  that exposes `sendBantiReport`; it does not hard-code a Banti global name.
+  In-page SSE fetches send the official `JS-Token` and `Acs-Token` headers
+  (`sse` Banti subid).
+- A Chromium runtime selected by `OREATE_CHROME` in production.   Signed pages
+  stay open between generations, so a submit costs one Banti report (sse) plus
+  an ACS token and one stream fetch, instead of a page load (about fifteen),
+  and pages are never shared across accounts or used by two submits at once. The pool size is
   derived from the cgroup CPU and memory limits (or the machine's own) at
   startup, so nothing has to be sized by hand; a page is recycled once it goes
   unused, gets old or has been used enough times. `OREATE_SIGNER_PAGES` overrides
@@ -135,7 +136,7 @@ go build ./internal/provider/oreate
 - `models.go`: strict Seedance capability, `aiType`, and point-cost mapping.
 - `media_duration.go`: bounded ISO BMFF `mvhd` duration parser.
 - `upload.go`: Oreate upload-token exchange and fixed-host GCS resumable upload.
-- `video.go`: chat creation, SSE generation, parsing, and artifact download.
+- `video.go`: SSE generation, parsing, logId recovery, and artifact download.
 - `signer.go`: Chromium signer, Banti report barrier, and proxy configuration.
 - `signer_pool.go`: warm pages, their in-page submits and sticky proxy sessions.
 - `video_inpage.go`: the in-page submit script and its result parsing.
