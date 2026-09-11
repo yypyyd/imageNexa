@@ -45,7 +45,7 @@ async function copy(name) {
 </script>
 
 <template>
-  <section class="space-y-6 max-w-6xl">
+  <section class="space-y-6">
     <div>
       <h2 class="text-xl font-semibold text-white/90">2API 接入文档</h2>
       <p class="mt-1 text-xs text-white/40">文本、图片和视频统一使用 OpenAI Bearer 鉴权。多渠道产品使用带渠道前缀的 canonical 模型 ID。</p>
@@ -111,5 +111,24 @@ async function copy(name) {
 </template>
 
 <style scoped>
-.callout{display:flex;gap:.8rem;padding:1rem;border-radius:.85rem;background:rgb(16 185 129 / .06);box-shadow:inset 0 0 0 1px rgb(16 185 129 / .15)}.doc-section{scroll-margin-top:1rem;display:flex;flex-direction:column;gap:.85rem;padding:1.25rem;border-radius:.9rem;background:rgb(255 255 255 / .03);box-shadow:inset 0 0 0 1px rgb(255 255 255 / .06)}.doc-title{display:flex;align-items:center;gap:.6rem}.doc-title code{font-size:.82rem;color:rgb(255 255 255 / .85)}.get,.post{display:inline-flex;border-radius:.35rem;padding:.18rem .4rem;font:bold .58rem ui-monospace,SFMono-Regular,monospace}.get{color:rgb(125 211 252);background:rgb(14 165 233 / .12)}.post{color:rgb(167 243 208);background:rgb(16 185 129 / .12)}.doc-text{font-size:.72rem;line-height:1.75;color:rgb(255 255 255 / .45)}.doc-text code,.callout code{padding:.08rem .28rem;border-radius:.25rem;color:rgb(255 255 255 / .75);background:rgb(255 255 255 / .06)}.model-group{display:flex;flex-direction:column;gap:.45rem;padding:.8rem;border-radius:.7rem;background:rgb(255 255 255 / .025)}.model-group h4{font-size:.65rem;color:rgb(255 255 255 / .4)}.model-group code{font-size:.68rem;color:rgb(196 181 253)}.code-block{position:relative;border-radius:.7rem;background:#090b11;box-shadow:inset 0 0 0 1px rgb(255 255 255 / .07);overflow:auto}.code-block button{position:absolute;right:.6rem;top:.6rem;padding:.25rem .5rem;border-radius:.35rem;font-size:.6rem;color:rgb(255 255 255 / .5);background:rgb(255 255 255 / .07)}.code-block pre,.simple-code{padding:1rem;padding-right:4rem;white-space:pre-wrap;word-break:break-word;font: .68rem/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;color:rgb(167 243 208)}.endpoint-list{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:.5rem .7rem;font-size:.68rem;color:rgb(255 255 255 / .4)}.endpoint-list code{color:rgb(255 255 255 / .7)}.simple-code{padding:1rem;border-radius:.65rem;background:#090b11}.error-item{display:flex;gap:.6rem;padding:.65rem;border-radius:.55rem;background:rgb(255 255 255 / .025)}.error-item strong{color:rgb(253 164 175)}
+.callout { display: flex; gap: .8rem; padding: 1rem; border-radius: .85rem; background: rgb(16 185 129 / .08); box-shadow: inset 0 0 0 1px rgb(16 185 129 / .18); }
+.doc-section { scroll-margin-top: 1rem; display: flex; flex-direction: column; gap: .85rem; padding: 1.25rem; border-radius: .9rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); }
+.doc-title { display: flex; align-items: center; gap: .6rem; }
+.doc-title code { font-size: .82rem; color: var(--fg); }
+.get, .post { display: inline-flex; border-radius: .35rem; padding: .18rem .4rem; font: bold .58rem ui-monospace, SFMono-Regular, monospace; }
+.get { color: rgb(125 211 252); background: rgb(14 165 233 / .12); }
+.post { color: rgb(167 243 208); background: rgb(16 185 129 / .12); }
+.doc-text { font-size: .72rem; line-height: 1.75; color: var(--fg-3); overflow-wrap: anywhere; }
+.doc-text code, .callout code { padding: .08rem .28rem; border-radius: .25rem; color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent); }
+.model-group { display: flex; flex-direction: column; gap: .45rem; padding: .8rem; border-radius: .7rem; background: var(--surface); box-shadow: inset 0 0 0 1px var(--hairline); }
+.model-group h4 { font-size: .65rem; color: var(--fg-3); }
+.model-group code { font-size: .68rem; color: rgb(196 181 253); }
+.code-block { position: relative; border-radius: .7rem; background: #090b11; box-shadow: inset 0 0 0 1px rgb(255 255 255 / .07); overflow: auto; }
+.code-block button { position: absolute; right: .6rem; top: .6rem; padding: .25rem .5rem; border-radius: .35rem; font-size: .6rem; color: rgb(255 255 255 / .5); background: rgb(255 255 255 / .07); }
+.code-block pre, .simple-code { padding: 1rem; padding-right: 4rem; white-space: pre-wrap; word-break: break-word; font: .68rem/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; color: rgb(167 243 208); }
+.endpoint-list { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: .5rem .7rem; font-size: .68rem; color: var(--fg-3); }
+.endpoint-list code { color: var(--fg); }
+.simple-code { padding: 1rem; border-radius: .65rem; background: #090b11; }
+.error-item { display: flex; gap: .6rem; padding: .65rem; border-radius: .55rem; background: var(--surface); box-shadow: inset 0 0 0 1px var(--hairline); }
+.error-item strong { color: rgb(253 164 175); }
 </style>

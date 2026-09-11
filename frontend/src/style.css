@@ -119,14 +119,17 @@ html:not(.dark) .theme-text :is([class*="text-sky-3"], [class*="text-sky-2"]) { 
 html:not(.dark) .theme-text :is([class*="text-amber-3"], [class*="text-amber-2"]) { color: rgb(180 83 9); }
 html:not(.dark) .theme-text :is([class*="text-rose-3"], [class*="text-rose-2"]) { color: rgb(190 18 60); }
 
-html:not(.dark) .theme-text :is(.metric, .health, .quota, .security, .doc-section, .model-group, .filter, .tabs, .small-btn, .icon-btn, .kind, .provider, .status) {
+html:not(.dark) .theme-text :is(.metric, .health, .quota, .security, .doc-section, .model-group, .provider-row, .filter, .tabs, .small-btn, .icon-btn, .kind, .provider, .status) {
   background-color: var(--surface-2);
   border-color: var(--hairline);
 }
 html:not(.dark) .theme-text :is(.metric-label, .kpi-label, .table-head, .section-title, .label, .hint, .health-label, .section-desc, .doc-text, .endpoint-list, .tabs button, .filter, .small-btn, .icon-btn, .status) { color: var(--fg-3); }
-html:not(.dark) .theme-text :is(.metric strong, .section-heading, .doc-title code) { color: var(--fg); }
-html:not(.dark) .theme-text :is(.table-row, .model-group h4) { color: var(--fg-2); }
+html:not(.dark) .theme-text :is(.metric strong, .section-heading, .doc-title code, .provider-row strong, .security strong) { color: var(--fg); }
+html:not(.dark) .theme-text :is(.table-row, .model-group h4, .provider-row code) { color: var(--fg-2); }
 html:not(.dark) .theme-text .model-group code { color: rgb(109 40 217); }
+html:not(.dark) .theme-text :is(.doc-text code, .callout code) { color: var(--fg); background: rgb(15 23 42 / 0.06); }
+html:not(.dark) .theme-text .security span { color: rgb(4 120 87); }
+html:not(.dark) .theme-text .switch { background: rgb(15 23 42 / 0.18); }
 html:not(.dark) .theme-text :is(.filter.on, .tabs button.on) { color: #fff; background: rgb(124 58 237); }
 html:not(.dark) .theme-text :is(.status-active, .status-healthy, .status-enabled, .status-succeeded, .status-success, .health .ok, .route) { color: rgb(4 120 87); background: rgb(16 185 129 / 0.12); }
 html:not(.dark) .theme-text :is(.status-cooldown, .status-processing, .status-unknown) { color: rgb(180 83 9); background: rgb(245 158 11 / 0.13); }
