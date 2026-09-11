@@ -229,38 +229,18 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 	return service
 }
 
-// applyProxy keeps only providers with a verified residential-egress
-// requirement synchronized with proxy.url. Other providers retain direct local
-// egress instead of consuming the metered proxy by default.
+// applyProxy snapshots each channel's residential route onto its client.
 func (s *TokenService) applyProxy(ctx context.Context) {
-	proxy := ""
-	if s.settings != nil {
-		var err error
-		proxy, err = s.settings.GetValue(ctx, "proxy.url")
-		if err != nil {
-			// Preserve the last known route on a transient settings-store error.
-			return
-		}
+	snap, err := loadProviderProxies(ctx, s.settings)
+	if err != nil {
+		// Preserve the last applied route on a transient settings-store error.
+		return
 	}
-	if s.chatgpt != nil {
-		s.chatgpt.SetProxy(proxy)
+	var byteplusClient *byteplus.Client
+	if client, ok := s.byteplus.(*byteplus.Client); ok {
+		byteplusClient = client
 	}
-	if s.grok != nil {
-		s.grok.SetProxy(proxy)
-	}
-	if s.oreate != nil {
-		s.oreate.SetProxy(proxy)
-	}
-	if s.dola != nil {
-		s.dola.SetProxy(proxy)
-		sessionAPI := ""
-		if s.settings != nil {
-			if value, err := s.settings.GetValue(ctx, "proxy.dola.session_api"); err == nil {
-				sessionAPI = strings.TrimSpace(value)
-			}
-		}
-		s.dola.SetSessionAPI(sessionAPI)
-	}
+	assignProviderProxies(snap, s.chatgpt, s.grok, s.oreate, s.dola, s.adobe, byteplusClient)
 }
 
 func (s *TokenService) List(ctx context.Context) (map[string][]ginToken, error) {

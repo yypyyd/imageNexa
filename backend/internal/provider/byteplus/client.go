@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"backend/internal/provider/proxypool"
+	"backend/internal/provider/proxysession"
 )
 
 const (
@@ -165,8 +168,9 @@ func normalizeModelName(value string) string {
 }
 
 type Client struct {
-	proxyMu sync.RWMutex
-	proxy   string
+	proxyMu  sync.RWMutex
+	proxy    string
+	assigner proxypool.Assigner
 }
 
 func NewClient(proxy string) *Client {
@@ -192,12 +196,60 @@ func (c *Client) proxyValue() string {
 	return c.proxy
 }
 
-func (c *Client) newHTTPClient(timeout time.Duration) (*http.Client, error) {
+func (c *Client) SetAssigner(assigner proxypool.Assigner) {
+	if c == nil {
+		return
+	}
+	c.proxyMu.Lock()
+	c.assigner = assigner
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) RotateProxySession(cookie string) {
+	if c == nil {
+		return
+	}
+	if assigner := c.assignerValue(); assigner != nil {
+		assigner.Rotate(proxyAccountID(cookie))
+	}
+}
+
+func (c *Client) assignerValue() proxypool.Assigner {
+	if c == nil {
+		return nil
+	}
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.assigner
+}
+
+func proxyAccountID(material string) string {
+	if key := proxysession.Key(material); key != "" {
+		return key
+	}
+	return "shared"
+}
+
+func (c *Client) egressProxy(account string) string {
+	if c == nil {
+		return ""
+	}
+	if assigner := c.assignerValue(); assigner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if url, ok := assigner.Assign(ctx, proxyAccountID(account), ""); ok {
+			return url
+		}
+	}
+	return c.proxyValue()
+}
+
+func (c *Client) newHTTPClient(timeout time.Duration, account string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// Provider pools opt into a proxy explicitly. Do not silently inherit
 	// HTTP(S)_PROXY from the host process when this client is configured direct.
 	transport.Proxy = nil
-	if rawProxy := c.proxyValue(); rawProxy != "" {
+	if rawProxy := c.egressProxy(account); rawProxy != "" {
 		proxyURL, err := url.Parse(rawProxy)
 		if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" {
 			return nil, fmt.Errorf("%w: invalid proxy URL", ErrInvalidParams)
@@ -517,7 +569,7 @@ func (c *Client) apiData(ctx context.Context, method, path, cookie string, paylo
 		return nil, fmt.Errorf("%w: create request: %v", ErrTemporaryUpstream, err)
 	}
 	setAPIHeaders(req, cookie, payload != nil)
-	client, err := c.newHTTPClient(90 * time.Second)
+	client, err := c.newHTTPClient(90*time.Second, cookie)
 	if err != nil {
 		return nil, err
 	}

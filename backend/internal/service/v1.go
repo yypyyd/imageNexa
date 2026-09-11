@@ -154,7 +154,7 @@ type V1Service struct {
 	custom   *custom.Client
 	store    *storage.Client
 	proxyMu  sync.RWMutex
-	proxy    string
+	proxies  providerProxySnapshot
 	// refresh re-mints an Adobe access token from its cookie when a request hits a
 	// 401 mid-flight (set via SetRefresh — wired after construction to avoid an
 	// init cycle). nil for deployments without cookie refresh.
@@ -443,8 +443,9 @@ func NewV1Service(cfg *config.Config, models *repo.ModelRepository, apiKeys *API
 		inflight: &InflightRegistry{},
 	}
 	if settings != nil {
-		if proxy, err := settings.GetValue(context.Background(), "proxy.url"); err == nil {
-			service.proxy = strings.TrimSpace(proxy)
+		if snap, err := loadProviderProxies(context.Background(), settings); err == nil {
+			service.proxies = snap
+			service.applyProviderProxySnapshot(snap)
 		}
 	}
 	return service
@@ -462,53 +463,28 @@ func (s *V1Service) SetRefresh(r *RefreshProfileService) { s.refresh = r }
 // SetBannedWords wires the prompt blocklist in after construction.
 func (s *V1Service) SetBannedWords(r *repo.BannedWordRepository) { s.banned = r }
 
-// applyGlobalProxy snapshots the administrator's residential route onto only
-// the providers with a verified protected-control-plane requirement. Other
-// providers remain on direct local egress.
+// applyGlobalProxy snapshots each channel's residential route onto its client.
+// Extract APIs, when set, batch-lease dedicated exits per account. ChatGPT /
+// Grok / Dola / Oreate still fall back to proxy.url when extract fails or is
+// empty. Adobe and BytePlus stay direct unless their own extract API or URL is set.
 func (s *V1Service) applyGlobalProxy(ctx context.Context) string {
-	proxy := ""
-	if s.settings != nil {
-		var err error
-		proxy, err = s.settings.GetValue(ctx, "proxy.url")
-		if err != nil {
-			// A transient settings-store failure is not equivalent to an
-			// administrator clearing the proxy. Keep the last known route.
-			s.proxyMu.RLock()
-			proxy = s.proxy
-			s.proxyMu.RUnlock()
-			return s.setProviderProxy(proxy)
-		}
+	snap, err := loadProviderProxies(ctx, s.settings)
+	if err != nil {
+		s.proxyMu.RLock()
+		snap = s.proxies
+		s.proxyMu.RUnlock()
+		s.applyProviderProxySnapshot(snap)
+		return snap.Default
 	}
-	proxy = strings.TrimSpace(proxy)
 	s.proxyMu.Lock()
-	s.proxy = proxy
+	s.proxies = snap
 	s.proxyMu.Unlock()
-	return s.setProviderProxy(proxy)
+	s.applyProviderProxySnapshot(snap)
+	return snap.Default
 }
 
-func (s *V1Service) setProviderProxy(proxy string) string {
-	if s.chatgpt != nil {
-		s.chatgpt.SetProxy(proxy)
-	}
-	if s.grok != nil {
-		s.grok.SetProxy(proxy)
-	}
-	if s.oreate != nil {
-		s.oreate.SetProxy(proxy)
-	}
-	if s.dola != nil {
-		s.dola.SetProxy(proxy)
-		// Dola's sticky per-account exits come from a dedicated session API so the
-		// shared proxy.url stays a real proxy for every other provider.
-		sessionAPI := ""
-		if s.settings != nil {
-			if value, err := s.settings.GetValue(context.Background(), "proxy.dola.session_api"); err == nil {
-				sessionAPI = strings.TrimSpace(value)
-			}
-		}
-		s.dola.SetSessionAPI(sessionAPI)
-	}
-	return strings.TrimSpace(proxy)
+func (s *V1Service) applyProviderProxySnapshot(snap providerProxySnapshot) {
+	assignProviderProxies(snap, s.chatgpt, s.grok, s.oreate, s.dola, s.adobe, s.byteplus)
 }
 
 func globalProxyHTTPClient(proxyRaw string, timeout time.Duration) (*http.Client, error) {
@@ -2106,11 +2082,6 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 	// them through the SAME account that generated the clip, using its token. If
 	// that account is gone (grok pools churn often), the clip is unrecoverable.
 	if ev.Provider == "grok" && s.grok != nil {
-		if s.settings != nil {
-			if proxy, perr := s.settings.GetValue(ctx, "proxy.url"); perr == nil {
-				s.grok.SetProxy(proxy)
-			}
-		}
 		acct, _ := s.tokens.Get(ctx, "grok", ev.AccountID)
 		if acct == nil || strings.TrimSpace(acct.Value) == "" {
 			return nil, "", fmt.Errorf("%w: grok account no longer available for this video", ErrProviderTemporary)
@@ -2241,11 +2212,6 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		if cached, ct, ok := s.openCachedImage(ctx, cacheKey); ok {
 			return cached, ct, nil
 		}
-		if s.settings != nil {
-			if proxy, perr := s.settings.GetValue(ctx, "proxy.url"); perr == nil {
-				s.chatgpt.SetProxy(proxy)
-			}
-		}
 		acct, _ := s.tokens.Get(ctx, "chatgpt", ev.AccountID)
 		if acct == nil || strings.TrimSpace(acct.Value) == "" {
 			return nil, "", fmt.Errorf("%w: chatgpt account no longer available for this image", ErrProviderTemporary)
@@ -2259,11 +2225,6 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 	// grok asset URLs (assets.grok.com) are auth-gated too — stream them with the
 	// token of the account that generated the image.
 	if ev.Provider == "grok" && s.grok != nil {
-		if s.settings != nil {
-			if proxy, perr := s.settings.GetValue(ctx, "proxy.url"); perr == nil {
-				s.grok.SetProxy(proxy)
-			}
-		}
 		acct, _ := s.tokens.Get(ctx, "grok", ev.AccountID)
 		if acct == nil || strings.TrimSpace(acct.Value) == "" {
 			return nil, "", fmt.Errorf("%w: grok account no longer available for this image", ErrProviderTemporary)
@@ -3299,7 +3260,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				}
 			}
 			s.markTokenFailure(ctx, pool, token, kind, true, false)
-			s.coolDownAccount(pool, token.ID)
+			s.coolDownAccountWithToken(pool, token)
 			return nil, true, false, err
 		}
 		// Fatal / temporary-under-failover-policy upstream error.
@@ -3313,7 +3274,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				// request may burn this way (maxTempFailoverAccounts) so a pool-wide
 				// blip can't fan a single request across the whole pool.
 				s.markTokenUpstreamFailure(ctx, pool, token)
-				s.coolDownAccount(pool, token.ID)
+				s.coolDownAccountWithToken(pool, token)
 				return nil, true, true, err
 			}
 			s.markTokenDead(ctx, pool, token, kind)
@@ -3325,7 +3286,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			// account) and fail over to the NEXT account, capped via the tempDead
 			// return so a pool-wide blip can't fan one request across the whole pool.
 			s.markTokenUpstreamFailure(ctx, pool, token)
-			s.coolDownAccount(pool, token.ID)
+			s.coolDownAccountWithToken(pool, token)
 			return nil, true, true, err
 		}
 		return nil, false, false, err // 参数错 / request-level
@@ -4222,11 +4183,6 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 	if s.grok == nil {
 		return nil, "", errors.New("grok client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.grok.SetProxy(proxy)
-		}
-	}
 
 	// Optional reference frames (image-to-video), up to the model's max.
 	frames, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
@@ -4298,11 +4254,6 @@ func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, model
 	urlOnly := noStore
 	if s.grok == nil {
 		return nil, "", errors.New("grok client not configured")
-	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.grok.SetProxy(proxy)
-		}
 	}
 
 	items, err := s.tokens.ListByPool(ctx, "grok")
@@ -4462,11 +4413,6 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 	urlOnly := noStore
 	if s.chatgpt == nil {
 		return nil, "", errors.New("chatgpt client not configured")
-	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.chatgpt.SetProxy(proxy)
-		}
 	}
 
 	items, err := s.tokens.ListByPool(ctx, "chatgpt")
@@ -5164,6 +5110,36 @@ func (s *V1Service) coolDownAccount(pool, accountID string) {
 		return
 	}
 	s.acctCooldowns.Store(pool+":"+accountID, time.Now().Add(accountFailureCooldown))
+}
+
+func (s *V1Service) coolDownAccountWithToken(pool string, token model.TokenAccount) {
+	s.coolDownAccount(pool, token.ID)
+	s.rotateAccountProxy(pool, token)
+}
+
+func (s *V1Service) rotateAccountProxy(pool string, token model.TokenAccount) {
+	switch pool {
+	case "chatgpt":
+		if s.chatgpt != nil {
+			s.chatgpt.RotateProxySession(token.Value)
+		}
+	case "grok":
+		if s.grok != nil {
+			s.grok.RotateProxySession(token.Value)
+		}
+	case "dola":
+		if s.dola != nil {
+			s.dola.RotateProxySession(token.ID)
+		}
+	case "adobe":
+		if s.adobe != nil {
+			s.adobe.RotateProxySession(token.Value)
+		}
+	case "byteplus":
+		if s.byteplus != nil {
+			s.byteplus.RotateProxySession(token.Value)
+		}
+	}
 }
 
 func (s *V1Service) accountCooling(pool, accountID string) bool {

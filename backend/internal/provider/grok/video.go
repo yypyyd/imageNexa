@@ -64,7 +64,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 
 	// Account bootstrap/challenge and generation submits use the proxy; reference
 	// uploads, polling, and artifact downloads remain direct.
-	submitClient, err := c.newSubmitTLSClient()
+	submitClient, err := c.newSubmitTLSClient(token)
 	if err != nil {
 		return nil, nil, err
 	}

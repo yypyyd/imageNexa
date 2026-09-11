@@ -240,6 +240,14 @@ risk-control hosts.
 
 ## Change History
 
+### 2026-09-11 - Account-stable sticky proxy sessions
+
+- Replaced the random per-page proxy session label with a hash of the account
+  id (cookie as fallback) so a recycled signer page reconnects through the
+  same residential exit.
+- Kept `OREATE_PROXY_SESSION=false` as the provider-local disable; the shared
+  `proxysession` helper also honours `PROXY_STICKY_SESSION=false`.
+
 ### 2026-09-11 - SSE-only submit
 
 - Video and first-image bonus post only `/oreate/sse/stream` from the signed

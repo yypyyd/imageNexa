@@ -64,7 +64,7 @@ func (c *Client) loginOnce(ctx context.Context, identity, secret string) (string
 		tlsclient.WithClientProfile(profiles.Chrome_131),
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
 	}
-	if proxy := strings.TrimSpace(c.proxyValue()); proxy != "" {
+	if proxy := strings.TrimSpace(c.egressProxy(identity)); proxy != "" {
 		opts = append(opts, tlsclient.WithProxyUrl(proxy))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), opts...)

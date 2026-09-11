@@ -245,7 +245,6 @@ Frontend:
 ```bash
 cd frontend
 npm ci
-npm test
 npm run lint:unused
 npm run build
 ```

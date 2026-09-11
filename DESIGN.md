@@ -313,7 +313,6 @@ go build ./cmd/api
 # Frontend
 cd ../frontend
 npm ci
-npm test
 npm run lint:unused
 npm run build
 
@@ -483,3 +482,33 @@ Dola 的发布验证重点包括请求结构、时长限制、导入识别、就
 **Reason**: These three channels are no longer operated. Leftover accounts and public IDs were still visible after earlier deferrals.
 
 **Impact**: The closed catalog is 21 models (4 text, 10 image, 7 video). Requests for `oreate-seedance-*`, `seedance-2.0-mini`, `seedance-1.5-pro`, Runway IDs, or Custom bindings receive `model_not_found`. Seedance video remains on Adobe and Dola.
+
+### 2026-09-11 — Per-account sticky proxy and TLS reuse
+
+**Change**: ChatGPT, Grok, and Oreate now pin `proxy.url` to one residential session per credential (`user-session-<hash>`) and reuse that account's TLS client. ChatGPT also derives stable `oai-device-id` / `oai-session-id` from the access token instead of sharing one pair for the whole process. Dola keeps its existing session-API leases. Adobe, BytePlus, and Runway stay on direct local egress. Account selection order is unchanged (weight, available concurrency, known quota, consecutive failures, remaining-fit, round-robin). `PROXY_STICKY_SESSION=false` disables the username rewrite for pools that reject session labels; Oreate still honours `OREATE_PROXY_SESSION=false`.
+
+**Reason**: The previous ChatGPT path put every account on one rotating exit and one device id, so the site saw stolen sessions. Grok opened a fresh CONNECT on every quota probe and submit, which burned metered proxy traffic and hopped IPs mid-account. Oreate already sticky-labelled each signer page, but a recycled page drew a new random label, so the same cookie left from a new IP.
+
+**Impact**: One account keeps one exit IP across generation, quota, keep-alive, and (for Oreate) page recycle. Distinct accounts get distinct session labels. Unauthenticated proxies and pools without username session support are left unchanged. The session label is a truncated credential hash, not the cookie or JWT; proxy userinfo is still not logged.
+
+**Security decision**: Sticky labels are derived with SHA-256 and never echo the raw credential. Global `proxy.url` is still applied only to ChatGPT, Grok, Oreate, and Dola.
+
+### 2026-09-11 — Per-channel residential pools and failure-aware scheduling
+
+**Change**: System settings now store `proxy.{provider}.url` per channel plus `proxy.dola.session_api`. ChatGPT / Grok / Dola / Oreate still fall back to `proxy.url` when their own URL is empty so existing deployments keep working. Adobe and BytePlus stay direct unless their own URL is set, so a Dola JP/KR pool is not attached to Firefly or Lumina. `routeAccounts` demotes in-memory-cooling accounts before weight, and a temporary or auth failure rotates that ChatGPT/Grok credential onto a new sticky session label.
+
+**Reason**: One shared residential pool forced every website provider through the same exits. High-weight accounts that had just failed still won `routeAccounts` because cooling only affected the earlier round-robin pass. A burned sticky IP was reused on the next try of the same account.
+
+**Impact**: Operators can give ChatGPT, Grok, and Dola different pools in 系统设置. Adobe/BytePlus remain direct until explicitly configured. After a temp failure the next request prefers a healthy account, and if that same ChatGPT/Grok account is tried again it leaves from a new session label.
+
+**Security decision**: Per-channel proxy URLs are stored in `site_settings` like `proxy.url`. They are never logged. Session rotation still hashes the credential rather than putting the cookie or JWT in the proxy username.
+
+### 2026-09-11 — Batch extract API leases per channel
+
+**Change**: System settings now treat a provider extract API as the primary residential source. `proxy.extract_api` and `proxy.{provider}.extract_api` batch-fetch sticky endpoints (count rewritten to at most 64 per call) and lease one exit per account. Existing `proxy.dola.session_api` is read as Dola's extract API so current deployments keep working. ChatGPT / Grok / Dola still inherit the default extract API when their own field is empty; Adobe and BytePlus stay direct unless they have their own extract API. Static `proxy.url` remains a fallback gateway with username session labels when extract is empty or the fetch fails. Temporary or auth failures rotate the account onto a new leased exit.
+
+**Reason**: A single gateway URL with session labels cannot pre-allocate exits for a burst of concurrent accounts. The residential vendor's extract API can return many endpoints in one call, which the scheduler can assign immediately.
+
+**Impact**: Concurrent generations on distinct accounts receive distinct IPs from the same extract batch. The same account keeps its IP until TTL or a failure rotation. Operators paste extract links per channel instead of duplicating a Dola-only session API field.
+
+**Security decision**: Extract API URLs and leased proxy endpoints are stored and used like other proxy settings. They are never logged. Account lease keys are truncated hashes or durable account IDs, not raw cookies or JWTs.

@@ -18,6 +18,9 @@ import (
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/google/uuid"
+
+	"backend/internal/provider/proxypool"
+	"backend/internal/provider/proxysession"
 )
 
 const (
@@ -145,9 +148,10 @@ var profileURLs = []string{
 }
 
 type Client struct {
-	apiKey  string
-	proxyMu sync.RWMutex
-	proxy   string
+	apiKey   string
+	proxyMu  sync.RWMutex
+	proxy    string
+	assigner proxypool.Assigner
 }
 
 func NewClient(apiKey, proxy string) *Client {
@@ -163,8 +167,51 @@ func (c *Client) proxyValue() string {
 	return c.proxy
 }
 
+func (c *Client) SetProxy(proxy string) {
+	proxy = strings.TrimSpace(proxy)
+	c.proxyMu.Lock()
+	c.proxy = proxy
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) SetAssigner(assigner proxypool.Assigner) {
+	c.proxyMu.Lock()
+	c.assigner = assigner
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) RotateProxySession(token string) {
+	if assigner := c.assignerValue(); assigner != nil {
+		assigner.Rotate(proxyAccountID(token))
+	}
+}
+
+func (c *Client) assignerValue() proxypool.Assigner {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.assigner
+}
+
+func (c *Client) egressProxy(account string) string {
+	if assigner := c.assignerValue(); assigner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if url, ok := assigner.Assign(ctx, proxyAccountID(account), ""); ok {
+			return url
+		}
+	}
+	return c.proxyValue()
+}
+
+func proxyAccountID(material string) string {
+	if key := proxysession.Key(material); key != "" {
+		return key
+	}
+	return "shared"
+}
+
 func (c *Client) ExchangeCookie(ctx context.Context, cookie string) (*CookieExchangeResult, error) {
-	sess, err := c.newProxyTLSClient()
+	sess, err := c.newProxyTLSClient(cookie)
 	if err != nil {
 		return nil, err
 	}
@@ -306,7 +353,7 @@ func defaultMediaContentType(kind string) string {
 const generatedImageSafetyMaxAttempts = 3
 
 func (c *Client) GenerateImage(ctx context.Context, token, arpSessionToken, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
-	submitSess, err := c.newSubmitTLSClient()
+	submitSess, err := c.newSubmitTLSClient(token)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -376,7 +423,7 @@ generationAttempts:
 // in meta["video_url"] — used by the async /v1/videos job, which proxies that URL
 // on /content instead of persisting the file.
 func (c *Client) GenerateVideo(ctx context.Context, token, arpSessionToken, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, inputs VideoInputs, downloadResult bool) ([]byte, map[string]any, error) {
-	submitSess, err := c.newSubmitTLSClient()
+	submitSess, err := c.newSubmitTLSClient(token)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -411,7 +458,7 @@ func (c *Client) FetchAccountProfile(ctx context.Context, token string) (map[str
 	if token == "" {
 		return map[string]any{}, nil
 	}
-	sess, err := c.newProxyTLSClient()
+	sess, err := c.newProxyTLSClient(token)
 	if err != nil {
 		return nil, err
 	}
@@ -496,7 +543,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		}, nil
 	}
 
-	sess, err := c.newProxyTLSClient()
+	sess, err := c.newProxyTLSClient(token)
 	if err != nil {
 		return nil, err
 	}
@@ -1063,24 +1110,26 @@ type tlsSession struct {
 
 // newProxyTLSClient is used for authentication, account maintenance, and
 // generation-submit requests. Large media and artifact transfers use direct.
-func (c *Client) newProxyTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(currentAdobeFingerprint(), true)
+func (c *Client) newProxyTLSClient(account string) (*tlsSession, error) {
+	return c.newTLSSession(currentAdobeFingerprint(), true, account)
 }
 
-func (c *Client) newSubmitTLSClient() (*tlsSession, error) { return c.newProxyTLSClient() }
+func (c *Client) newSubmitTLSClient(account string) (*tlsSession, error) {
+	return c.newProxyTLSClient(account)
+}
 
 func (c *Client) newDirectTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(currentAdobeFingerprint(), false)
+	return c.newTLSSession(currentAdobeFingerprint(), false, "")
 }
 
-func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, error) {
+func (c *Client) newTLSSession(fp fingerprint, useProxy bool, account string) (*tlsSession, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(fp.profile),
 		tlsclient.WithNotFollowRedirects(),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if proxy := c.proxyValue(); useProxy && proxy != "" {
+	if proxy := c.egressProxy(account); useProxy && proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)

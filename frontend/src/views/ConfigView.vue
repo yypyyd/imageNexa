@@ -12,6 +12,10 @@ const health = reactive({ live: null, ready: null })
 const settings = reactive({
   public_base_url: '',
   outbound_proxy: '',
+  outbound_extract_api: '',
+  dola_session_api: '',
+  provider_proxies: Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, ''])),
+  provider_extract_apis: Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, ''])),
   logs_retention_days: 30,
   artifacts_retention_days: 30,
 })
@@ -26,15 +30,35 @@ const PROVIDER_LABELS = {
   grok: 'Grok',
 }
 
+const PROXY_PROVIDER_ORDER = ['chatgpt', 'grok', 'dola', 'adobe', 'byteplus']
+const PROXY_INHERIT_DEFAULT = new Set(['chatgpt', 'grok', 'dola'])
+
 const visibleProviders = computed(() => Object.keys(providers).filter((pool) => ACCOUNT_PROVIDERS.includes(pool)).sort())
+const proxyProviders = computed(() => PROXY_PROVIDER_ORDER.filter((pool) => ACCOUNT_PROVIDERS.includes(pool)))
 
 function providerLabel(pool) {
   return PROVIDER_LABELS[pool] || pool[0].toUpperCase() + pool.slice(1)
 }
 
+function emptyProviderProxies() {
+  return Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, '']))
+}
+
+function extractHint(pool) {
+  if (PROXY_INHERIT_DEFAULT.has(pool)) {
+    return '留空则使用上方默认提取 API'
+  }
+  return '留空为直连，不使用默认提取 API'
+}
+
 function applySettings(data) {
-  const { providers_enabled: enabled, ...rest } = data || {}
+  const { providers_enabled: enabled, provider_proxies: proxies, provider_extract_apis: extracts, ...rest } = data || {}
   Object.assign(settings, rest)
+  settings.provider_proxies = { ...emptyProviderProxies(), ...(proxies && typeof proxies === 'object' ? proxies : {}) }
+  settings.provider_extract_apis = { ...emptyProviderProxies(), ...(extracts && typeof extracts === 'object' ? extracts : {}) }
+  if (!(settings.provider_extract_apis.dola || '').trim() && (settings.dola_session_api || '').trim()) {
+    settings.provider_extract_apis.dola = settings.dola_session_api
+  }
   if (enabled && typeof enabled === 'object') {
     for (const key of Object.keys(providers)) delete providers[key]
     Object.assign(providers, enabled)
@@ -57,6 +81,8 @@ async function save() {
   const response = await api('/settings', jsonBody('PUT', {
     public_base_url: settings.public_base_url.trim(),
     outbound_proxy: settings.outbound_proxy.trim(),
+    outbound_extract_api: (settings.outbound_extract_api || '').trim(),
+    provider_extract_apis: Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, (settings.provider_extract_apis[pool] || '').trim()])),
     logs_retention_days: Math.max(1, Number(settings.logs_retention_days) || 30),
     artifacts_retention_days: Math.max(1, Number(settings.artifacts_retention_days) || 30),
     providers_enabled: { ...providers },
@@ -107,8 +133,16 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
       </div>
 
       <div class="card p-5 space-y-4">
-        <div><h3 class="section-heading">上游网络</h3><p class="section-desc">为支持的 Provider 配置统一出站代理。</p></div>
-        <label class="block"><span class="label">出站代理</span><input v-model="settings.outbound_proxy" class="field mt-1.5 font-mono text-xs" placeholder="http://127.0.0.1:7890（留空为直连）" /><span class="hint">修改后仅影响新建连接；账号调度状态不会被重置。</span></label>
+        <div><h3 class="section-heading">上游网络</h3><p class="section-desc">每个渠道贴提取 API。系统会按并发批量领取出口，按账号粘性分配；地区不同请分开填写。Adobe / BytePlus 留空则直连。</p></div>
+        <label class="block"><span class="label">默认提取 API</span><input v-model="settings.outbound_extract_api" class="field mt-1.5 font-mono text-xs" placeholder="http://host:port/gen?zone=custom&region=US&count=64&proto=http&stype=txt&sessType=sticky&sessTime=180" /><span class="hint">ChatGPT、Grok、Dola 未单独填写时使用此项。链接里的 count 只是上限，系统按并发分批领取，单次最多 64 条。</span></label>
+        <div class="space-y-4">
+          <label v-for="pool in proxyProviders" :key="pool" class="block">
+            <span class="label">{{ providerLabel(pool) }} 提取 API</span>
+            <input v-model="settings.provider_extract_apis[pool]" class="field mt-1.5 font-mono text-xs" :placeholder="extractHint(pool)" />
+            <span class="hint">{{ extractHint(pool) }}</span>
+          </label>
+        </div>
+        <label class="block"><span class="label">回退出站网关</span><input v-model="settings.outbound_proxy" class="field mt-1.5 font-mono text-xs" placeholder="http://user:pass@host:port（可选）" /><span class="hint">未配置提取 API、或提取失败时使用。ChatGPT / Grok 仍会给用户名加 session 标签。Adobe / BytePlus 不会走这项。</span></label>
       </div>
 
       <div class="card p-5 space-y-4">

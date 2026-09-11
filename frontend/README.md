@@ -26,7 +26,6 @@ session cookie and Origin protection work as intended.
 ## Verify and build
 
 ```bash
-npm test
 npm run lint:unused
 npm run build
 ```

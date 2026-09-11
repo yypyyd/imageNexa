@@ -8,13 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"backend/internal/provider/proxysession"
 
 	"github.com/chromedp/chromedp"
 )
@@ -23,11 +24,11 @@ import (
 // the browser both mints the token and posts the request. Opening a page for
 // every generation cost 14 to 16 seconds of navigation, which is why pages are
 // kept warm here: a submit is then just the stream fetch the site makes. A page
-// belongs to one account and pins one proxy session for its whole life, because
-// the token is only valid for that account from that exit IP.
+// belongs to one account and pins that account's sticky proxy session, including
+// when the page is later recycled, because the token is only valid for that
+// account from that exit IP.
 const (
-	proxySessionEnv    = "OREATE_PROXY_SESSION"
-	proxySessionMarker = "-session-"
+	proxySessionEnv = "OREATE_PROXY_SESSION"
 
 	signerPagesEnv = "OREATE_SIGNER_PAGES"
 	// A warm page costs about half a gigabyte of headroom and bursts one core
@@ -451,8 +452,8 @@ func (p *signerPool) sweepIdle() {
 	}
 }
 
-// open launches one browser pinned to a fresh proxy session, installs the
-// account cookies and waits for the page runtime that mints tokens.
+// open launches one browser pinned to this account's sticky proxy session,
+// installs the account cookies and waits for the page runtime that mints tokens.
 func (p *signerPool) open(account Account) (*signerPage, error) {
 	path := chromiumExecPath()
 	if path == "" {
@@ -460,7 +461,7 @@ func (p *signerPool) open(account Account) (*signerPage, error) {
 	}
 	proxyURL := ""
 	if p.proxy != nil {
-		proxyURL = stickyProxyURL(p.proxy(), newProxySession())
+		proxyURL = stickyProxyURL(p.proxy(), accountProxySession(account))
 	}
 	// The page outlives the generation that opened it, so its browser hangs off
 	// the background context and is only closed by the pool.
@@ -643,23 +644,27 @@ func (page *signerPage) usable() bool {
 // stickyProxyURL pins the proxy to one exit IP by labelling the session in the
 // user name, which is how rotating residential pools expose sticky sessions.
 // Pools that do not support the label, or a proxy without credentials, are left
-// alone; OREATE_PROXY_SESSION=false turns the rewrite off entirely.
+// alone. OREATE_PROXY_SESSION=false turns the rewrite off for this provider;
+// PROXY_STICKY_SESSION=false is the process-wide kill switch.
 func stickyProxyURL(raw, session string) string {
 	raw = strings.TrimSpace(raw)
-	if raw == "" || session == "" || strings.EqualFold(strings.TrimSpace(os.Getenv(proxySessionEnv)), "false") {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(proxySessionEnv)), "false") {
 		return raw
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User == nil {
-		return raw
+	return proxysession.URL(raw, session)
+}
+
+// accountProxySession is stable for one Oreate account so a recycled signer
+// page reconnects through the same residential exit instead of hopping IPs.
+func accountProxySession(account Account) string {
+	account = account.normalized()
+	if key := proxysession.Key(account.ID); key != "" {
+		return key
 	}
-	name := parsed.User.Username()
-	if name == "" || strings.Contains(name, proxySessionMarker) {
-		return raw
+	if key := proxysession.Key(account.Cookie); key != "" {
+		return key
 	}
-	password, _ := parsed.User.Password()
-	parsed.User = url.UserPassword(name+proxySessionMarker+session, password)
-	return parsed.String()
+	return newProxySession()
 }
 
 func newProxySession() string {

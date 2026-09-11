@@ -253,6 +253,12 @@ func safeAdminValidationMessage(err error) (string, bool) {
 		"weight must be between -1000 and 1000",
 		"max_concurrency must be between 0 and 1000",
 		"outbound_proxy must be an http(s) or socks5 URL",
+		"outbound_proxy must be an absolute http(s) or socks5 URL",
+		"outbound_proxy must not contain a query or fragment",
+		"provider_proxies must be an object of pool => URL",
+		"provider_extract_apis must be an object of pool => URL",
+		"dola_session_api must be an absolute http(s) URL",
+		"outbound_extract_api must be an absolute http(s) URL",
 		"public_base_url must be an http(s) URL",
 		"cookie required",
 		"not a byteplus lumina cookie",
@@ -274,6 +280,14 @@ func safeAdminValidationMessage(err error) (string, bool) {
 		if message == setting+" must be between 1 and 3650" {
 			return message, true
 		}
+	}
+	if strings.HasPrefix(message, "provider_proxies.") ||
+		strings.HasPrefix(message, "provider_proxies contains unknown provider") ||
+		strings.HasPrefix(message, "provider_extract_apis.") ||
+		strings.HasPrefix(message, "provider_extract_apis contains unknown provider") ||
+		strings.HasPrefix(message, "outbound_extract_api ") ||
+		strings.HasPrefix(message, "dola_session_api ") {
+		return message, true
 	}
 	if strings.HasPrefix(message, "invalid base_url: public HTTPS on port 443 is required") ||
 		strings.HasPrefix(message, "invalid base_url: query and fragment are not allowed") {

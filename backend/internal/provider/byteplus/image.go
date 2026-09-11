@@ -1116,7 +1116,7 @@ func (c *Client) OpenAsset(ctx context.Context, cookie, rawURL string) ([]byte, 
 	if err != nil {
 		return nil, "", err
 	}
-	client, err := c.newHTTPClient(5 * time.Minute)
+	client, err := c.newHTTPClient(5*time.Minute, cookie)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1313,7 +1313,7 @@ func (c *Client) uploadImageX(ctx context.Context, cookie string, token imageXTo
 		return "", fmt.Errorf("%w: create ImageX apply request", ErrTemporaryUpstream)
 	}
 	signImageXRequest(applyReq, token, nil, time.Now().UTC())
-	applyRaw, err := c.doImageX(ctx, applyReq, maxAPIResponseBytes)
+	applyRaw, err := c.doImageX(ctx, cookie, applyReq, maxAPIResponseBytes)
 	if err != nil {
 		return "", err
 	}
@@ -1350,7 +1350,7 @@ func (c *Client) uploadImageX(ctx context.Context, cookie string, token imageXTo
 	for key, value := range address.UploadHeader {
 		uploadReq.Header.Set(key, value)
 	}
-	uploadRaw, err := c.doImageX(ctx, uploadReq, maxAPIResponseBytes)
+	uploadRaw, err := c.doImageX(ctx, cookie, uploadReq, maxAPIResponseBytes)
 	if err != nil {
 		return "", err
 	}
@@ -1377,7 +1377,7 @@ func (c *Client) uploadImageX(ctx context.Context, cookie string, token imageXTo
 	}
 	commitReq.Header.Set("Content-Type", "application/json")
 	signImageXRequest(commitReq, token, commitBody, time.Now().UTC())
-	commitRaw, err := c.doImageX(ctx, commitReq, maxAPIResponseBytes)
+	commitRaw, err := c.doImageX(ctx, cookie, commitReq, maxAPIResponseBytes)
 	if err != nil {
 		return "", err
 	}
@@ -1420,8 +1420,8 @@ func validateRiskResult(data any) error {
 	return nil
 }
 
-func (c *Client) doImageX(ctx context.Context, req *http.Request, limit int64) ([]byte, error) {
-	client, err := c.newHTTPClient(5 * time.Minute)
+func (c *Client) doImageX(ctx context.Context, cookie string, req *http.Request, limit int64) ([]byte, error) {
+	client, err := c.newHTTPClient(5*time.Minute, cookie)
 	if err != nil {
 		return nil, err
 	}

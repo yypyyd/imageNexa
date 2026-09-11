@@ -14,7 +14,6 @@ import (
 	_ "image/png"
 	"io"
 	stdhttp "net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,6 +22,8 @@ import (
 	"time"
 
 	"backend/internal/netguard"
+	"backend/internal/provider/proxypool"
+	"backend/internal/provider/proxysession"
 
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
@@ -42,18 +43,21 @@ var (
 type Client struct {
 	proxyMu   sync.RWMutex
 	proxy     string
+	assigner  proxypool.Assigner
 	deviceID  string
 	sessionID string
-	// Reusable tls-client sessions. Every call previously built a fresh client,
-	// so each proxied request paid a full CONNECT + TLS handshake (and a fresh
-	// cookie jar). Caching per egress lets the underlying transport keep-alive,
-	// cutting metered-proxy connect overhead. sessionMu guards the cache and the
-	// proxy value it was built for; the returned clients are themselves safe for
+	// Reusable tls-client sessions keyed by credential. One shared client used
+	// to hop every account onto the same rotating exit and the same
+	// oai-device-id; pinning the residential session label and the TLS jar to
+	// the access token keeps one ChatGPT account on one exit. sessionMu guards
+	// the maps and the proxy they were built for; the clients are safe for
 	// concurrent use, so requests do not hold the lock.
-	sessionMu           sync.Mutex
-	cachedProxySession  tlsclient.HttpClient
-	cachedDirectSession tlsclient.HttpClient
-	cachedProxy         string
+	sessionMu            sync.Mutex
+	cachedBaseProxy      string
+	cachedProxySessions  map[string]tlsclient.HttpClient
+	cachedAssetSessions  map[string]tlsclient.HttpClient
+	cachedDirectSessions map[string]tlsclient.HttpClient
+	sessionEpochs        map[string]int
 }
 
 type fileEntry struct {
@@ -81,15 +85,75 @@ func NewClient(proxy string) *Client {
 }
 
 func (c *Client) SetProxy(proxy string) {
+	proxy = strings.TrimSpace(proxy)
 	c.proxyMu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
+	changed := c.proxy != proxy
+	c.proxy = proxy
 	c.proxyMu.Unlock()
+	if changed {
+		c.dropSessions()
+	}
+}
+
+func (c *Client) SetAssigner(assigner proxypool.Assigner) {
+	c.proxyMu.Lock()
+	c.assigner = assigner
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) dropSessions() {
+	c.sessionMu.Lock()
+	c.cachedBaseProxy = ""
+	c.cachedProxySessions = nil
+	c.cachedAssetSessions = nil
+	c.cachedDirectSessions = nil
+	c.sessionMu.Unlock()
+}
+
+// RotateProxySession moves one credential onto a new residential session label
+// after a temporary upstream failure so the next try does not reuse a burned exit.
+func (c *Client) RotateProxySession(accessToken string) {
+	key := accountSessionKey(accessToken)
+	if assigner := c.assignerValue(); assigner != nil {
+		assigner.Rotate(key)
+	}
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.sessionEpochs == nil {
+		c.sessionEpochs = map[string]int{}
+	}
+	c.sessionEpochs[key]++
+	dropCredentialClients(c.cachedProxySessions, key)
+	dropCredentialClients(c.cachedAssetSessions, key)
 }
 
 func (c *Client) proxyValue() string {
 	c.proxyMu.RLock()
 	defer c.proxyMu.RUnlock()
 	return c.proxy
+}
+
+func (c *Client) assignerValue() proxypool.Assigner {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.assigner
+}
+
+func (c *Client) dedicatedProxy(accountID string) (string, bool) {
+	assigner := c.assignerValue()
+	if assigner == nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return assigner.Assign(ctx, accountID, "")
+}
+
+func (c *Client) resolveProxy(accessToken string, epoch int) string {
+	if url, ok := c.dedicatedProxy(accountSessionKey(accessToken)); ok {
+		return url
+	}
+	return proxysession.URL(c.proxyValue(), proxysession.KeyWithEpoch(accessToken, epoch))
 }
 
 // GenerateText submits a new ChatGPT Web conversation and returns the final
@@ -485,7 +549,7 @@ func (c *Client) OpenAsset(ctx context.Context, accessToken, rawURL string) (io.
 		return nil, "", fmt.Errorf("%w: rejected asset URL", ErrTemporaryUpstream)
 	}
 	originalHost := strings.ToLower(current.Hostname())
-	session, err := c.newAssetSession()
+	session, err := c.newAssetSession(accessToken)
 	if err != nil {
 		return nil, "", err
 	}
@@ -629,17 +693,57 @@ func (c *Client) newProxySession(accessToken string) (tlsclient.HttpClient, erro
 	return c.newSessionP(accessToken, true)
 }
 
-func (c *Client) newAssetSession() (tlsclient.HttpClient, error) {
+func (c *Client) newAssetSession(accessToken string) (tlsclient.HttpClient, error) {
+	base := c.proxyValue()
+	c.sessionMu.Lock()
+	epoch := c.epochLocked(accountSessionKey(accessToken))
+	c.sessionMu.Unlock()
+	sticky := c.resolveProxy(accessToken, epoch)
+	key := proxyCacheKey(accessToken, epoch, sticky)
+	c.sessionMu.Lock()
+	if c.cachedBaseProxy != base {
+		c.cachedProxySessions = map[string]tlsclient.HttpClient{}
+		c.cachedAssetSessions = map[string]tlsclient.HttpClient{}
+		c.cachedBaseProxy = base
+	}
+	if c.cachedAssetSessions == nil {
+		c.cachedAssetSessions = map[string]tlsclient.HttpClient{}
+	}
+	if client, ok := c.cachedAssetSessions[key]; ok {
+		c.sessionMu.Unlock()
+		return client, nil
+	}
+	c.sessionMu.Unlock()
+
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(600),
 		tlsclient.WithClientProfile(profiles.Chrome_110),
 		tlsclient.WithRandomTLSExtensionOrder(),
 		tlsclient.WithNotFollowRedirects(),
 	}
-	if proxy := c.proxyValue(); proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxy))
+	if sticky != "" {
+		options = append(options, tlsclient.WithProxyUrl(sticky))
 	}
-	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, err
+	}
+	c.sessionMu.Lock()
+	if c.cachedBaseProxy != base {
+		c.cachedProxySessions = map[string]tlsclient.HttpClient{}
+		c.cachedAssetSessions = map[string]tlsclient.HttpClient{}
+		c.cachedBaseProxy = base
+	}
+	if c.cachedAssetSessions == nil {
+		c.cachedAssetSessions = map[string]tlsclient.HttpClient{}
+	}
+	if existing, ok := c.cachedAssetSessions[key]; ok {
+		c.sessionMu.Unlock()
+		return existing, nil
+	}
+	c.cachedAssetSessions[key] = client
+	c.sessionMu.Unlock()
+	return client, nil
 }
 
 // newDirectSession is used by the raw blob upload host only.
@@ -648,20 +752,30 @@ func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, err
 }
 
 func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpClient, error) {
-	proxy := c.proxyValue()
+	base := c.proxyValue()
 	c.sessionMu.Lock()
+	epoch := c.epochLocked(accountSessionKey(accessToken))
+	c.sessionMu.Unlock()
+	sticky := ""
 	if useProxy {
-		if c.cachedProxySession != nil && c.cachedProxy == proxy {
-			client := c.cachedProxySession
-			c.sessionMu.Unlock()
-			// Keep the original invariant: every session starts with an empty jar.
-			client.SetCookies(&url.URL{Scheme: "https", Host: "chatgpt.com"}, nil)
-			return client, nil
-		}
-	} else if c.cachedDirectSession != nil {
-		client := c.cachedDirectSession
+		sticky = c.resolveProxy(accessToken, epoch)
+	}
+	key := proxyCacheKey(accessToken, epoch, sticky)
+	c.sessionMu.Lock()
+	if useProxy && c.cachedBaseProxy != base {
+		c.cachedProxySessions = map[string]tlsclient.HttpClient{}
+		c.cachedAssetSessions = map[string]tlsclient.HttpClient{}
+		c.cachedBaseProxy = base
+	}
+	store := &c.cachedDirectSessions
+	if useProxy {
+		store = &c.cachedProxySessions
+	}
+	if *store == nil {
+		*store = map[string]tlsclient.HttpClient{}
+	}
+	if client, ok := (*store)[key]; ok {
 		c.sessionMu.Unlock()
-		client.SetCookies(&url.URL{Scheme: "https", Host: "chatgpt.com"}, nil)
 		return client, nil
 	}
 	c.sessionMu.Unlock()
@@ -673,26 +787,85 @@ func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpC
 		tlsclient.WithClientProfile(profiles.Chrome_110),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if useProxy {
-		if proxy != "" {
-			options = append(options, tlsclient.WithProxyUrl(proxy))
-		}
+	if useProxy && sticky != "" {
+		options = append(options, tlsclient.WithProxyUrl(sticky))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {
 		return nil, err
 	}
-	client.SetCookies(&url.URL{Scheme: "https", Host: "chatgpt.com"}, nil)
 
 	c.sessionMu.Lock()
-	if useProxy {
-		c.cachedProxySession = client
-		c.cachedProxy = proxy
-	} else {
-		c.cachedDirectSession = client
+	if useProxy && c.cachedBaseProxy != base {
+		c.cachedProxySessions = map[string]tlsclient.HttpClient{}
+		c.cachedAssetSessions = map[string]tlsclient.HttpClient{}
+		c.cachedBaseProxy = base
 	}
+	store = &c.cachedDirectSessions
+	if useProxy {
+		store = &c.cachedProxySessions
+	}
+	if *store == nil {
+		*store = map[string]tlsclient.HttpClient{}
+	}
+	if existing, ok := (*store)[key]; ok {
+		c.sessionMu.Unlock()
+		return existing, nil
+	}
+	(*store)[key] = client
 	c.sessionMu.Unlock()
 	return client, nil
+}
+
+func accountSessionKey(accessToken string) string {
+	if key := proxysession.Key(accessToken); key != "" {
+		return key
+	}
+	return "shared"
+}
+
+func credentialCacheKey(accessToken string, epoch int) string {
+	key := accountSessionKey(accessToken)
+	if epoch <= 0 {
+		return key
+	}
+	return key + ":" + strconv.Itoa(epoch)
+}
+
+func proxyCacheKey(accessToken string, epoch int, proxyURL string) string {
+	return credentialCacheKey(accessToken, epoch) + "\n" + proxyURL
+}
+
+func dropCredentialClients(store map[string]tlsclient.HttpClient, accountKey string) {
+	if store == nil || accountKey == "" {
+		return
+	}
+	for key := range store {
+		if key == accountKey || strings.HasPrefix(key, accountKey+":") || strings.HasPrefix(key, accountKey+"\n") {
+			delete(store, key)
+		}
+	}
+}
+
+func (c *Client) epochLocked(baseKey string) int {
+	if c.sessionEpochs == nil {
+		return 0
+	}
+	return c.sessionEpochs[baseKey]
+}
+
+func (c *Client) deviceFor(accessToken string) string {
+	if id := proxysession.DeviceID(accessToken, "device"); id != "" {
+		return id
+	}
+	return c.deviceID
+}
+
+func (c *Client) sessionFor(accessToken string) string {
+	if id := proxysession.DeviceID(accessToken, "session"); id != "" {
+		return id
+	}
+	return c.sessionID
 }
 
 func (c *Client) baseHeaders(accessToken string) http.Header {
@@ -700,9 +873,9 @@ func (c *Client) baseHeaders(accessToken string) http.Header {
 		"accept-language":             {"zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"},
 		"oai-client-build-number":     {defaultClientBuildNumber},
 		"oai-client-version":          {defaultClientVersion},
-		"oai-device-id":               {c.deviceID},
+		"oai-device-id":               {c.deviceFor(accessToken)},
 		"oai-language":                {"zh-CN"},
-		"oai-session-id":              {c.sessionID},
+		"oai-session-id":              {c.sessionFor(accessToken)},
 		"origin":                      {baseURL},
 		"priority":                    {"u=1, i"},
 		"referer":                     {baseURL + "/"},

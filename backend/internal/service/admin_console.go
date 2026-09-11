@@ -847,6 +847,39 @@ func (s *AdminConsoleService) GetSettings(ctx context.Context) (map[string]any, 
 		providers[pool] = enabled
 	}
 	values["providers_enabled"] = providers
+	proxies := map[string]string{}
+	extracts := map[string]string{}
+	for _, pool := range SchedulableProviders() {
+		value, err := s.settings.GetValue(ctx, providerProxySettingKey(pool))
+		if err != nil {
+			return nil, err
+		}
+		proxies[pool] = strings.TrimSpace(value)
+		extract, err := s.settings.GetValue(ctx, providerExtractSettingKey(pool))
+		if err != nil {
+			return nil, err
+		}
+		extracts[pool] = strings.TrimSpace(extract)
+	}
+	values["provider_proxies"] = proxies
+	sessionAPI, err := s.settings.GetValue(ctx, settingDolaSessionAPI)
+	if err != nil {
+		return nil, err
+	}
+	sessionAPI = strings.TrimSpace(sessionAPI)
+	if extracts["dola"] == "" {
+		extracts["dola"] = sessionAPI
+	}
+	if sessionAPI == "" {
+		sessionAPI = extracts["dola"]
+	}
+	values["provider_extract_apis"] = extracts
+	values["dola_session_api"] = sessionAPI
+	extractAPI, err := s.settings.GetValue(ctx, settingExtractAPI)
+	if err != nil {
+		return nil, err
+	}
+	values["outbound_extract_api"] = strings.TrimSpace(extractAPI)
 	return values, nil
 }
 
@@ -869,6 +902,68 @@ func (s *AdminConsoleService) UpdateSettings(ctx context.Context, input map[stri
 			return nil, err
 		}
 		updates["proxy.url"] = proxy
+	}
+	if value, ok := input["outbound_extract_api"]; ok {
+		extractAPI, err := normalizeExtractAPI(fmt.Sprint(value), "outbound_extract_api")
+		if err != nil {
+			return nil, err
+		}
+		updates[settingExtractAPI] = extractAPI
+	}
+	if value, ok := input["dola_session_api"]; ok {
+		sessionAPI, err := normalizeExtractAPI(fmt.Sprint(value), "dola_session_api")
+		if err != nil {
+			return nil, err
+		}
+		updates[settingDolaSessionAPI] = sessionAPI
+		if _, hasExtracts := input["provider_extract_apis"]; !hasExtracts {
+			updates[providerExtractSettingKey("dola")] = sessionAPI
+		}
+	}
+	if raw, ok := input["provider_extract_apis"]; ok {
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("provider_extract_apis must be an object of pool => URL")
+		}
+		allowed := map[string]bool{}
+		for _, pool := range SchedulableProviders() {
+			allowed[pool] = true
+		}
+		for pool, value := range obj {
+			normalized := strings.ToLower(strings.TrimSpace(pool))
+			if !allowed[normalized] {
+				return nil, fmt.Errorf("provider_extract_apis contains unknown provider %q", pool)
+			}
+			extractAPI, err := normalizeExtractAPI(fmt.Sprint(value), "provider_extract_apis."+normalized)
+			if err != nil {
+				return nil, err
+			}
+			updates[providerExtractSettingKey(normalized)] = extractAPI
+			if normalized == "dola" {
+				updates[settingDolaSessionAPI] = extractAPI
+			}
+		}
+	}
+	if raw, ok := input["provider_proxies"]; ok {
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("provider_proxies must be an object of pool => URL")
+		}
+		allowed := map[string]bool{}
+		for _, pool := range SchedulableProviders() {
+			allowed[pool] = true
+		}
+		for pool, value := range obj {
+			normalized := strings.ToLower(strings.TrimSpace(pool))
+			if !allowed[normalized] {
+				return nil, fmt.Errorf("provider_proxies contains unknown provider %q", pool)
+			}
+			proxy, err := normalizeProxyURL(fmt.Sprint(value), "provider_proxies."+normalized)
+			if err != nil {
+				return nil, err
+			}
+			updates[providerProxySettingKey(normalized)] = proxy
+		}
 	}
 	if value, ok := input["public_base_url"]; ok {
 		production := s.cfg != nil && strings.EqualFold(strings.TrimSpace(s.cfg.AppEnv), "production")
@@ -902,24 +997,61 @@ func (s *AdminConsoleService) UpdateSettings(ctx context.Context, input map[stri
 }
 
 func normalizeOutboundProxy(raw string) (string, error) {
+	return normalizeProxyURL(raw, "outbound_proxy")
+}
+
+func normalizeProxyURL(raw, field string) (string, error) {
+	if field == "" {
+		field = "outbound_proxy"
+	}
 	value := strings.TrimSpace(raw)
 	if value == "" {
 		return "", nil
 	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" {
-		return "", errors.New("outbound_proxy must be an absolute http(s) or socks5 URL")
+		return "", fmt.Errorf("%s must be an absolute http(s) or socks5 URL", field)
 	}
 	switch strings.ToLower(parsed.Scheme) {
 	case "http", "https", "socks5", "socks5h":
 	default:
-		return "", errors.New("outbound_proxy must be an absolute http(s) or socks5 URL")
+		return "", fmt.Errorf("%s must be an absolute http(s) or socks5 URL", field)
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", errors.New("outbound_proxy must not contain a query or fragment")
+		return "", fmt.Errorf("%s must not contain a query or fragment", field)
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
 	return parsed.String(), nil
+}
+
+func normalizeDolaSessionAPI(raw string) (string, error) {
+	return normalizeExtractAPI(raw, "dola_session_api")
+}
+
+func normalizeExtractAPI(raw, field string) (string, error) {
+	if field == "" {
+		field = "outbound_extract_api"
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil {
+		return "", fmt.Errorf("%s must be an absolute http(s) URL", field)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("%s must be an absolute http(s) URL", field)
+	}
+	// Keep the operator's raw query. Re-encoding would turn split=\r\n into
+	// percent-escapes that some residential extract APIs reject.
+	out := strings.ToLower(parsed.Scheme) + "://" + parsed.Host + parsed.EscapedPath()
+	if parsed.RawQuery != "" {
+		out += "?" + parsed.RawQuery
+	}
+	return out, nil
 }
 
 func normalizeAdminPublicOrigin(raw string, production bool) (string, error) {

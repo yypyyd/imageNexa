@@ -19,7 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
+
+	"backend/internal/provider/proxypool"
 
 	"github.com/google/uuid"
 )
@@ -110,24 +111,15 @@ func IdentityHash(sessionID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-type accountProxyLease struct {
-	url       string
-	expiresAt time.Time
-}
-
 type Client struct {
 	proxyMu            sync.RWMutex
 	proxy              string
-	sessionAPI         string
+	assigner           proxypool.Assigner
 	baseURL            string
 	directClient       *http.Client
 	directClientProxy  string
 	protocolIdentities sync.Map // session identity -> *protocolIdentity
 
-	// accountProxies pins one sticky residential exit per account so Dola sees
-	// a stable device instead of a rotating pool. Entries are lazily filled from
-	// the proxy provider's session API and refreshed on auth/verify failures.
-	accountProxies   map[string]accountProxyLease
 	accountClients   map[string]*http.Client
 	browserMu        sync.Mutex
 	boundBrowsers    map[string]*boundBrowser
@@ -138,7 +130,6 @@ func NewClient(proxy string) *Client {
 	return &Client{
 		proxy:          strings.TrimSpace(proxy),
 		baseURL:        apiBase,
-		accountProxies: make(map[string]accountProxyLease),
 		accountClients: make(map[string]*http.Client),
 	}
 }
@@ -154,17 +145,38 @@ func (c *Client) SetProxy(proxy string) {
 	c.invalidateClientsLocked(true)
 }
 
-// SetSessionAPI configures the proxy provider's sticky-session assignment
-// endpoint (separate from the shared proxy so other providers are unaffected).
-func (c *Client) SetSessionAPI(endpoint string) {
-	endpoint = strings.TrimSpace(endpoint)
+func (c *Client) SetAssigner(assigner proxypool.Assigner) {
 	c.proxyMu.Lock()
-	defer c.proxyMu.Unlock()
-	if c.sessionAPI == endpoint {
+	c.assigner = assigner
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) RotateProxySession(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
 		return
 	}
-	c.sessionAPI = endpoint
-	c.invalidateClientsLocked(true)
+	if assigner := c.assignerValue(); assigner != nil {
+		assigner.Rotate(accountID)
+	}
+	c.proxyMu.Lock()
+	defer c.proxyMu.Unlock()
+	for key, client := range c.accountClients {
+		if key == accountID || strings.HasPrefix(key, accountID+"|") {
+			if client != nil {
+				if transport, ok := client.Transport.(*http.Transport); ok {
+					transport.CloseIdleConnections()
+				}
+			}
+			delete(c.accountClients, key)
+		}
+	}
+}
+
+func (c *Client) assignerValue() proxypool.Assigner {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.assigner
 }
 
 func (c *Client) invalidateClientsLocked(clearProxies bool) {
@@ -184,9 +196,6 @@ func (c *Client) invalidateClientsLocked(clearProxies bool) {
 	c.directClient = nil
 	c.directClientProxy = ""
 	c.accountClients = make(map[string]*http.Client)
-	if clearProxies {
-		c.accountProxies = make(map[string]accountProxyLease)
-	}
 }
 
 // AccountProxy resolves the sticky (or shared fallback) proxy used for every
@@ -304,50 +313,18 @@ func (c *Client) accountClient(ctx context.Context, account Account) (*http.Clie
 // It reads the provider's session API once per account and reuses the result.
 func (c *Client) assignAccountProxy(ctx context.Context, account Account) string {
 	account = account.normalized()
-	c.proxyMu.RLock()
-	if existing, ok := c.accountProxies[account.ID]; ok && time.Now().Before(existing.expiresAt) {
-		c.proxyMu.RUnlock()
-		return existing.url
+	id := strings.TrimSpace(account.ID)
+	if id == "" {
+		id = IdentityHash(account.SessionID)
 	}
-	endpoint := sessionAPIForRegion(c.sessionAPI, dolaAccountRegion(account))
-	shared := c.proxy
-	c.proxyMu.RUnlock()
-	// The dedicated session API takes precedence; without it the account shares
-	// the global proxy like any other provider.
-	if endpoint == "" {
-		return shared
-	}
-	proxyURL := fetchStickyProxy(ctx, endpoint)
-	if proxyURL == "" {
-		return shared
-	}
-	c.proxyMu.Lock()
-	if stale := c.accountClients[account.ID]; stale != nil {
-		if transport, ok := stale.Transport.(*http.Transport); ok {
-			transport.CloseIdleConnections()
+	if assigner := c.assignerValue(); assigner != nil {
+		if proxyURL, ok := assigner.Assign(ctx, id, dolaAccountRegion(account)); ok {
+			return proxyURL
 		}
-		delete(c.accountClients, account.ID)
 	}
-	c.accountProxies[account.ID] = accountProxyLease{url: proxyURL, expiresAt: time.Now().Add(14 * time.Minute)}
-	c.proxyMu.Unlock()
-	return proxyURL
-}
-
-func sessionAPIForRegion(endpoint, region string) string {
-	endpoint = strings.TrimSpace(endpoint)
-	if endpoint == "" || region == "" {
-		return endpoint
-	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Host == "" {
-		return endpoint
-	}
-	query := parsed.Query()
-	query.Set("region", region)
-	query.Set("count", "1")
-	query.Set("sessTime", "900")
-	parsed.RawQuery = query.Encode()
-	return parsed.String()
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 func dolaAccountRegion(account Account) string {
@@ -358,36 +335,6 @@ func dolaAccountRegion(account Account) string {
 	default:
 		return "JP"
 	}
-}
-
-// fetchStickyProxy calls the provider's session API and returns the first
-// host:port as an http proxy URL. The API returns one sticky session per call.
-func fetchStickyProxy(ctx context.Context, endpoint string) string {
-	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return ""
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.Contains(line, " ") {
-			continue
-		}
-		if host, port, ok := strings.Cut(line, ":"); ok && host != "" && port != "" {
-			return "http://" + line
-		}
-	}
-	return ""
 }
 
 // commonQuery mirrors the full parameter set the Dola webapp attaches to every

@@ -28,7 +28,7 @@ func (c *Client) GenerateText(ctx context.Context, token, prompt, mode string) (
 		mode = "fast"
 	}
 
-	submitClient, err := c.newSubmitTLSClient()
+	submitClient, err := c.newSubmitTLSClient(token)
 	if err != nil {
 		return "", err
 	}

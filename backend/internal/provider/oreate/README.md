@@ -49,10 +49,12 @@ repository layers.
   and pages are never shared across accounts or used by two submits at once. The pool size is
   derived from the cgroup CPU and memory limits (or the machine's own) at
   startup, so nothing has to be sized by hand; a page is recycled once it goes
-  unused, gets old or has been used enough times. `OREATE_SIGNER_PAGES` overrides
+  unused, gets old or has been used enough times. A replacement page for the
+  same account reuses that account's sticky session label so the exit IP does
+  not hop. `OREATE_SIGNER_PAGES` overrides
   the pool size and `OREATE_PROXY_SESSION=false` disables sticky proxy sessions
   for proxy pools that do not support the session label in the user name.
-- The gateway's global `proxy.url` setting and Oreate account pool.
+- The gateway's per-channel `proxy.{provider}.url` setting (Oreate falls back to `proxy.url`) and Oreate account pool.
 
 The Docker runtime also supplies a dedicated unprivileged `chrome` user and a
 pinned GlobalSign intermediate in both the system and Chromium NSS certificate

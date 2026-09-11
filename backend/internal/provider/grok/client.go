@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"backend/internal/netguard"
+	"backend/internal/provider/proxypool"
+	"backend/internal/provider/proxysession"
 
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
@@ -56,8 +58,17 @@ var (
 )
 
 type Client struct {
-	proxyMu sync.RWMutex
-	proxy   string
+	proxyMu  sync.RWMutex
+	proxy    string
+	assigner proxypool.Assigner
+	// Proxy TLS clients are cached per credential so each Grok account keeps one
+	// labelled residential exit and reuses CONNECT/TLS instead of opening a new
+	// session on every quota probe or submit. Direct clients stay unproxied.
+	sessionMu     sync.Mutex
+	cachedBase    string
+	proxyClients  map[string]tlsclient.HttpClient
+	directClient  tlsclient.HttpClient
+	sessionEpochs map[string]int
 }
 
 func NewClient(proxy string) *Client {
@@ -67,14 +78,62 @@ func NewClient(proxy string) *Client {
 func (c *Client) SetProxy(proxy string) {
 	proxy = strings.TrimSpace(proxy)
 	c.proxyMu.Lock()
+	changed := c.proxy != proxy
 	c.proxy = proxy
 	c.proxyMu.Unlock()
+	if !changed {
+		return
+	}
+	c.sessionMu.Lock()
+	c.cachedBase = ""
+	c.proxyClients = nil
+	c.directClient = nil
+	c.sessionMu.Unlock()
+}
+
+func (c *Client) SetAssigner(assigner proxypool.Assigner) {
+	c.proxyMu.Lock()
+	c.assigner = assigner
+	c.proxyMu.Unlock()
+}
+
+// RotateProxySession moves one credential onto a new residential session label
+// after a temporary upstream failure so the next try does not reuse a burned exit.
+func (c *Client) RotateProxySession(credential string) {
+	key := accountSessionKey(credential)
+	if assigner := c.assignerValue(); assigner != nil {
+		assigner.Rotate(key)
+	}
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	if c.sessionEpochs == nil {
+		c.sessionEpochs = map[string]int{}
+	}
+	c.sessionEpochs[key]++
+	dropCredentialClients(c.proxyClients, key)
 }
 
 func (c *Client) proxyValue() string {
 	c.proxyMu.RLock()
 	defer c.proxyMu.RUnlock()
 	return c.proxy
+}
+
+func (c *Client) assignerValue() proxypool.Assigner {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.assigner
+}
+
+func (c *Client) resolveProxy(credential string, epoch int) string {
+	if assigner := c.assignerValue(); assigner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if url, ok := assigner.Assign(ctx, accountSessionKey(credential), ""); ok {
+			return url
+		}
+	}
+	return proxysession.URL(c.proxyValue(), proxysession.KeyWithEpoch(credential, epoch))
 }
 
 // IsGrokToken reports whether a JWT looks like a Grok website "sso" cookie.
@@ -130,7 +189,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 	if token == "" {
 		return unknownBalance("empty token"), nil
 	}
-	client, err := c.newProxyTLSClient()
+	client, err := c.newProxyTLSClient(token)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +267,7 @@ func (c *Client) FetchSession(ctx context.Context, token string) (email, userID 
 	if token == "" {
 		return "", "", ErrAuth
 	}
-	client, err := c.newProxyTLSClient()
+	client, err := c.newProxyTLSClient(token)
 	if err != nil {
 		return "", "", err
 	}
@@ -632,13 +691,17 @@ func (c *Client) applyHeaders(req *http.Request, token string, extra map[string]
 
 // newProxyTLSClient is used for authentication/account maintenance, bootstrap,
 // and generation-submit requests. Media and artifact transfers use direct.
-func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+func (c *Client) newProxyTLSClient(credential string) (tlsclient.HttpClient, error) {
+	return c.newTLSClientP(true, credential)
+}
 
-func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
+func (c *Client) newSubmitTLSClient(credential string) (tlsclient.HttpClient, error) {
+	return c.newProxyTLSClient(credential)
+}
 
 // newDirectTLSClient is used for reference uploads, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) {
-	return c.newTLSClientP(false)
+	return c.newTLSClientP(false, "")
 }
 
 func (c *Client) newAssetTLSClient(allowedHosts []string) (tlsclient.HttpClient, error) {
@@ -651,7 +714,36 @@ func (c *Client) newAssetTLSClient(allowedHosts []string) (tlsclient.HttpClient,
 	)
 }
 
-func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
+func (c *Client) newTLSClientP(useProxy bool, credential string) (tlsclient.HttpClient, error) {
+	base := c.proxyValue()
+	c.sessionMu.Lock()
+	epoch := c.epochLocked(accountSessionKey(credential))
+	c.sessionMu.Unlock()
+	sticky := ""
+	if useProxy {
+		sticky = c.resolveProxy(credential, epoch)
+	}
+	key := credentialCacheKey(credential, epoch) + "\n" + sticky
+	c.sessionMu.Lock()
+	if useProxy && c.cachedBase != base {
+		c.proxyClients = map[string]tlsclient.HttpClient{}
+		c.cachedBase = base
+	}
+	if useProxy {
+		if c.proxyClients == nil {
+			c.proxyClients = map[string]tlsclient.HttpClient{}
+		}
+		if client, ok := c.proxyClients[key]; ok {
+			c.sessionMu.Unlock()
+			return client, nil
+		}
+	} else if c.directClient != nil {
+		client := c.directClient
+		c.sessionMu.Unlock()
+		return client, nil
+	}
+	c.sessionMu.Unlock()
+
 	options := []tlsclient.HttpClientOption{
 		// Video generation streams inline until progress=100; a 15s clip can take
 		// several minutes, so allow up to 10m (caller's genCtx caps at 12m).
@@ -659,12 +751,70 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(profiles.Chrome_133),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
+	if useProxy && sticky != "" {
+		options = append(options, tlsclient.WithProxyUrl(sticky))
+	}
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, err
+	}
+
+	c.sessionMu.Lock()
 	if useProxy {
-		if proxy := c.proxyValue(); proxy != "" {
-			options = append(options, tlsclient.WithProxyUrl(proxy))
+		if c.cachedBase != base {
+			c.proxyClients = map[string]tlsclient.HttpClient{}
+			c.cachedBase = base
+		}
+		if c.proxyClients == nil {
+			c.proxyClients = map[string]tlsclient.HttpClient{}
+		}
+		if existing, ok := c.proxyClients[key]; ok {
+			c.sessionMu.Unlock()
+			return existing, nil
+		}
+		c.proxyClients[key] = client
+	} else if c.directClient != nil {
+		existing := c.directClient
+		c.sessionMu.Unlock()
+		return existing, nil
+	} else {
+		c.directClient = client
+	}
+	c.sessionMu.Unlock()
+	return client, nil
+}
+
+func accountSessionKey(credential string) string {
+	if key := proxysession.Key(credential); key != "" {
+		return key
+	}
+	return "shared"
+}
+
+func credentialCacheKey(credential string, epoch int) string {
+	key := accountSessionKey(credential)
+	if epoch <= 0 {
+		return key
+	}
+	return key + ":" + strconv.Itoa(epoch)
+}
+
+func dropCredentialClients(store map[string]tlsclient.HttpClient, accountKey string) {
+	if store == nil || accountKey == "" {
+		return
+	}
+	for key := range store {
+		if key == accountKey || strings.HasPrefix(key, accountKey+":") || strings.HasPrefix(key, accountKey+"\n") {
+			delete(store, key)
 		}
 	}
-	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
+}
+
+func (c *Client) epochLocked(baseKey string) int {
+	if c.sessionEpochs == nil {
+		return 0
+	}
+	return c.sessionEpochs[baseKey]
 }
 
 // --- gRPC-web / protobuf decoding for GetGrokCreditsConfig ---

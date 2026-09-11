@@ -233,9 +233,18 @@ func (s *V1Service) routeAccounts(ctx context.Context, route model.ModelRoute, a
 			return nil, ErrConcurrencyFull
 		}
 	}
+	cooling := make(map[string]bool, len(candidates))
+	for _, item := range candidates {
+		cooling[item.account.ID] = s.accountCooling(route.Provider, item.account.ID)
+	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
-		// Administrator weight is the primary scheduling preference. Within the
+		// Accounts that just failed upstream are tried last even when they have
+		// higher weight, otherwise rotateRoundRobin's demotion is overwritten here.
+		if cooling[left.account.ID] != cooling[right.account.ID] {
+			return !cooling[left.account.ID]
+		}
+		// Administrator weight is the primary healthy-account preference. Within the
 		// same weight, prefer accounts that can absorb more concurrent work, while
 		// retaining busy accounts at the tail. Final admission is atomic in
 		// runPoolWithFailoverPolicy; keeping the full eligible set lets a queued or

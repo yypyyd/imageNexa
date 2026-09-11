@@ -31,7 +31,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt, aspectRatio s
 
 	// Account bootstrap/challenge and the conversations/new submit use the proxy;
 	// media and artifact transfers remain direct.
-	submitClient, err := c.newSubmitTLSClient()
+	submitClient, err := c.newSubmitTLSClient(token)
 	if err != nil {
 		return nil, nil, err
 	}
