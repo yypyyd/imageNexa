@@ -445,7 +445,20 @@ func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context)
 	if len(items) == 0 {
 		return
 	}
-	accounts, err := m.tokens.List(ctx)
+	accountIDs := make([]string, 0, len(items))
+	seenAccount := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		accountID := strings.TrimSpace(item.Bucket.AccountID)
+		if accountID == "" {
+			continue
+		}
+		if _, exists := seenAccount[accountID]; exists {
+			continue
+		}
+		seenAccount[accountID] = struct{}{}
+		accountIDs = append(accountIDs, accountID)
+	}
+	accounts, err := m.tokens.ListIdentityByIDs(ctx, accountIDs)
 	if err != nil {
 		log.Printf("maintenance: list accounts for quota reconciliation failed")
 		return

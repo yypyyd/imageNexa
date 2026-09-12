@@ -66,7 +66,7 @@ img, video { -ms-touch-action: none; }
   .field {
     @apply w-full rounded-lg px-3 py-2 text-sm outline-none transition-colors;
     color: var(--fg);
-    background: var(--surface);
+    background: var(--surface-2);
     border: 1px solid var(--hairline);
   }
   .field::placeholder { color: var(--fg-faint); }

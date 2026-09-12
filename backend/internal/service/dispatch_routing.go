@@ -122,16 +122,19 @@ func (s *V1Service) routeAccounts(ctx context.Context, route model.ModelRoute, a
 	return s.collectRouteAccounts(ctx, route, accounts, true, true)
 }
 
+type routeAccountCandidate struct {
+	account   model.TokenAccount
+	binding   model.AccountModelRoute
+	bucketKey string
+	remaining float64
+	known     bool
+	available int64
+	slotsSeen bool
+}
+
+const routeExistenceSlotChunk = 32
+
 func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelRoute, accounts []model.TokenAccount, observeSlots, rank bool) ([]model.TokenAccount, error) {
-	type candidate struct {
-		account   model.TokenAccount
-		binding   model.AccountModelRoute
-		bucketKey string
-		remaining float64
-		known     bool
-		available int64
-		slotsSeen bool
-	}
 	plan, _ := dispatchPlanFromContext(ctx)
 	accountIDs := make([]string, 0, len(accounts))
 	for _, account := range accounts {
@@ -147,8 +150,9 @@ func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelR
 		return nil, err
 	}
 	now := time.Now()
-	candidates := make([]candidate, 0, len(accounts))
+	candidates := make([]routeAccountCandidate, 0, len(accounts))
 	bucketKeys := make([]string, 0, len(accounts))
+	lookupIDs := make([]string, 0, len(accounts))
 	for _, account := range accounts {
 		binding, exists := bindings[account.ID]
 		if !exists {
@@ -157,7 +161,7 @@ func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelR
 		if !binding.Enabled || !binding.Entitled || binding.CooldownUntil != nil && binding.CooldownUntil.After(now) {
 			continue
 		}
-		item := candidate{account: account, binding: binding}
+		item := routeAccountCandidate{account: account, binding: binding}
 		bucketKey := strings.TrimSpace(binding.QuotaBucketKey)
 		if bucketKey == "" {
 			bucketKey = strings.TrimSpace(route.QuotaBucketKey)
@@ -173,12 +177,14 @@ func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelR
 			item.bucketKey = bucketKey
 			bucketKeys = append(bucketKeys, bucketKey)
 		}
+		lookupIDs = append(lookupIDs, account.ID)
 		candidates = append(candidates, item)
 	}
 
 	// Quota snapshots are read in one query even when account-specific bindings
 	// point at different buckets (Adobe image/video intentionally share one).
-	snapshots, err := s.models.Quotas().GetMany(ctx, accountIDs, bucketKeys)
+	// Only entitled candidates are included; unbound dispatchable rows are not.
+	snapshots, err := s.models.Quotas().GetMany(ctx, lookupIDs, bucketKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +201,10 @@ func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelR
 		quotaEligible = append(quotaEligible, item)
 	}
 	candidates = quotaEligible
+
+	if !rank {
+		return s.pickRouteExistence(ctx, route, candidates, observeSlots)
+	}
 
 	if observeSlots {
 		// Observe all account gates in one Redis pipeline. A failed observation is
@@ -221,13 +231,6 @@ func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelR
 				return nil, ErrConcurrencyFull
 			}
 		}
-	}
-	if !rank {
-		out := make([]model.TokenAccount, 0, len(candidates))
-		for _, item := range candidates {
-			out = append(out, item.account)
-		}
-		return out, nil
 	}
 	cooling := make(map[string]bool, len(candidates))
 	for _, item := range candidates {
@@ -270,6 +273,47 @@ func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelR
 		out = append(out, item.account)
 	}
 	return out, nil
+}
+
+// pickRouteExistence answers "does this route have at least one usable
+// account?" without ranking or returning the full eligible set. Slot
+// observation stays required for fast failover so a saturated route is still
+// skipped before generate*.
+func (s *V1Service) pickRouteExistence(ctx context.Context, route model.ModelRoute, candidates []routeAccountCandidate, observeSlots bool) ([]model.TokenAccount, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if !observeSlots {
+		return []model.TokenAccount{candidates[0].account}, nil
+	}
+	fastFailover := poolPolicy(ctx).fastFailover
+	slotsSeen := false
+	for start := 0; start < len(candidates); start += routeExistenceSlotChunk {
+		end := start + routeExistenceSlotChunk
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+		batch := candidates[start:end]
+		concurrencyKeys := make([]string, 0, len(batch))
+		for _, item := range batch {
+			concurrencyKeys = append(concurrencyKeys, "conc:a:"+item.account.ID)
+		}
+		activeCounts, seen := s.conc.ActiveCounts(ctx, concurrencyKeys)
+		if !seen {
+			return []model.TokenAccount{batch[0].account}, nil
+		}
+		slotsSeen = true
+		for _, item := range batch {
+			maximum := int64(poolAccountConcurrency(route.Provider, item.account))
+			if maximum-activeCounts["conc:a:"+item.account.ID] > 0 {
+				return []model.TokenAccount{item.account}, nil
+			}
+		}
+	}
+	if slotsSeen && fastFailover {
+		return nil, ErrConcurrencyFull
+	}
+	return []model.TokenAccount{candidates[0].account}, nil
 }
 
 func quotaCanServe(remaining float64, known bool, plan dispatchPlan) bool {

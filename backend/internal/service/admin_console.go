@@ -271,16 +271,15 @@ func (s *AdminConsoleService) ListAccounts(ctx context.Context, filter AccountLi
 	}
 	limit, offset := normalizePage(filter.Limit, filter.Offset)
 	var accounts []model.TokenAccount
-	if err := query.Order("pool asc, weight desc, created_at desc").Limit(limit).Offset(offset).Find(&accounts).Error; err != nil {
+	if err := query.Select(repo.SchedulingAccountColumns()).
+		Order("pool asc, weight desc, created_at desc").
+		Limit(limit).Offset(offset).
+		Find(&accounts).Error; err != nil {
 		return nil, 0, err
 	}
-	rows := make([]map[string]any, 0, len(accounts))
-	for _, account := range accounts {
-		row, err := s.accountRow(ctx, account)
-		if err != nil {
-			return nil, 0, err
-		}
-		rows = append(rows, row)
+	rows, err := s.accountRows(ctx, accounts)
+	if err != nil {
+		return nil, 0, err
 	}
 	return rows, total, nil
 }
@@ -339,29 +338,97 @@ func (s *AdminConsoleService) CountAccountHealthByProvider(ctx context.Context) 
 }
 
 func (s *AdminConsoleService) accountRow(ctx context.Context, account model.TokenAccount) (map[string]any, error) {
-	var bindings []model.AccountModelRoute
-	if s.db.Migrator().HasTable(&model.AccountModelRoute{}) {
-		if err := s.db.WithContext(ctx).Where("account_id = ?", account.ID).Order("model_route_id asc").Find(&bindings).Error; err != nil {
-			return nil, err
+	rows, err := s.accountRows(ctx, []model.TokenAccount{account})
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("account row missing")
+	}
+	return rows[0], nil
+}
+
+func (s *AdminConsoleService) accountRows(ctx context.Context, accounts []model.TokenAccount) ([]map[string]any, error) {
+	rows := make([]map[string]any, 0, len(accounts))
+	if len(accounts) == 0 {
+		return rows, nil
+	}
+	ids := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		if id := strings.TrimSpace(account.ID); id != "" {
+			ids = append(ids, id)
 		}
 	}
+	bindingsByAccount := map[string][]model.AccountModelRoute{}
+	routesByID := map[string]model.ModelRoute{}
+	if s.db.Migrator().HasTable(&model.AccountModelRoute{}) {
+		var bindings []model.AccountModelRoute
+		if err := s.db.WithContext(ctx).Where("account_id IN ?", ids).Order("model_route_id asc").Find(&bindings).Error; err != nil {
+			return nil, err
+		}
+		routeIDs := make([]string, 0, len(bindings))
+		seenRoute := map[string]struct{}{}
+		for _, binding := range bindings {
+			bindingsByAccount[binding.AccountID] = append(bindingsByAccount[binding.AccountID], binding)
+			if _, exists := seenRoute[binding.ModelRouteID]; exists {
+				continue
+			}
+			seenRoute[binding.ModelRouteID] = struct{}{}
+			routeIDs = append(routeIDs, binding.ModelRouteID)
+		}
+		if len(routeIDs) > 0 && s.db.Migrator().HasTable(&model.ModelRoute{}) {
+			var routes []model.ModelRoute
+			if err := s.db.WithContext(ctx).Where("id IN ?", routeIDs).Find(&routes).Error; err != nil {
+				return nil, err
+			}
+			for _, route := range routes {
+				routesByID[route.ID] = route
+			}
+		}
+	}
+	quotaByAccount := map[string][]model.AccountQuotaBucket{}
+	if s.models != nil && s.models.Quotas() != nil {
+		buckets, err := s.models.Quotas().ListByAccounts(ctx, ids)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+		for _, bucket := range buckets {
+			quotaByAccount[bucket.AccountID] = append(quotaByAccount[bucket.AccountID], bucket)
+		}
+	}
+	activeJobs := map[string]int64{}
+	if s.db.Migrator().HasTable(&model.DispatchAttempt{}) {
+		type inflightRow struct {
+			AccountID string `gorm:"column:account_id"`
+			Count     int64  `gorm:"column:count"`
+		}
+		var inflight []inflightRow
+		_ = s.db.WithContext(ctx).Model(&model.DispatchAttempt{}).
+			Select("account_id, COUNT(*) AS count").
+			Where("account_id IN ? AND state IN ?", ids, []string{"created", "submitting", "accepted", "unknown"}).
+			Group("account_id").
+			Scan(&inflight).Error
+		for _, row := range inflight {
+			activeJobs[row.AccountID] = row.Count
+		}
+	}
+	for _, account := range accounts {
+		rows = append(rows, assembleAccountRow(account, bindingsByAccount[account.ID], routesByID, quotaByAccount[account.ID], activeJobs[account.ID]))
+	}
+	return rows, nil
+}
+
+func assembleAccountRow(account model.TokenAccount, bindings []model.AccountModelRoute, routesByID map[string]model.ModelRoute, buckets []model.AccountQuotaBucket, activeJobs int64) map[string]any {
 	routeRows := make([]map[string]any, 0, len(bindings))
 	for _, binding := range bindings {
-		var route model.ModelRoute
-		if err := s.db.WithContext(ctx).First(&route, "id = ?", binding.ModelRouteID).Error; err != nil {
-			continue
-		}
-		if !model.IsCanonicalRoute(route) {
+		route, exists := routesByID[binding.ModelRouteID]
+		if !exists || !model.IsCanonicalRoute(route) {
 			continue
 		}
 		routeRows = append(routeRows, map[string]any{
 			"id": binding.ID, "route_id": route.ID, "model_id": route.LogicalModelID,
 			"enabled": binding.Enabled && binding.Entitled,
 		})
-	}
-	buckets, err := s.models.Quotas().ListByAccount(ctx, account.ID)
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
 	}
 	quotaRows := make([]map[string]any, 0, len(buckets))
 	for _, bucket := range buckets {
@@ -370,11 +437,6 @@ func (s *AdminConsoleService) accountRow(ctx context.Context, account model.Toke
 			"reserved": bucket.Reserved, "reset_at": bucket.ResetAt, "unit": bucket.Unit,
 			"refreshed_at": bucket.RefreshedAt,
 		})
-	}
-	var activeJobs int64
-	if s.db.Migrator().HasTable(&model.DispatchAttempt{}) {
-		_ = s.db.WithContext(ctx).Model(&model.DispatchAttempt{}).
-			Where("account_id = ? AND state IN ?", account.ID, []string{"created", "submitting", "accepted", "unknown"}).Count(&activeJobs).Error
 	}
 	health := "healthy"
 	if account.Dead || account.Status == "disabled" {
@@ -410,7 +472,7 @@ func (s *AdminConsoleService) accountRow(ctx context.Context, account model.Toke
 		"session_expires_at": sessionExpiresAt, "session_state": sessionState,
 		"readiness": readiness, "readiness_detail": readinessDetail,
 		"base_url": safeCustomMeta(account, "base_url"), "models": safeCustomMeta(account, "models"),
-	}, nil
+	}
 }
 
 func bytePlusSessionStatus(account model.TokenAccount, now time.Time) (string, string) {

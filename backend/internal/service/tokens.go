@@ -974,16 +974,13 @@ func (s *TokenService) ReprobeStalePendingChatGPT(ctx context.Context, older tim
 	if s.chatgpt == nil {
 		return
 	}
-	items, err := s.tokens.ListByPool(ctx, "chatgpt")
+	cutoff := time.Now().Add(-older)
+	items, err := s.tokens.ListStalePending(ctx, "chatgpt", cutoff)
 	if err != nil {
 		return
 	}
-	cutoff := time.Now().Add(-older)
 	for _, it := range items {
-		if it.Status != "pending" || it.Dead || strings.TrimSpace(it.Value) == "" {
-			continue
-		}
-		if it.UpdatedAt.After(cutoff) {
+		if strings.TrimSpace(it.Value) == "" {
 			continue
 		}
 		id, token := it.ID, it.Value
@@ -1005,18 +1002,12 @@ func (s *TokenService) ReprobeStalePendingAdobe(ctx context.Context, older time.
 	if s.adobe == nil {
 		return
 	}
-	items, err := s.tokens.ListByPool(ctx, "adobe")
+	cutoff := time.Now().Add(-older)
+	items, err := s.tokens.ListStalePending(ctx, "adobe", cutoff)
 	if err != nil {
 		return
 	}
-	cutoff := time.Now().Add(-older)
 	for _, it := range items {
-		if it.Status != "pending" || it.Dead {
-			continue
-		}
-		if it.UpdatedAt.After(cutoff) {
-			continue
-		}
 		prof, err := s.refresh.Get(ctx, it.ID)
 		if err != nil || prof == nil || strings.TrimSpace(prof.Cookie) == "" {
 			continue
@@ -1202,7 +1193,10 @@ func selectGrokLivenessCandidates(items []model.TokenAccount, now time.Time) []m
 	due := make([]candidate, 0, grokLivenessBatchSize)
 	for i := range items {
 		it := items[i]
-		if it.Pool != "grok" || it.Dead || it.Status == "disabled" || strings.TrimSpace(it.Value) == "" {
+		if it.Pool != "grok" || it.Dead || it.Status == "disabled" {
+			continue
+		}
+		if !it.SchedulingStub && strings.TrimSpace(it.Value) == "" {
 			continue
 		}
 		checkedAt, ok := jsonMapInt(it.Meta, "grok_liveness_checked_at")
@@ -1246,11 +1240,34 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 	if s.grok == nil {
 		return
 	}
-	items, err := s.tokens.ListByPool(ctx, "grok")
+	stubs, err := s.tokens.ListSchedulingByPool(ctx, "grok")
 	if err != nil {
 		return
 	}
-	items = selectGrokLivenessCandidates(items, time.Now())
+	picked := selectGrokLivenessCandidates(stubs, time.Now())
+	if len(picked) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(picked))
+	for _, account := range picked {
+		ids = append(ids, account.ID)
+	}
+	loaded, err := s.tokens.ListByIDs(ctx, "grok", ids)
+	if err != nil {
+		return
+	}
+	byID := make(map[string]model.TokenAccount, len(loaded))
+	for _, account := range loaded {
+		byID[account.ID] = account
+	}
+	items := make([]model.TokenAccount, 0, len(picked))
+	for _, account := range picked {
+		full, ok := byID[account.ID]
+		if !ok || strings.TrimSpace(full.Value) == "" {
+			continue
+		}
+		items = append(items, full)
+	}
 	if len(items) == 0 {
 		return
 	}

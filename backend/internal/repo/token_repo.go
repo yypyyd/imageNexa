@@ -44,8 +44,12 @@ func (r *TokenRepository) ListByPool(ctx context.Context, pool string) ([]model.
 	return items, nil
 }
 
-// schedulingAccountColumns omits credential material. Admission reloads the
+// SchedulingAccountColumns omits credential material. Admission reloads the
 // chosen row with Get before any provider call.
+func SchedulingAccountColumns() []string {
+	return append([]string(nil), schedulingAccountColumns...)
+}
+
 var schedulingAccountColumns = []string{
 	"id", "pool", "status", "fails", "fail_total", "upstream_fails", "success_total",
 	"dead", "meta", "added_at", "last_used_at", "cached_quota_reset_after", "quota_recover_at",
@@ -97,6 +101,32 @@ func (r *TokenRepository) ListSchedulingByIDs(ctx context.Context, pool string, 
 		Where("pool = ? AND id IN ? AND value <> ''", pool, ids).
 		Find(&items).Error
 	return markSchedulingStubs(items), err
+}
+
+// ListStalePending returns only rows still stuck in pending past olderThan.
+// ChatGPT re-probe needs Value; Adobe pending rows usually have an empty
+// token and keep the cookie on the refresh profile. Either way this query
+// never loads the rest of the pool.
+func (r *TokenRepository) ListStalePending(ctx context.Context, pool string, olderThan time.Time) ([]model.TokenAccount, error) {
+	var items []model.TokenAccount
+	err := r.db.WithContext(ctx).
+		Where("pool = ? AND status = ? AND dead = ? AND updated_at <= ?", pool, "pending", false, olderThan).
+		Find(&items).Error
+	return items, err
+}
+
+// ListIdentityByIDs returns only id and pool for the requested accounts.
+// Callers that need a credential must Get or ListByIDs afterwards.
+func (r *TokenRepository) ListIdentityByIDs(ctx context.Context, ids []string) ([]model.TokenAccount, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var items []model.TokenAccount
+	err := r.db.WithContext(ctx).
+		Select("id", "pool").
+		Where("id IN ?", ids).
+		Find(&items).Error
+	return items, err
 }
 
 func (r *TokenRepository) Get(ctx context.Context, pool, id string) (*model.TokenAccount, error) {

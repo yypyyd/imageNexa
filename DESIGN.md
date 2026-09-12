@@ -1,7 +1,7 @@
 # 2API Design
 
 Status: locked product architecture
-Last updated: 2026-09-11
+Last updated: 2026-09-13
 
 ## 1. Goals and boundaries
 
@@ -345,6 +345,14 @@ Release verification should cover:
 - Long image/video requests need outer-proxy timeouts compatible with Nginx and should use idempotency or asynchronous task mode.
 
 ## 15. Change record
+
+### 2026-09-13 — Stop maintenance and admin from reloading the whole pool
+
+**Change**: Pending ChatGPT/Adobe re-probes load only stale pending rows. Grok liveness ranks scheduling stubs, then reloads credentials for the four due accounts. Quota reservation recovery loads `id`/`pool` for the open reservations instead of every provider account. Availability probes stop after the first usable account and observe concurrency in chunks of 32. The administrator account page selects scheduling columns and assembles one page of bindings, routes, quota, and in-flight counts in four queries.
+
+**Reason**: After credential-free scheduling landed, the 60-second maintenance tick and the account console were still pulling full Cookie/JWT blobs for 300–500-account pools, and `prepareImage` still collected every entitled ChatGPT row just to answer "does this route have a number?".
+
+**Impact**: Request admission, failover budgets, and provider switches are unchanged. Background ticks no longer copy unused secrets into memory; a saturated route still returns `concurrency_full` before generate; the account list JSON shape is unchanged.
 
 ### 2026-09-12 — Raise account-pool efficiency
 

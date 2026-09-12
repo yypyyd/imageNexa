@@ -35,6 +35,10 @@ const PROXY_INHERIT_DEFAULT = new Set(['chatgpt', 'grok', 'dola'])
 
 const visibleProviders = computed(() => Object.keys(providers).filter((pool) => ACCOUNT_PROVIDERS.includes(pool)).sort())
 const proxyProviders = computed(() => PROXY_PROVIDER_ORDER.filter((pool) => ACCOUNT_PROVIDERS.includes(pool)))
+const hasChannelOverrides = computed(() =>
+  proxyProviders.value.some((pool) => (settings.provider_extract_apis[pool] || '').trim())
+)
+const showChannelProxies = ref(false)
 
 function providerLabel(pool) {
   return PROVIDER_LABELS[pool] || pool[0].toUpperCase() + pool.slice(1)
@@ -63,6 +67,7 @@ function applySettings(data) {
     for (const key of Object.keys(providers)) delete providers[key]
     Object.assign(providers, enabled)
   }
+  if (hasChannelOverrides.value) showChannelProxies.value = true
 }
 
 async function load() {
@@ -101,6 +106,16 @@ function toggleProvider(pool) {
 
 const disabledCount = () => visibleProviders.value.filter((pool) => !providers[pool]).length
 
+function healthText(value, okLabel, badLabel) {
+  if (value === null) return '检查中'
+  return value ? okLabel : badLabel
+}
+
+function healthClass(value) {
+  if (value === null) return 'wait'
+  return value ? 'ok' : 'bad'
+}
+
 async function checkHealth(name) {
   health[name] = null
   try {
@@ -115,86 +130,95 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
 <template>
   <section class="space-y-5">
     <div class="flex justify-between items-start gap-4">
-      <div><h2 class="text-xl font-semibold text-white/90">系统设置</h2><p class="mt-1 text-xs text-white/40">2API 服务地址、上游网络和数据保留策略。</p></div>
-      <button class="btn-primary" :disabled="saving || loading" @click="save"><Icon name="check" class="w-3.5 h-3.5" />{{ saving ? '保存中…' : (saved ? '已保存' : '保存设置') }}</button>
+      <div>
+        <h2 class="page-title">系统设置</h2>
+        <p class="page-sub">对外地址、号池开关、上游出口和日志保留。</p>
+      </div>
+      <div class="flex flex-wrap items-center justify-end gap-2">
+        <span class="health-pill" :class="healthClass(health.live)" :title="'/health/live'">存活 {{ healthText(health.live, '正常', '异常') }}</span>
+        <span class="health-pill" :class="healthClass(health.ready)" :title="'/health/ready'">就绪 {{ healthText(health.ready, '就绪', '未就绪') }}</span>
+        <button class="btn-primary" :disabled="saving || loading" @click="save"><Icon name="check" class="w-3.5 h-3.5" />{{ saving ? '保存中…' : (saved ? '已保存' : '保存设置') }}</button>
+      </div>
     </div>
 
     <p v-if="error" class="notice">{{ error }}</p>
 
-    <div class="grid md:grid-cols-2 gap-3">
-      <div class="health"><div><div class="health-label">Liveness</div><code>/health/live</code></div><span :class="health.live ? 'ok' : 'bad'">{{ health.live === null ? '检查中' : (health.live ? '正常' : '异常') }}</span></div>
-      <div class="health"><div><div class="health-label">Readiness</div><code>/health/ready</code></div><span :class="health.ready ? 'ok' : 'bad'">{{ health.ready === null ? '检查中' : (health.ready ? '就绪' : '未就绪') }}</span></div>
-    </div>
-
     <form class="space-y-4" @submit.prevent="save">
-      <div class="card p-5 space-y-4">
-        <div><h3 class="section-heading">公开 API</h3><p class="section-desc">用于文档示例和生成短期签名媒体 URL。</p></div>
-        <label class="block"><span class="label">对外 Base URL</span><input v-model="settings.public_base_url" class="field mt-1.5 font-mono text-xs" placeholder="https://api.example.com" /><span class="hint">不要包含 <code>/v1</code> 或尾部斜杠。</span></label>
+      <div class="grid gap-4 xl:grid-cols-2">
+        <div class="card p-5 space-y-4">
+          <div><h3 class="section-heading">公开 API</h3><p class="section-desc">文档示例和成品链接用的对外地址。</p></div>
+          <label class="block"><span class="label">对外 Base URL</span><input v-model="settings.public_base_url" class="field mt-1.5 font-mono text-xs" placeholder="https://api.example.com" /><span class="hint">不要带 <code>/v1</code> 或末尾斜杠。</span></label>
+        </div>
+
+        <div class="card p-5 space-y-4">
+          <div class="flex items-start justify-between gap-3">
+            <div><h3 class="section-heading">平台启用</h3><p class="section-desc">关掉后不再从该号池选号，配置还在，打开即恢复。</p></div>
+            <span v-if="disabledCount()" class="badge-off">{{ disabledCount() }} 个已停用</span>
+          </div>
+          <div class="provider-grid">
+            <label v-for="pool in visibleProviders" :key="pool" class="provider-row" :class="!providers[pool] && 'off'">
+              <span><strong>{{ providerLabel(pool) }}</strong><code>{{ pool }}</code></span>
+              <button type="button" class="switch" :class="providers[pool] && 'on'" :aria-label="`${providers[pool] ? '停用' : '启用'} ${providerLabel(pool)}`" :title="providers[pool] ? '点击停用该平台' : '点击启用该平台'" @click="toggleProvider(pool)"><span></span></button>
+            </label>
+            <p v-if="!visibleProviders.length && !loading" class="hint">未获取到平台列表。</p>
+          </div>
+        </div>
       </div>
 
       <div class="card p-5 space-y-4">
-        <div><h3 class="section-heading">上游网络</h3><p class="section-desc">每个渠道贴提取 API。系统会按并发批量领取出口，按账号粘性分配；地区不同请分开填写。Adobe / BytePlus 留空则直连。</p></div>
-        <label class="block"><span class="label">默认提取 API</span><input v-model="settings.outbound_extract_api" class="field mt-1.5 font-mono text-xs" placeholder="http://host:port/gen?zone=custom&region=US&count=64&proto=http&stype=txt&sessType=sticky&sessTime=180" /><span class="hint">ChatGPT、Grok、Dola 未单独填写时使用此项。链接里的 count 只是上限，系统按并发分批领取，单次最多 64 条。</span></label>
-        <div class="space-y-4">
-          <label v-for="pool in proxyProviders" :key="pool" class="block">
-            <span class="label">{{ providerLabel(pool) }} 提取 API</span>
-            <input v-model="settings.provider_extract_apis[pool]" class="field mt-1.5 font-mono text-xs" :placeholder="extractHint(pool)" />
-            <span class="hint">{{ extractHint(pool) }}</span>
-          </label>
+        <div>
+          <h3 class="section-heading">上游网络</h3>
+          <p class="section-desc">ChatGPT / Grok / Dola 共用默认提取 API，按账号粘性分配出口。Adobe / BytePlus 留空即直连。</p>
         </div>
-        <label class="block"><span class="label">回退出站网关</span><input v-model="settings.outbound_proxy" class="field mt-1.5 font-mono text-xs" placeholder="http://user:pass@host:port（可选）" /><span class="hint">未配置提取 API、或提取失败时使用。ChatGPT / Grok 仍会给用户名加 session 标签。Adobe / BytePlus 不会走这项。</span></label>
+        <label class="block"><span class="label">默认提取 API</span><input v-model="settings.outbound_extract_api" class="field mt-1.5 font-mono text-xs" placeholder="http://host:port/gen?zone=…&count=64" /><span class="hint">链接里的 count 只是上限，单次最多领 64 条。</span></label>
+        <label class="block"><span class="label">回退出站网关</span><input v-model="settings.outbound_proxy" class="field mt-1.5 font-mono text-xs" placeholder="http://user:pass@host:port（可选）" /><span class="hint">提取失败时用。Adobe / BytePlus 不走这项。</span></label>
+        <div>
+          <button type="button" class="linkish" @click="showChannelProxies = !showChannelProxies">
+            {{ showChannelProxies ? '收起各渠道出口' : '填写各渠道单独出口（可选）' }}
+            <span v-if="hasChannelOverrides && !showChannelProxies" class="dot">已有覆盖</span>
+          </button>
+          <div v-if="showChannelProxies" class="channel-grid">
+            <label v-for="pool in proxyProviders" :key="pool" class="block">
+              <span class="label">{{ providerLabel(pool) }}</span>
+              <input v-model="settings.provider_extract_apis[pool]" class="field mt-1.5 font-mono text-xs" :placeholder="extractHint(pool)" />
+            </label>
+          </div>
+        </div>
       </div>
 
       <div class="card p-5 space-y-4">
-        <div class="flex items-start justify-between gap-3">
-          <div><h3 class="section-heading">平台启用</h3><p class="section-desc">关闭后调度器不再从该平台的号池选号；已有 route 和账号配置保留不变，重新开启即恢复。</p></div>
-          <span v-if="disabledCount()" class="badge-off">{{ disabledCount() }} 个已停用</span>
-        </div>
-        <div class="provider-grid">
-          <label v-for="pool in visibleProviders" :key="pool" class="provider-row" :class="!providers[pool] && 'off'">
-            <span><strong>{{ providerLabel(pool) }}</strong><code>{{ pool }}</code></span>
-            <button type="button" class="switch" :class="providers[pool] && 'on'" :aria-label="`${providers[pool] ? '停用' : '启用'} ${providerLabel(pool)}`" :title="providers[pool] ? '点击停用该平台' : '点击启用该平台'" @click="toggleProvider(pool)"><span></span></button>
-          </label>
-          <p v-if="!visibleProviders.length && !loading" class="hint">未获取到平台列表。</p>
-        </div>
-        <span class="hint">若某个模型的全部平台都被关闭，该模型的请求会返回 <code>provider_disabled</code>，而不会白跑上游重试。</span>
-      </div>
-
-      <div class="card p-5 space-y-4">
-        <div><h3 class="section-heading">数据保留</h3><p class="section-desc">清理任务必须保留 API Key 归属与必要的审计快照。</p></div>
+        <div><h3 class="section-heading">数据保留</h3><p class="section-desc">过期日志和成品会按天清理；API Key 归属会留下。</p></div>
         <div class="grid sm:grid-cols-2 gap-3">
           <label><span class="label">调用日志保留天数</span><input v-model.number="settings.logs_retention_days" type="number" min="1" max="3650" class="field mt-1.5" /></label>
           <label><span class="label">成品保留天数</span><input v-model.number="settings.artifacts_retention_days" type="number" min="1" max="3650" class="field mt-1.5" /></label>
         </div>
       </div>
     </form>
-
-    <div class="card p-5">
-      <h3 class="section-heading">管理员会话安全</h3>
-      <div class="mt-3 grid sm:grid-cols-3 gap-2 text-[11px]">
-        <div class="security"><strong>HttpOnly Cookie</strong><span>已启用</span></div><div class="security"><strong>Origin + CSRF</strong><span>写请求必须验证</span></div><div class="security"><strong>Bearer Token</strong><span>仅下游 /v1 API 使用</span></div>
-      </div>
-    </div>
   </section>
 </template>
 
 <style scoped>
-.notice { border-radius: .7rem; padding: .7rem .9rem; font-size: .72rem; color: rgb(253 164 175); background: rgb(244 63 94 / .09); }
-.health { display: flex; align-items: center; justify-content: space-between; padding: 1rem; border-radius: .8rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); }
-.health-label { font-size: .65rem; text-transform: uppercase; letter-spacing: .08em; color: var(--fg-faint); }
-.health code { font-size: .68rem; color: var(--fg-2); }
-.health span { font-size: .66rem; border-radius: 999px; padding: .2rem .5rem; }
-.health .ok { color: rgb(110 231 183); background: rgb(16 185 129 / .1); }
-.health .bad { color: rgb(253 164 175); background: rgb(244 63 94 / .1); }
+.page-title { font-size: 1.25rem; line-height: 1.75rem; font-weight: 600; color: var(--fg); }
+.page-sub { margin-top: .25rem; font-size: .75rem; color: var(--fg-3); }
+.notice { border-radius: .7rem; padding: .7rem .9rem; font-size: .72rem; color: rgb(190 18 60); background: rgb(244 63 94 / .09); }
+.health-pill { font-size: .66rem; border-radius: 999px; padding: .28rem .65rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); color: var(--fg-3); }
+.health-pill.ok { color: rgb(4 120 87); background: rgb(16 185 129 / .12); }
+.health-pill.bad { color: rgb(190 18 60); background: rgb(244 63 94 / .1); }
+.health-pill.wait { color: var(--fg-3); }
+:global(html.dark) .health-pill.ok { color: rgb(110 231 183); }
+:global(html.dark) .health-pill.bad { color: rgb(253 164 175); }
+:global(html.dark) .notice { color: rgb(253 164 175); }
+:global(html.dark) .badge-off { color: rgb(253 164 175); }
 .section-heading { font-size: .85rem; font-weight: 600; color: var(--fg); }
 .section-desc { margin-top: .3rem; font-size: .68rem; color: var(--fg-3); }
 .label { display: block; font-size: .68rem; font-weight: 600; color: var(--fg-3); }
 .hint { display: block; margin-top: .35rem; font-size: .62rem; color: var(--fg-faint); }
 .hint code { color: var(--fg-2); }
-.security { display: flex; flex-direction: column; gap: .35rem; padding: .75rem; border-radius: .65rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); }
-.security strong { color: var(--fg); }
-.security span { color: rgb(52 211 153); }
-.badge-off { flex: none; font-size: .62rem; border-radius: 999px; padding: .2rem .55rem; color: rgb(253 164 175); background: rgb(244 63 94 / .1); }
+.linkish { display: inline-flex; align-items: center; gap: .45rem; font-size: .72rem; font-weight: 600; color: var(--fg-2); }
+.linkish:hover { color: var(--fg); }
+.dot { font-size: .62rem; font-weight: 500; color: rgb(180 83 9); }
+.channel-grid { display: grid; gap: .85rem; margin-top: .9rem; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); }
+.badge-off { flex: none; font-size: .62rem; border-radius: 999px; padding: .2rem .55rem; color: rgb(190 18 60); background: rgb(244 63 94 / .1); }
 .provider-grid { display: grid; gap: .5rem; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); }
 .provider-row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .65rem .8rem; border-radius: .65rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); cursor: pointer; transition: background .15s; }
 .provider-row:hover { background: var(--hover); }

@@ -99,8 +99,18 @@ func (r *QuotaRepository) ClaimRefreshDue(ctx context.Context, now time.Time, li
 }
 
 func (r *QuotaRepository) ListByAccount(ctx context.Context, accountID string) ([]model.AccountQuotaBucket, error) {
+	return r.ListByAccounts(ctx, []string{accountID})
+}
+
+func (r *QuotaRepository) ListByAccounts(ctx context.Context, accountIDs []string) ([]model.AccountQuotaBucket, error) {
+	if len(accountIDs) == 0 {
+		return nil, nil
+	}
 	var items []model.AccountQuotaBucket
-	if err := r.db.WithContext(ctx).Where("account_id = ?", accountID).Order("bucket_key asc").Find(&items).Error; err != nil {
+	if err := r.db.WithContext(ctx).
+		Where("account_id IN ?", accountIDs).
+		Order("account_id asc, bucket_key asc").
+		Find(&items).Error; err != nil {
 		return nil, err
 	}
 	return items, nil

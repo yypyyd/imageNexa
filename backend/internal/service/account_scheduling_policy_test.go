@@ -3,10 +3,13 @@ package service
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
+
+	"gorm.io/datatypes"
 )
 
 func TestTempFailureSignatureStable(t *testing.T) {
@@ -92,6 +95,25 @@ func TestAdobeVideoEligibilityAgreesOnLogicalAndRuntimeIDs(t *testing.T) {
 	}
 	if adobeAccountSupportsModel(ordinary, "kling-3", "video") || adobeAccountSupportsModel(ordinary, "firefly-kling-3", "video") {
 		t.Fatalf("kling is points-only on both public and runtime ids")
+	}
+}
+
+func TestSelectGrokLivenessCandidatesKeepsSchedulingStubs(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	items := []model.TokenAccount{
+		{
+			ID: "fresh", Pool: "grok", Status: "active", SchedulingStub: true,
+			Meta: datatypes.JSONMap{"grok_liveness_checked_at": now.Unix()},
+		},
+		{
+			ID: "stale", Pool: "grok", Status: "active", SchedulingStub: true,
+			Meta: datatypes.JSONMap{"grok_liveness_checked_at": now.Add(-7 * time.Hour).Unix()},
+		},
+		{ID: "empty", Pool: "grok", Status: "active", Value: ""},
+	}
+	got := selectGrokLivenessCandidates(items, now)
+	if len(got) != 1 || got[0].ID != "stale" {
+		t.Fatalf("got %#v", got)
 	}
 }
 
