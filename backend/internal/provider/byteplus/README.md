@@ -48,7 +48,7 @@ distinct accounts on the same route. 2API only advances when that failed
 account's live pre-submit balance and three fresh post-failure balances all prove
 that no points were consumed. Every failed account must pass this proof
 independently. An unknown, changed, or unavailable balance stops the chain. It
-never returns to an attempted account, enters the ordinary 300-second temporary
+never returns to an attempted account, enters the ordinary temporary-account
 retry loop, or switches provider routes. Busy eligible accounts stay at the end
 of the candidate list so the bounded account wait can admit them after a slot is
 released.

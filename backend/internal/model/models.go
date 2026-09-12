@@ -154,6 +154,9 @@ type TokenAccount struct {
 	Concurrency int `gorm:"not null;default:0"`
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	// SchedulingStub is set when credential columns were omitted from a
+	// scheduling query. An empty Value then means "not loaded", not "missing".
+	SchedulingStub bool `gorm:"-" json:"-"`
 }
 
 type RefreshProfile struct {

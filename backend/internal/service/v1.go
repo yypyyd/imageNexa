@@ -787,6 +787,7 @@ func (s *V1Service) PrepareAdminTest(ctx context.Context, in AdminTestRequest) (
 
 func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPrincipal, payload []byte, accountID, source string) (*V1ChatResponse, error) {
 	s.applyGlobalProxy(ctx)
+	ctx = withSchedulingCache(ctx)
 	if source == "" {
 		source = "v1"
 	}
@@ -868,20 +869,9 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 		var active []model.TokenAccount
 		switch pool {
 		case "custom":
-			active, configErr = s.customActive(ctx, route.LogicalModelID)
+			active, configErr = s.customActive(ctx, route.LogicalModelID, "text")
 		case "chatgpt", "grok":
-			var items []model.TokenAccount
-			items, configErr = s.tokens.ListByPool(ctx, pool)
-			if configErr == nil {
-				for _, item := range items {
-					// Media quota states do not disable text chat. Durable route
-					// bindings and text-specific cooldowns are applied below.
-					if (item.Status == "active" || item.Status == "quota") && !item.Dead && strings.TrimSpace(item.Value) != "" {
-						active = append(active, item)
-					}
-				}
-				s.rotateRoundRobin(pool, active)
-			}
+			active, configErr = s.loadActivePool(ctx, pool, "text", route.LogicalModelID, accountID)
 		default:
 			return nil, ErrProviderUnsupported
 		}
@@ -983,16 +973,20 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 					return nil, callErr
 				case errors.Is(callErr, custom.ErrAuth), errors.Is(callErr, chatgpt.ErrAuth), errors.Is(callErr, grok.ErrAuth):
 					s.markTokenFailure(bookCtx, pool, token, "text", true, false)
+					s.coolDownAccountWithToken(pool, token)
 					continue
 				case errors.Is(callErr, grok.ErrQuotaExhausted):
 					// Grok chat throttling is separate from its media credits.
 					s.markTokenFailure(bookCtx, pool, token, "text", false, false)
+					s.coolDownAccountWithToken(pool, token)
 					continue
 				case errors.Is(callErr, custom.ErrQuotaExhausted), errors.Is(callErr, chatgpt.ErrQuotaExhausted):
 					s.markTokenFailure(bookCtx, pool, token, "text", false, true)
+					s.coolDownAccountWithToken(pool, token)
 					continue
 				case errors.Is(callErr, custom.ErrTemporaryUpstream), errors.Is(callErr, chatgpt.ErrTemporaryUpstream), errors.Is(callErr, grok.ErrTemporaryUpstream):
 					s.markTokenFailure(bookCtx, pool, token, "text", false, false)
+					s.coolDownAccountWithToken(pool, token)
 					continue
 				default:
 					return nil, callErr
@@ -1401,6 +1395,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// generation from running on for minutes and surfacing a late "success" on an
 	// already-abandoned event.
 	ctx = context.WithoutCancel(ctx)
+	ctx = withSchedulingCache(ctx)
 	eventFingerprint := ""
 	if len(canonicalFingerprint) > 0 {
 		eventFingerprint = strings.TrimSpace(canonicalFingerprint[0])
@@ -1860,6 +1855,7 @@ func mustDispatchRoute(ctx context.Context, models *repo.ModelRepository, routeI
 func (s *V1Service) prepareAdminVideoTest(ctx context.Context, in V1VideoRequest) (map[string]any, error) {
 	s.applyGlobalProxy(ctx)
 	ctx = context.WithoutCancel(ctx)
+	ctx = withSchedulingCache(ctx)
 	modelItem, resolution, aspectRatio, duration, price, err := s.prepareVideo(ctx, nil, in, false)
 	if err != nil {
 		return nil, err
@@ -1918,6 +1914,7 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 		return s.videoJobFromEvent(existing), nil
 	}
 	ctx = context.WithoutCancel(ctx)
+	ctx = withSchedulingCache(ctx)
 	if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
 		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
 		return nil, err
@@ -1992,6 +1989,7 @@ func (s *V1Service) videoJobFromEvent(ev *model.EventLog) map[string]any {
 // (downloadResult=false → no bytes, no RustFS) and storing it on the event.
 func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, modelItem *model.ModelConfig, eventID, aspectRatio, resolution, duration string, price float64) {
 	s.applyGlobalProxy(ctx)
+	ctx = withSchedulingCache(ctx)
 	if principal != nil && principal.Credential != nil {
 		slot := "video:" + eventID
 		admitted, gateErr := s.credentialAcquire(ctx, principal, slot)
@@ -2874,21 +2872,10 @@ func (budget *bytePlusBetaRetryBudget) handle(err error, now time.Time) (retry b
 	return true, nil
 }
 
-// Bound temporary failover so a shared-egress outage cannot fan one downstream
-// request across the entire account pool. This is retry/failover accounting,
-// not a submit rate limiter or circuit breaker.
-const maxTempFailoverAccounts = 3
-
-// Temporary upstream errors (including provider-side overload) are absorbed by waiting
-// and retrying inside the request instead of failing it: the synchronous
-// response heartbeats keep the downstream connection alive, so a queued burst
-// degrades into slower responses rather than user-visible errors. The window
-// bounds the total wait; the backoff only separates retries after failures.
-const (
-	tempRetryWindow         = 300 * time.Second
-	tempRetryInitialBackoff = 3 * time.Second
-	tempRetryMaxBackoff     = 12 * time.Second
-)
+// Temporary upstream errors fail over to unused accounts. Identical signatures
+// stop early so a pool-wide outage cannot walk the whole pool or retry the same
+// three credentials for minutes. This is retry/failover accounting, not a
+// submit rate limiter or circuit breaker.
 
 // runPoolWithFailover drives a generation across a round-robin-ordered account
 // list with per-error-class behavior, so a bad request never burns the whole
@@ -2900,8 +2887,10 @@ const (
 //     fresh token; if it still auth-fails (or there's nothing to refresh, e.g.
 //     chatgpt's JWT IS the credential), mark the account and fail over.
 //   - 上游临时 temporary → record the failure (no disable/dead) and FAIL OVER to
-//     the next account immediately, capped by maxTempFailoverAccounts so a
-//     pool-wide blip can't fan a single request out across everything.
+//     the next unused account immediately. The failed credential is excluded
+//     for the rest of the request. Identical temporary signatures stop after
+//     three accounts; mixed failures may use up to six distinct accounts so a
+//     few bad credentials cannot idle the rest of the pool.
 //   - 参数错 / request-level (anything else) → return immediately, no retry, no
 //     account penalty (the account isn't at fault).
 //
@@ -2919,10 +2908,10 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 	return s.runPoolWithFailoverPolicy(ctx, eventID, pool, active, kind, attempt, classify, refreshOnAuth, tempFailover, true)
 }
 
-// runPoolWithFailoverPolicy is the policy-bearing implementation. Most pools
-// retain the bounded in-request temporary retry. Adobe third-party images pass
-// retryTemporary=false because they have an explicit cross-provider fallback;
-// waiting five minutes before entering that fallback defeats its purpose.
+// runPoolWithFailoverPolicy is the policy-bearing implementation. Temporary
+// failures exclude that credential and continue to unused accounts. Adobe
+// third-party images still pass retryTemporary=false so a later cross-provider
+// fallback is not delayed; the flag is retained for call-site compatibility.
 func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool string, active []model.TokenAccount, kind string,
 	attempt func(token model.TokenAccount) ([]byte, error),
 	classify func(error) (isAuth, isQuota, isTemporary, isDead bool),
@@ -2941,45 +2930,24 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 		}
 	}
 	policy := poolPolicy(ctx)
-	retryTemporary = retryTemporary && !policy.fastFailover
+	_ = retryTemporary
 	requestState := policy.accountRequest(ctx, pool)
 	excludedAccounts := requestState.excluded
 	var refreshedAt time.Time
-	tempDeadCount := 0
+	var tempState tempFailoverState
+	var durableErr error
 	queueDeadline := time.Now().Add(providerAccountQueueWait)
-	tempRetryDeadline := time.Now().Add(tempRetryWindow)
-	tempRetryBackoff := tempRetryInitialBackoff
 	// A verified terminal BytePlus beta-instability verdict may walk a bounded
 	// set of different accounts. The attempted set prevents cycling back to any
 	// account already used by this request; the special budget also bypasses the
-	// ordinary 300-second temporary retry loop and never crosses provider routes.
+	// ordinary temporary-account budget and never crosses provider routes.
 	var bytePlusBetaRetry bytePlusBetaRetryBudget
 	attemptedAccounts := requestState.attempted
-	// waitTempRetry pauses before re-running the pool after a temporary
-	// upstream failure. It reports false once the retry window is spent or the
-	// caller has gone away, at which point the error is surfaced.
-	waitTempRetry := func() bool {
-		if !retryTemporary || time.Now().After(tempRetryDeadline) || ctx.Err() != nil {
-			return false
-		}
-		timer := time.NewTimer(tempRetryBackoff)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return false
-		case <-timer.C:
-		}
-		tempRetryBackoff *= 2
-		if tempRetryBackoff > tempRetryMaxBackoff {
-			tempRetryBackoff = tempRetryMaxBackoff
-		}
-		tempDeadCount = 0
-		return true
-	}
 	for {
 		var refreshErr error
 		if time.Since(refreshedAt) >= time.Second {
 			active, refreshErr = s.refreshPoolAccounts(ctx, pool, kind, active, excludedAccounts)
+			s.demoteCoolingAccounts(pool, active)
 			refreshedAt = time.Now()
 		}
 		if refreshErr != nil || len(active) == 0 {
@@ -2989,12 +2957,13 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 			if refreshErr != nil {
 				return nil, refreshErr
 			}
+			if durableErr != nil {
+				return nil, durableErr
+			}
 			return nil, ErrNoProviderAccount
 		}
 		counts, observed := s.conc.ActiveCounts(ctx, accountGateKeys(active))
 		var lastErr error
-		lastTempDead := false
-		retrying := false
 		busy := 0
 		for _, token := range active {
 			if excludedAccounts[token.ID] {
@@ -3032,9 +3001,9 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 				return data, nil
 			}
 			lastErr = err
-			lastTempDead = tempDead
+			durableErr = err
 			isAuth, isQuota, _, isDead := classify(err)
-			if isAuth || isQuota || (isDead && !tempDead) || errors.Is(err, ErrNoProviderAccount) {
+			if excludeAfterAccountFailure(isAuth, isQuota, isDead, tempDead, err) {
 				excludedAccounts[token.ID] = true
 			}
 			// Once the job's deadline is spent, another account can only fail on
@@ -3058,15 +3027,10 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 				}
 			}
 			if tempDead {
-				// temp-failover policy: this account hit a temporary upstream error.
-				// Cap how many accounts one burst may burn, then wait and retry
-				// instead of failing the request while the retry window lasts.
-				tempDeadCount++
-				if tempDeadCount >= maxTempFailoverAccounts {
-					if waitTempRetry() {
-						retrying = true
-						break
-					}
+				// Unused accounts are tried immediately. The same credential is
+				// never retried in this request; identical signatures stop the
+				// wave so a shared outage cannot walk the pool.
+				if tempState.note(err) {
 					return nil, lastErr
 				}
 			}
@@ -3077,19 +3041,10 @@ func (s *V1Service) runPoolWithFailoverPolicy(ctx context.Context, eventID, pool
 			return nil, lastErr
 		}
 
-		if retrying {
-			continue
-		}
 		if bytePlusBetaRetry.active && busy == 0 {
 			return nil, bytePlusBetaRetry.lastErr
 		}
 		if lastErr != nil && busy == 0 && !bytePlusBetaRetry.active {
-			// The whole pool was tried and the last failure was a temporary
-			// upstream error → wait and retry within the window; anything else
-			// (auth/quota exhaustion across the pool) is surfaced immediately.
-			if lastTempDead && waitTempRetry() {
-				continue
-			}
 			return nil, lastErr
 		}
 		if busy == 0 {
@@ -3271,10 +3226,9 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				// Ops policy (adobe): NEVER kill on these upstream errors — a
 				// genuinely bad account and a transient Adobe blip (429/5xx/
 				// overload) look the same, and killing wipes healthy accounts.
-				// Record the failure and fail over to the next account (no
-				// disable/dead). The 4th return value caps how many accounts one
-				// request may burn this way (maxTempFailoverAccounts) so a pool-wide
-				// blip can't fan a single request across the whole pool.
+				// Record the failure and fail over to the next unused account (no
+				// disable/dead). The caller excludes this credential and stops
+				// after identical temporary signatures or the unique-account cap.
 				s.markTokenUpstreamFailure(ctx, pool, token)
 				s.coolDownAccountWithToken(pool, token)
 				return nil, true, true, err
@@ -3431,35 +3385,21 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 	}
 	s.applyGlobalProxy(ctx)
 
-	items, err := s.tokens.ListByPool(ctx, "adobe")
+	active, err := s.loadActivePool(ctx, "adobe", "image", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		// Image quota is tracked separately from video — an account whose video
-		// quota is exhausted (VideoLimited) is still usable for image as long as
-		// its image quota remains. status=="quota" means BOTH kinds are limited
-		// (or a legacy/full quota mark), so it's excluded for either kind.
-		if item.Status == "active" && !item.Dead && !item.ImageLimited && strings.TrimSpace(item.Value) != "" && !adobePointsAccount(item) && adobeAccountSupportsModel(item, modelItem.ID, "image") {
-			active = append(active, item)
-		}
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("adobe", active)
 
 	refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
 	if err != nil {
 		return nil, "", err
 	}
 
-	// Round-robin order. Adobe uses tempFailover=true: a temporary upstream error
-	// ("system under load") fails over to the next account without penalizing the
-	// current one, capped at maxTempFailoverAccounts; auth/quota also fail over
-	// (see runPoolWithFailover). imageURL is captured from the successful attempt.
+	// Temporary upstream errors fail over to unused accounts; identical
+	// signatures stop the wave. Auth/quota also fail over (see runPoolWithFailover).
 	var imageURL string
 	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "adobe", active, "image", func(token model.TokenAccount) ([]byte, error) {
 		var blobIDs []string
@@ -3498,26 +3438,13 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	}
 	s.applyGlobalProxy(ctx)
 
-	items, err := s.tokens.ListByPool(ctx, "adobe")
+	active, err := s.loadActivePool(ctx, "adobe", "video", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		// Video quota is tracked separately from image — skip accounts whose
-		// video quota is exhausted (VideoLimited), but an image-only limit
-		// (ImageLimited) leaves the account usable for video. status=="quota"
-		// means BOTH kinds are limited (or a legacy/full quota mark), so it's
-		// excluded for either kind.
-		if item.Status == "active" && !item.Dead && !item.VideoLimited && strings.TrimSpace(item.Value) != "" && adobeAccountSupportsModel(item, modelItem.ID, "video") {
-			active = append(active, item)
-		}
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("adobe", active)
 
 	refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
 	if err != nil {
@@ -3527,10 +3454,9 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	engine, upstreamModel := resolveAdobeVideoEngine(modelItem.ID)
 	referenceMode := defaultString(strings.TrimSpace(modelItem.ReferenceMode), "frame")
 
-	// Round-robin order; fail over to the next account on auth/quota; temporary
-	// upstream errors fail over too without penalizing the account (tempFailover,
-	// capped at maxTempFailoverAccounts). videoURL is
-	// captured from the successful attempt's meta (the upstream presigned URL).
+	// Fail over to unused accounts on auth/quota/temporary errors without
+	// penalizing the credential. videoURL is captured from the successful
+	// attempt's meta (the upstream presigned URL).
 	var videoURL string
 	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "adobe", active, "video", func(token model.TokenAccount) ([]byte, error) {
 		inputs := adobe.VideoInputs{GenerateAudio: in.GenerateAudio}
@@ -3587,28 +3513,13 @@ func (s *V1Service) generateRunwayVideo(ctx context.Context, eventID string, mod
 	}
 	frame := refs[0]
 
-	items, err := s.tokens.ListByPool(ctx, "runway")
+	active, err := s.loadActivePool(ctx, "runway", "video", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		// No pre-deduct (same policy as the image flow): skip only accounts we KNOW
-		// are out of credits (cached remaining <= 0) — those are treated as dead.
-		// Unknown balance gets the benefit of the doubt.
-		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem <= 0 {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("runway", active)
 
 	var videoURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "runway", active, "video", func(token model.TokenAccount) ([]byte, error) {
@@ -3639,7 +3550,7 @@ func runwayErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
 // given model id: active, not dead, has a base_url, and its meta.models list (csv
 // of model ids it serves) contains the id. An empty models list serves ALL ids.
 func customAccountServes(item model.TokenAccount, modelID string) bool {
-	if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
+	if item.Status != "active" || item.Dead || (!item.SchedulingStub && strings.TrimSpace(item.Value) == "") {
 		return false
 	}
 	if item.Meta == nil || strings.TrimSpace(stringValue(item.Meta["base_url"])) == "" {
@@ -3659,19 +3570,8 @@ func customAccountServes(item model.TokenAccount, modelID string) bool {
 
 // customActive returns the custom accounts that serve modelID, ordered by weight
 // (higher first; ties by id) so heavier upstreams are preferred.
-func (s *V1Service) customActive(ctx context.Context, modelID string) ([]model.TokenAccount, error) {
-	items, err := s.tokens.ListByPool(ctx, "custom")
-	if err != nil {
-		return nil, err
-	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if customAccountServes(item, modelID) {
-			active = append(active, item)
-		}
-	}
-	s.rotateRoundRobin("custom", active) // weight priority + round-robin within ties
-	return active, nil
+func (s *V1Service) customActive(ctx context.Context, modelID, kind string) ([]model.TokenAccount, error) {
+	return s.loadActivePool(ctx, "custom", kind, modelID, "")
 }
 
 func poolAccountConcurrency(pool string, item model.TokenAccount) int {
@@ -3702,11 +3602,10 @@ func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, mod
 	if err != nil {
 		return nil, "", err
 	}
-	active, err := s.customActive(ctx, modelItem.ID)
+	active, err := s.loadActivePool(ctx, "custom", "image", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	active = pinTestAccount(active, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
@@ -3743,11 +3642,10 @@ func (s *V1Service) generateCustomVideo(ctx context.Context, eventID string, mod
 		return nil, "", errors.New("custom client not configured")
 	}
 	s.applyGlobalProxy(ctx)
-	active, err := s.customActive(ctx, modelItem.ID)
+	active, err := s.loadActivePool(ctx, "custom", "video", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	active = pinTestAccount(active, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
@@ -3909,21 +3807,10 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 	}
 	ctx = withDispatchCost(ctx, float64(requiredCredits))
 	s.applyGlobalProxy(ctx)
-	items, err := s.tokens.ListByPool(ctx, "oreate")
+	active, err := s.loadActivePool(ctx, "oreate", "video", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	active := make([]model.TokenAccount, 0, len(items))
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || item.VideoLimited || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < oreateMinUsableCredits {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	active = s.dropOreateSpamQuarantined(active)
 	active, knownInsufficient := filterOreateAccountsByCredits(active, requiredCredits)
 	if len(active) == 0 {
@@ -3932,7 +3819,6 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 		}
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("oreate", active)
 	s.prioritizeOreate80CreditAccounts(active, requiredCredits)
 	var videoURL string
 	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "oreate", active, "video", func(token model.TokenAccount) ([]byte, error) {
@@ -4047,22 +3933,13 @@ func (s *V1Service) generateDolaVideo(ctx context.Context, eventID string, model
 		return nil, "", errors.New("dola: metered dispatch route required")
 	}
 	s.applyGlobalProxy(ctx)
-	items, err := s.tokens.ListByPool(ctx, "dola")
+	active, err := s.loadActivePool(ctx, "dola", "video", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	active := make([]model.TokenAccount, 0, len(items))
-	for _, item := range items {
-		if !model.DolaAccountReady(item) || item.Status != "active" || item.Dead || item.VideoLimited || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("dola", active)
 	var videoURL string
 	data, err := s.runPoolWithFailoverPolicy(ctx, eventID, "dola", active, "video", func(token model.TokenAccount) ([]byte, error) {
 		dolaAccount := dolaAccountFromToken(token)
@@ -4192,30 +4069,13 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 		return nil, "", err
 	}
 
-	items, err := s.tokens.ListByPool(ctx, "grok")
+	active, err := s.loadActivePool(ctx, "grok", "video", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		// Keep the explicit per-account flag as a fail-safe for an upstream quota
-		// response, but do not derive it from the subscription tier.
-		if item.VideoLimited {
-			continue
-		}
-		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem <= 0 {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("grok", active)
 
 	res := strings.TrimSpace(resolution)
 	if res == "" {
@@ -4258,25 +4118,13 @@ func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, model
 		return nil, "", errors.New("grok client not configured")
 	}
 
-	items, err := s.tokens.ListByPool(ctx, "grok")
+	active, err := s.loadActivePool(ctx, "grok", "image", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || item.ImageLimited || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem <= 0 {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("grok", active)
 
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "grok", active, "image", func(token model.TokenAccount) ([]byte, error) {
@@ -4320,28 +4168,13 @@ func (s *V1Service) generateRunwayImage(ctx context.Context, eventID string, mod
 		return nil, "", err
 	}
 
-	items, err := s.tokens.ListByPool(ctx, "runway")
+	active, err := s.loadActivePool(ctx, "runway", "image", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		// No pre-deduct: skip only accounts we KNOW are out of credits
-		// (cached remaining <= 0); they're treated as dead. Unknown balance gets
-		// the benefit of the doubt — upstream rejects if it's truly empty.
-		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem <= 0 {
-			continue
-		}
-		active = append(active, item)
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("runway", active)
 
 	imageSize := strings.TrimSpace(resolution)
 	if imageSize == "" {
@@ -4417,21 +4250,13 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 		return nil, "", errors.New("chatgpt client not configured")
 	}
 
-	items, err := s.tokens.ListByPool(ctx, "chatgpt")
+	active, err := s.loadActivePool(ctx, "chatgpt", "image", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	var active []model.TokenAccount
-	for _, item := range items {
-		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
-			active = append(active, item)
-		}
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("chatgpt", active)
 
 	refLimit := modelItem.MaxReferenceImages
 	if refLimit <= 0 {
@@ -4443,8 +4268,7 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 	}
 
 	// Round-robin order; on a transient upstream error FAIL OVER to the next
-	// account (tempFailover=true, capped at maxTempFailoverAccounts) — never mark the
-	// account dead. Auth/quota fail over immediately (see runPoolWithFailover).
+	// account. Auth/quota fail over immediately (see runPoolWithFailover).
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "chatgpt", active, "image", func(token model.TokenAccount) ([]byte, error) {
 		d, meta, genErr := s.chatgpt.GenerateImage(ctx, token.Value, in.Prompt, modelItem.ID, aspectRatio, resolution, refs, false)
@@ -4507,18 +4331,10 @@ func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, m
 		return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
 	}
 	ctx = withDispatchCost(ctx, requiredCredits)
-	items, err := s.tokens.ListByPool(ctx, "byteplus")
+	active, err := s.loadActivePool(ctx, "byteplus", "image", modelItem.ID, in.AccountID)
 	if err != nil {
 		return nil, "", err
 	}
-	active := make([]model.TokenAccount, 0, len(items))
-	now := time.Now()
-	for _, item := range items {
-		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" && bytePlusAccountSessionUsable(item, now) {
-			active = append(active, item)
-		}
-	}
-	active = pinTestAccount(items, active, in.AccountID)
 	active, knownInsufficient := filterBytePlusAccountsByCredits(active, requiredCredits)
 	if len(active) == 0 {
 		if knownInsufficient {
@@ -4526,7 +4342,6 @@ func (s *V1Service) generateBytePlusImage(ctx context.Context, eventID string, m
 		}
 		return nil, "", ErrNoProviderAccount
 	}
-	s.rotateRoundRobin("byteplus", active)
 	s.prioritizeBytePlusAccounts(active)
 	providerModel, providerModelOK := byteplus.LookupModel(request.Model)
 	verifyBetaNoCharge := providerModelOK && providerModel.Key == byteplus.ModelGPTImage2
@@ -5175,7 +4990,7 @@ func pinTestAccount(items, active []model.TokenAccount, accountID string) []mode
 		return active
 	}
 	for _, item := range items {
-		if item.ID == id && strings.TrimSpace(item.Value) != "" {
+		if item.ID == id && (item.SchedulingStub || strings.TrimSpace(item.Value) != "") {
 			return []model.TokenAccount{item}
 		}
 	}

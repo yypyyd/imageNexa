@@ -44,6 +44,37 @@ func (r *TokenRepository) ListByPool(ctx context.Context, pool string) ([]model.
 	return items, nil
 }
 
+// schedulingAccountColumns omits credential material. Admission reloads the
+// chosen row with Get before any provider call.
+var schedulingAccountColumns = []string{
+	"id", "pool", "status", "fails", "fail_total", "upstream_fails", "success_total",
+	"dead", "meta", "added_at", "last_used_at", "cached_quota_reset_after", "quota_recover_at",
+	"image_limited", "video_limited", "account_email", "account_display_name",
+	"weight", "concurrency", "created_at", "updated_at", "identity_hash",
+}
+
+func markSchedulingStubs(items []model.TokenAccount) []model.TokenAccount {
+	for i := range items {
+		items[i].SchedulingStub = true
+		items[i].Value = ""
+		items[i].ARPSessionToken = ""
+	}
+	return items
+}
+
+// ListSchedulingByPool loads pool rows for candidate ranking without cookies or
+// session tokens. Empty-credential rows never enter the candidate set.
+func (r *TokenRepository) ListSchedulingByPool(ctx context.Context, pool string) ([]model.TokenAccount, error) {
+	var items []model.TokenAccount
+	if err := r.db.WithContext(ctx).
+		Select(schedulingAccountColumns).
+		Where("pool = ? AND value <> ''", pool).
+		Find(&items).Error; err != nil {
+		return nil, err
+	}
+	return markSchedulingStubs(items), nil
+}
+
 // ListByIDs refreshes a queued request's candidates in one query. The caller
 // preserves its scheduling order; database row order is deliberately irrelevant.
 func (r *TokenRepository) ListByIDs(ctx context.Context, pool string, ids []string) ([]model.TokenAccount, error) {
@@ -53,6 +84,19 @@ func (r *TokenRepository) ListByIDs(ctx context.Context, pool string, ids []stri
 	var items []model.TokenAccount
 	err := r.db.WithContext(ctx).Where("pool = ? AND id IN ?", pool, ids).Find(&items).Error
 	return items, err
+}
+
+// ListSchedulingByIDs refreshes queued candidates without credential material.
+func (r *TokenRepository) ListSchedulingByIDs(ctx context.Context, pool string, ids []string) ([]model.TokenAccount, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var items []model.TokenAccount
+	err := r.db.WithContext(ctx).
+		Select(schedulingAccountColumns).
+		Where("pool = ? AND id IN ? AND value <> ''", pool, ids).
+		Find(&items).Error
+	return markSchedulingStubs(items), err
 }
 
 func (r *TokenRepository) Get(ctx context.Context, pool, id string) (*model.TokenAccount, error) {

@@ -159,7 +159,7 @@ For each request, the scheduler performs these steps in order:
 7. Within the remaining group, apply account weight, available concurrency, health, and quota best-fit ordering. Round-robin state breaks equivalent choices without starving peers.
 8. Atomically acquire concurrency, revalidate the current credential, account state, account binding, model/provider/route switches and quota, and create dispatch/quota reservations before provider submission. A queued first admission respects cooldown; a bounded retry already admitted on that account can continue through its own cooldown.
 
-When a model has multiple routes, make a non-waiting pass across them before queueing on capacity. Only full routes are revisited within one shared 90-second wait; failed routes do not enter a repeated cross-route submit loop. Single-route requests retain their bounded temporary retry, and the verified BytePlus beta chain retains its separate six-distinct-account budget. Queue polling uses jitter and batches capacity reads; per-request account snapshots refresh at most once per second, while each actual admission is revalidated. Equal ranked accounts preserve the distributed round-robin order. Concurrency cleanup uses an independent three-second context so cancelled work cannot leak a slot until its 15-minute lease expires. Capacity observation uses Redis time and never deletes leases.
+When a model has multiple routes, make a non-waiting pass across them before queueing on capacity. Only full routes are revisited within one shared 90-second wait; failed routes do not enter a repeated cross-route submit loop. Temporary failures exclude that credential for the rest of the request and immediately try an unused account. Three identical temporary signatures stop the wave (pool-wide outage); mixed temporary failures may use up to six distinct accounts. The verified BytePlus beta chain retains its separate six-distinct-account budget. Queue polling uses jitter and batches capacity reads; per-request scheduling lists omit credential material and are reused across prepare/dispatch; snapshots refresh at most once per second, while each actual admission reloads and revalidates the chosen row. Equal ranked accounts preserve the distributed round-robin order. Concurrency cleanup uses an independent three-second context so cancelled work cannot leak a slot until its 15-minute lease expires. Capacity observation uses Redis time and never deletes leases.
 
 Clients select a channel by requesting that channel's public model ID. Runway and Custom are not published as public channels, and they are hidden from the administrator account console, import, and provider switches until those channels are ready. Custom cannot substitute the Dola-only `dola-seedance-2.5` model.
 
@@ -199,7 +199,7 @@ The BytePlus exception is deliberately fail-closed: the fixed GPT Image 2
 inference ID, parent/child statuses, and exact failure text must all match, and
 each failed account's four balance snapshots must be known and identical. The
 bounded chain can submit to at most six distinct accounts, never revisits one,
-never enters the ordinary 300-second temporary retry loop, and never crosses the
+never enters the ordinary temporary-account budget, and never crosses the
 selected route. Any mismatch, changed/unknown balance, failed probe, or ambiguous
 submission stops account switching and falls back to the ordinary accepted-task
 rule. Accounts that are merely at their concurrency limit remain at the end of
@@ -345,6 +345,14 @@ Release verification should cover:
 - Long image/video requests need outer-proxy timeouts compatible with Nginx and should use idempotency or asynchronous task mode.
 
 ## 15. Change record
+
+### 2026-09-12 — Raise account-pool efficiency
+
+**Change**: Temporary failover no longer retries the same credentials. A failed account is excluded for the rest of the request; unused accounts are tried immediately. Three identical temporary signatures stop the wave, while mixed failures may use up to six distinct accounts. Scheduling queries omit cookies/session tokens and reuse one per-request pool list; availability probes skip ranking unless cross-route capacity failover needs slot observation. Admission still reloads the chosen credential and revalidates before submit.
+
+**Reason**: Production Adobe image requests were spending ~70 attempts and five minutes on the same three accounts during a shared outage, while hundreds of other credentials sat idle. Candidate ranking also reloaded full credential blobs for 300–500-account pools multiple times per request.
+
+**Impact**: Single-route temporary outages fail fast instead of hammering a tiny subset. Unlucky accounts no longer starve the rest of the pool. Prepare and dispatch share one scheduling snapshot, so Postgres and Redis work drop on every generation.
 
 ### 2026-09-05 — Revalidate queued accounts and recover scheduling capacity
 

@@ -78,38 +78,21 @@ func (s *V1Service) matchingRoutes(ctx context.Context, logicalID string, req mo
 }
 
 func (s *V1Service) routeHasAccount(ctx context.Context, route model.ModelRoute, kind string) (bool, error) {
-	items, err := s.tokens.ListByPool(ctx, route.Provider)
+	items, err := s.listSchedulingCached(ctx, route.Provider)
 	if err != nil {
 		return false, err
 	}
-	active := make([]model.TokenAccount, 0, len(items))
+	policy := poolPolicy(ctx)
 	now := time.Now()
+	active := make([]model.TokenAccount, 0, len(items))
 	for _, item := range items {
-		if route.Provider == "custom" && !customAccountServes(item, route.LogicalModelID) {
-			continue
+		if accountDispatchable(item, route.Provider, kind, routeDispatchModelID(route), policy.pinnedID, now) {
+			active = append(active, item)
 		}
-		if item.Dead || strings.TrimSpace(item.Value) == "" {
-			continue
-		}
-		if route.Provider == "byteplus" && !bytePlusAccountSessionUsable(item, now) {
-			continue
-		}
-		if kind == "text" && (route.Provider == "chatgpt" || route.Provider == "grok") {
-			if item.Status != "active" && item.Status != "quota" {
-				continue
-			}
-		} else if item.Status != "active" {
-			continue
-		}
-		if kind == "image" && item.ImageLimited || kind == "video" && item.VideoLimited {
-			continue
-		}
-		active = append(active, item)
 	}
-	// The caller already attached this normalized request's route cost. Keep it
-	// through the availability probe so a known-insufficient route is not chosen
-	// merely because it has an otherwise active account.
-	active, err = s.routeAccounts(ctx, route, active)
+	// Existence does not need ranking. Cross-route failover still observes
+	// slots so a saturated route is skipped before entering generate*.
+	active, err = s.collectRouteAccounts(ctx, route, active, policy.fastFailover, false)
 	return len(active) > 0, err
 }
 
@@ -136,6 +119,10 @@ func (s *V1Service) firstAvailableRoute(ctx context.Context, logicalID, kind str
 }
 
 func (s *V1Service) routeAccounts(ctx context.Context, route model.ModelRoute, accounts []model.TokenAccount) ([]model.TokenAccount, error) {
+	return s.collectRouteAccounts(ctx, route, accounts, true, true)
+}
+
+func (s *V1Service) collectRouteAccounts(ctx context.Context, route model.ModelRoute, accounts []model.TokenAccount, observeSlots, rank bool) ([]model.TokenAccount, error) {
 	type candidate struct {
 		account   model.TokenAccount
 		binding   model.AccountModelRoute
@@ -209,29 +196,38 @@ func (s *V1Service) routeAccounts(ctx context.Context, route model.ModelRoute, a
 	}
 	candidates = quotaEligible
 
-	// Observe all account gates in one Redis pipeline. A failed observation is
-	// unknown (not zero): final admission remains the atomic Acquire in the pool.
-	concurrencyKeys := make([]string, 0, len(candidates))
-	for _, item := range candidates {
-		concurrencyKeys = append(concurrencyKeys, "conc:a:"+item.account.ID)
-	}
-	activeCounts, slotsSeen := s.conc.ActiveCounts(ctx, concurrencyKeys)
-	if slotsSeen {
-		for index := range candidates {
-			item := &candidates[index]
-			maximum := int64(poolAccountConcurrency(route.Provider, item.account))
-			active := activeCounts["conc:a:"+item.account.ID]
-			item.available, item.slotsSeen = maximum-active, true
-		}
-	}
-	if slotsSeen && len(candidates) > 0 && poolPolicy(ctx).fastFailover {
-		available := false
+	if observeSlots {
+		// Observe all account gates in one Redis pipeline. A failed observation is
+		// unknown (not zero): final admission remains the atomic Acquire in the pool.
+		concurrencyKeys := make([]string, 0, len(candidates))
 		for _, item := range candidates {
-			available = available || item.available > 0
+			concurrencyKeys = append(concurrencyKeys, "conc:a:"+item.account.ID)
 		}
-		if !available {
-			return nil, ErrConcurrencyFull
+		activeCounts, slotsSeen := s.conc.ActiveCounts(ctx, concurrencyKeys)
+		if slotsSeen {
+			for index := range candidates {
+				item := &candidates[index]
+				maximum := int64(poolAccountConcurrency(route.Provider, item.account))
+				active := activeCounts["conc:a:"+item.account.ID]
+				item.available, item.slotsSeen = maximum-active, true
+			}
 		}
+		if slotsSeen && len(candidates) > 0 && poolPolicy(ctx).fastFailover {
+			available := false
+			for _, item := range candidates {
+				available = available || item.available > 0
+			}
+			if !available {
+				return nil, ErrConcurrencyFull
+			}
+		}
+	}
+	if !rank {
+		out := make([]model.TokenAccount, 0, len(candidates))
+		for _, item := range candidates {
+			out = append(out, item.account)
+		}
+		return out, nil
 	}
 	cooling := make(map[string]bool, len(candidates))
 	for _, item := range candidates {

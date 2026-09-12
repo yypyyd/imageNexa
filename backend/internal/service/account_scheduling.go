@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	"backend/internal/model"
@@ -46,11 +47,103 @@ func poolPolicy(ctx context.Context) poolSchedulingPolicy {
 	return policy
 }
 
+const schedulingCacheKey dispatchContextKey = "pool-scheduling-cache"
+
+type poolSchedulingCache struct {
+	mu   sync.Mutex
+	data map[string][]model.TokenAccount
+}
+
+func withSchedulingCache(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(schedulingCacheKey).(*poolSchedulingCache); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, schedulingCacheKey, &poolSchedulingCache{data: make(map[string][]model.TokenAccount)})
+}
+
+func cloneAccounts(items []model.TokenAccount) []model.TokenAccount {
+	out := make([]model.TokenAccount, len(items))
+	copy(out, items)
+	return out
+}
+
+func (s *V1Service) listSchedulingCached(ctx context.Context, pool string) ([]model.TokenAccount, error) {
+	cache, _ := ctx.Value(schedulingCacheKey).(*poolSchedulingCache)
+	if cache != nil {
+		cache.mu.Lock()
+		if items, ok := cache.data[pool]; ok {
+			cache.mu.Unlock()
+			return cloneAccounts(items), nil
+		}
+		cache.mu.Unlock()
+	}
+	items, err := s.tokens.ListSchedulingByPool(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	if cache != nil {
+		cache.mu.Lock()
+		cache.data[pool] = cloneAccounts(items)
+		cache.mu.Unlock()
+	}
+	return items, nil
+}
+
+func (s *V1Service) loadActivePool(ctx context.Context, pool, kind, logicalID, pinnedID string) ([]model.TokenAccount, error) {
+	items, err := s.listSchedulingCached(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	active := make([]model.TokenAccount, 0, len(items))
+	for _, item := range items {
+		if accountDispatchable(item, pool, kind, logicalID, pinnedID, now) {
+			active = append(active, item)
+		}
+	}
+	active = pinTestAccount(items, active, pinnedID)
+	if strings.TrimSpace(pinnedID) == "" {
+		s.rotateRoundRobin(pool, active)
+	}
+	return active, nil
+}
+
+func (s *V1Service) demoteCoolingAccounts(pool string, items []model.TokenAccount) {
+	if len(items) < 2 {
+		return
+	}
+	cooling := make(map[string]bool, len(items))
+	for _, item := range items {
+		cooling[item.ID] = s.accountCooling(pool, item.ID)
+	}
+	sortDemoteCooling(items, cooling)
+}
+
+func sortDemoteCooling(items []model.TokenAccount, cooling map[string]bool) {
+	// Keep relative order; only send just-failed accounts behind healthy ones.
+	n := len(items)
+	if n < 2 {
+		return
+	}
+	stable := make([]model.TokenAccount, 0, n)
+	for _, item := range items {
+		if !cooling[item.ID] {
+			stable = append(stable, item)
+		}
+	}
+	for _, item := range items {
+		if cooling[item.ID] {
+			stable = append(stable, item)
+		}
+	}
+	copy(items, stable)
+}
+
 func accountDispatchable(account model.TokenAccount, pool, kind, logicalID, pinnedID string, now time.Time) bool {
 	if pool == "dola" && !model.DolaAccountReady(account) {
 		return false
 	}
-	if strings.TrimSpace(account.Value) == "" {
+	if !account.SchedulingStub && strings.TrimSpace(account.Value) == "" {
 		return false
 	}
 	if pinnedID != "" && account.ID == pinnedID {
@@ -65,7 +158,33 @@ func accountDispatchable(account model.TokenAccount, pool, kind, logicalID, pinn
 	if pool == "byteplus" && !bytePlusAccountSessionUsable(account, now) {
 		return false
 	}
+	if pool == "adobe" && kind == "image" && adobePointsAccount(account) {
+		return false
+	}
+	if pool == "adobe" && !adobeAccountSupportsModel(account, logicalID, kind) {
+		return false
+	}
+	if pinnedID == "" && (pool == "runway" || pool == "grok" && kind != "text") {
+		if remaining, ok := jsonMapInt(account.Meta, "cached_quota_remaining"); ok && remaining <= 0 {
+			return false
+		}
+	}
 	return pool != "custom" || customAccountServes(account, logicalID)
+}
+
+// routeDispatchModelID is the id accountDispatchable uses for provider-specific
+// eligibility (Adobe ordinary-vs-points video, custom model lists). Adobe
+// adapters key off RuntimeModel; custom bindings key off the public logical id.
+func routeDispatchModelID(route model.ModelRoute) string {
+	if route.Provider == "adobe" {
+		if runtime := strings.TrimSpace(route.RuntimeModel); runtime != "" {
+			return runtime
+		}
+	}
+	if logical := strings.TrimSpace(route.LogicalModelID); logical != "" {
+		return logical
+	}
+	return strings.TrimSpace(route.RuntimeModel)
 }
 
 func (s *V1Service) refreshPoolAccounts(ctx context.Context, pool, kind string, active []model.TokenAccount, excluded map[string]bool) ([]model.TokenAccount, error) {
@@ -75,7 +194,7 @@ func (s *V1Service) refreshPoolAccounts(ctx context.Context, pool, kind string, 
 			ids = append(ids, account.ID)
 		}
 	}
-	fresh, err := s.tokens.ListByIDs(ctx, pool, ids)
+	fresh, err := s.tokens.ListSchedulingByIDs(ctx, pool, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +202,7 @@ func (s *V1Service) refreshPoolAccounts(ctx context.Context, pool, kind string, 
 	policy := poolPolicy(ctx)
 	byID := make(map[string]model.TokenAccount, len(fresh))
 	for _, account := range fresh {
-		if accountDispatchable(account, pool, kind, plan.Route.LogicalModelID, policy.pinnedID, time.Now()) {
+		if accountDispatchable(account, pool, kind, routeDispatchModelID(plan.Route), policy.pinnedID, time.Now()) {
 			byID[account.ID] = account
 		}
 	}
@@ -108,7 +227,7 @@ func (s *V1Service) revalidateDispatchAccount(ctx context.Context, pool, account
 		return model.TokenAccount{}, err
 	}
 	plan, routed := dispatchPlanFromContext(ctx)
-	if !accountDispatchable(*account, pool, kind, plan.Route.LogicalModelID, poolPolicy(ctx).pinnedID, time.Now()) {
+	if !accountDispatchable(*account, pool, kind, routeDispatchModelID(plan.Route), poolPolicy(ctx).pinnedID, time.Now()) {
 		return model.TokenAccount{}, ErrNoProviderAccount
 	}
 	if s.settings != nil {

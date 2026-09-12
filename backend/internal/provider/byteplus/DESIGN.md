@@ -78,7 +78,7 @@ The submission boundary is intentionally conservative:
   must independently pass the same proof. Unknown, changed, or failed balance
   probes retain the ordinary no-resubmit semantics and stop the chain. The
   bounded chain submits to at most six distinct accounts; it does not return to
-  any attempted account, enter the normal 300-second temporary retry loop, or
+  any attempted account, enter the ordinary temporary-account budget, or
   switch provider routes. Eligible accounts that are only concurrency-full stay
   at the candidate tail and may be admitted if their slot becomes free during
   the bounded account wait.
