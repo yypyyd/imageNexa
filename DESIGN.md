@@ -443,7 +443,7 @@ Release verification should cover:
 
 ### 2026-09-10 — Dola 视频协议与账号调度
 
-Dola 使用 `seedance_v2.5`，仅提供 30 秒、720p 文生视频。公共模型 `dola-seedance-2.5` 仅路由到 Dola，原通用 Seedance 2.5 路由保留兼容；两者共享账号日期额度桶。迁移 000019 保留账号绑定的 enabled、entitled、cooldown，不重置额度。未验证的参考图片、视频和音频能力不对外发布。
+Dola 使用 `seedance_v2.5`，提供 30 秒、720p 文生视频，以及最多 10 张参考图的图生视频。公共模型 `dola-seedance-2.5` 仅路由到 Dola，原通用 Seedance 2.5 路由保留兼容；两者共享账号日期额度桶。迁移 000019 保留账号绑定的 enabled、entitled、cooldown，不重置额度。参考视频和音频仍不对外发布。
 
 每个账号同时处理一个请求，每天最多两次，每次预占 1 generation；多个账号可以并行处理请求。UTC 00:00（北京时间 08:00）是本地记账边界，尚不代表已验证的上游重置时间。首次建桶使用 ON CONFLICT DO NOTHING，扣次使用 SELECT FOR UPDATE；结算始终指向预占时的日期桶，避免跨日退款增加新一天额度。网页或独立脚本消耗的次数需单独校准。
 
@@ -520,3 +520,11 @@ Dola 的发布验证重点包括请求结构、时长限制、导入识别、就
 **Reason**: The ChatGPT product name is the unprefixed OpenAI ID; the `chatgpt-` prefix was redundant next to already-prefixed sibling channels.
 
 **Impact**: `/v1/models`, request validation, and the administrator console show `gpt-image-2`. Clients still sending `chatgpt-gpt-image-2` receive `model_not_found`. The catalog remains 21 models (4 text, 10 image, 7 video). The ChatGPT route ID is unchanged, so account bindings and dispatch history stay valid.
+
+### 2026-09-12 — Dola Seedance 2.5 reference images
+
+**Change**: `dola-seedance-2.5` now advertises up to ten reference images. The protocol adapter prepares the session before ImageX upload, signs `prepare_upload`, and submits the existing attachment blocks on `/chat/completion`. Migration 000023 updates the live route capability. Reference videos and audio stay unpublished.
+
+**Reason**: The official Dola video panel accepts up to ten reference images. The public route previously advertised text-to-video only because the protocol path rejected attachments, so clients sending `input_reference` received `unsupported parameters`.
+
+**Impact**: `POST /v1/videos` with one to ten `input_reference` images matches the Dola route. Text-only 30s/720p requests are unchanged. More than ten images, or any reference video/audio, still fail capability matching.

@@ -57,14 +57,16 @@ type VideoOptions struct {
 	Ratio   string
 	// Duration must be exactly 30 seconds.
 	Duration int
-	// ReferenceImages turn the request into image-to-video (first-frame). Each
-	// image is uploaded through the ImageX chain and attached to the message.
+	// ReferenceImages turn the request into image-to-video. Each image is
+	// uploaded through the ImageX chain and attached to the message. The
+	// public Seedance 2.5 route accepts up to ten.
 	ReferenceImages []MediaReference
 }
 
-// GenerateVideo submits one text-to-video request and polls the conversation
-// until Dola publishes the clip. It returns the artifact URL in meta; callers
-// own the download so bytes flow through the shared netguard pipeline.
+// GenerateVideo submits one text-to-video or image-to-video request and
+// polls the conversation until Dola publishes the clip. It returns the
+// artifact URL in meta; callers own the download so bytes flow through the
+// shared netguard pipeline.
 func (c *Client) GenerateVideo(ctx context.Context, account Account, options VideoOptions) ([]byte, map[string]any, error) {
 	account = account.normalized()
 	if account.Cookie == "" {
@@ -81,6 +83,14 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 	}
 	duration := options.Duration
 	model := NormalizeModelID(options.ModelID)
+
+	if c.usesProtocol() {
+		prepared, prepErr := c.prepareProtocolAccount(ctx, account)
+		if prepErr != nil {
+			return nil, nil, prepErr
+		}
+		account = prepared
+	}
 
 	imageURIs := make([]string, 0, len(options.ReferenceImages))
 	for _, ref := range options.ReferenceImages {
@@ -124,13 +134,12 @@ func (c *Client) submitVideo(ctx context.Context, account Account, model, prompt
 	var status int
 	var err error
 	pollingAccount := account
-	if strings.TrimRight(strings.TrimSpace(c.baseURL), "/") == apiBase {
-		if len(imageURIs) > 0 {
-			return "", account, errors.New("dola: reference images are not supported by the protocol video adapter")
-		}
-		pollingAccount, err = c.prepareProtocolAccount(ctx, account)
-		if err != nil {
-			return "", account, err
+	if c.usesProtocol() {
+		if len(account.ProtocolQuery) == 0 {
+			pollingAccount, err = c.prepareProtocolAccount(ctx, account)
+			if err != nil {
+				return "", account, err
+			}
 		}
 		query = commonQueryForTab(pollingAccount, webTabID)
 		if err = c.initializeProtocolVideo(ctx, pollingAccount, query); err != nil {

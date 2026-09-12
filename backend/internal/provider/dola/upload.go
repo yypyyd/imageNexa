@@ -75,16 +75,29 @@ type uploadSTS struct {
 }
 
 func (c *Client) prepareUpload(ctx context.Context, account Account) (uploadSTS, error) {
-	query := commonQuery(account)
-	query.Set("device_id", "7655726059970627125")
-	query.Set("pc_version", "3.23.10")
-	query.Set("pkg_type", "release_version")
-	query.Set("real_aid", dolaAID)
-	query.Set("tea_uuid", "7655726485928068629")
-	query.Set("web_id", "7655726485928068629")
 	body := map[string]any{"tenant_id": "5", "scene_id": "4", "resource_type": 2}
-	data, status, err := c.postJSON(ctx, account, prepareUploadPath, query, body,
-		"application/json", "str, str", c.endpoint("/chat/"), 2<<20)
+	var data []byte
+	var status int
+	var err error
+	if c.usesProtocol() {
+		if len(account.ProtocolQuery) == 0 {
+			account, err = c.prepareProtocolAccount(ctx, account)
+			if err != nil {
+				return uploadSTS{}, err
+			}
+		}
+		data, status, err = c.signedProtocolJSON(ctx, account, prepareUploadPath, commonQueryForTab(account, ""), body, false)
+	} else {
+		query := commonQuery(account)
+		query.Set("device_id", "7655726059970627125")
+		query.Set("pc_version", "3.23.10")
+		query.Set("pkg_type", "release_version")
+		query.Set("real_aid", dolaAID)
+		query.Set("tea_uuid", "7655726485928068629")
+		query.Set("web_id", "7655726485928068629")
+		data, status, err = c.postJSON(ctx, account, prepareUploadPath, query, body,
+			"application/json", "str, str", c.endpoint("/chat/"), 2<<20)
+	}
 	if err != nil {
 		return uploadSTS{}, err
 	}

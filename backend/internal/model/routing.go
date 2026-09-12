@@ -327,7 +327,7 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 			route("video.seedance-2.0-fast.adobe", "adobe-seedance-2.0-fast", "adobe", "firefly-seedance-2-fast", "", 100, videoProfile([]string{"16:9", "9:16"}, []string{"480p", "720p", "1080p"}, secondsRange(4, 15), 9, 3, 3, 9, true, "asset")),
 		}},
 		{Model: LogicalModel{ID: DolaPublicVideoModel, Kind: "video", Name: "Dola Seedance 2.5", Enabled: true}, Routes: []ModelRoute{
-			route("video.dola-seedance-2.5.dola", DolaPublicVideoModel, "dola", "dola-seedance-2.5", "seedance_v2.5", 100, videoProfile(dolaRatios, []string{"720p"}, []string{"30s"}, 0, 0, 0, 0, true, "")),
+			route("video.dola-seedance-2.5.dola", DolaPublicVideoModel, "dola", "dola-seedance-2.5", "seedance_v2.5", 100, videoProfile(dolaRatios, []string{"720p"}, []string{"30s"}, 10, 0, 0, 10, true, "asset")),
 		}},
 		{Model: LogicalModel{ID: "grok-imagine-video", Kind: "video", Name: "Grok Imagine Video", Enabled: true}, Routes: []ModelRoute{
 			route("video.grok-imagine-video.grok", "grok-imagine-video", "grok", "grok-video", "grok-imagine-video", 100, videoProfile([]string{"2:3", "3:2", "1:1", "9:16", "16:9"}, []string{"720p"}, []string{"6s", "10s"}, 6, 0, 0, 0, false, "asset")),

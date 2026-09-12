@@ -252,6 +252,10 @@ func (c *Client) endpoint(path string) string {
 	return base + path
 }
 
+func (c *Client) usesProtocol() bool {
+	return strings.TrimRight(strings.TrimSpace(c.baseURL), "/") == apiBase
+}
+
 // Dola is region-locked to JP/KR exits, so every API call leaves through the
 // configured proxy when one exists; artifact downloads stay on direct egress.
 // The client is rebuilt whenever the proxy changes so a late proxy.url update

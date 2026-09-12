@@ -93,7 +93,7 @@ Errors use the OpenAI shape:
 - `kling-o3`
 - `adobe-seedance-2.0`
 - `adobe-seedance-2.0-fast`
-- `dola-seedance-2.5` (Dola-only, 30 seconds)
+- `dola-seedance-2.5` (Dola-only, 30 seconds, up to 10 reference images)
 - `grok-imagine-video`
 - `firefly-video`
 

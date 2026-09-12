@@ -1628,4 +1628,11 @@ var migrationSources = map[string]string{
 		"  AND NOT EXISTS (\n" +
 		"      SELECT 1 FROM model_routes AS route WHERE route.logical_model_id = logical.id\n" +
 		");\n",
+	"000023_dola_seedance25_reference_images.sql": "-- Publish Dola Seedance 2.5 reference images. The website accepts up to ten\n" +
+		"-- image attachments; the public route had advertised text-to-video only\n" +
+		"-- while the protocol adapter caught up.\n" +
+		"UPDATE model_routes\n" +
+		"SET capabilities = '[{\"operations\":[\"generation\"],\"ratios\":[\"16:9\",\"9:16\",\"1:1\",\"4:3\",\"3:4\"],\"resolutions\":[\"720p\"],\"durations\":[\"30s\"],\"max_reference_images\":10,\"max_reference_media\":10,\"supports_audio_output\":true,\"reference_mode\":\"asset\"}]'::jsonb,\n" +
+		"    updated_at = NOW()\n" +
+		"WHERE id = 'video.dola-seedance-2.5.dola';\n",
 }
