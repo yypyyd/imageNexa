@@ -1635,4 +1635,11 @@ var migrationSources = map[string]string{
 		"SET capabilities = '[{\"operations\":[\"generation\"],\"ratios\":[\"16:9\",\"9:16\",\"1:1\",\"4:3\",\"3:4\"],\"resolutions\":[\"720p\"],\"durations\":[\"30s\"],\"max_reference_images\":10,\"max_reference_media\":10,\"supports_audio_output\":true,\"reference_mode\":\"asset\"}]'::jsonb,\n" +
 		"    updated_at = NOW()\n" +
 		"WHERE id = 'video.dola-seedance-2.5.dola';\n",
+	"000024_dola_seedance25_official_ratios.sql": "-- Align Dola Seedance 2.5 ratios with the live www.dola.com video panel.\n" +
+		"-- /samantha/skill/pack skill_type=17 lists 1:1, 3:4, 4:3, 9:16, 16:9, 21:9.\n" +
+		"-- Duration stays 30s (website picker is still 5s/10s; 30s is our extension).\n" +
+		"UPDATE model_routes\n" +
+		"SET capabilities = '[{\"operations\":[\"generation\"],\"ratios\":[\"1:1\",\"3:4\",\"4:3\",\"9:16\",\"16:9\",\"21:9\"],\"resolutions\":[\"720p\"],\"durations\":[\"30s\"],\"max_reference_images\":10,\"max_reference_media\":10,\"supports_audio_output\":true,\"reference_mode\":\"asset\"}]'::jsonb,\n" +
+		"    updated_at = NOW()\n" +
+		"WHERE id = 'video.dola-seedance-2.5.dola';\n",
 }

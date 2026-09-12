@@ -268,8 +268,8 @@ func secondsRange(first, last int) []string {
 func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 	commonImageRatios := []string{"1:1", "16:9", "9:16", "4:3", "3:4"}
 	adobeWideRatios := []string{"1:1", "5:4", "9:16", "21:9", "16:9", "4:3", "3:2", "4:5", "3:4", "2:3"}
-	// Dola's web picker exposes a fixed ratio set on the video panel.
-	dolaRatios := []string{"16:9", "9:16", "1:1", "4:3", "3:4"}
+	// Official Dola /samantha/skill/pack video_generation.ratio options.
+	dolaRatios := []string{"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
 	return []CanonicalModelDefinition{
 		{Model: LogicalModel{ID: "gpt-5-5-mini", Kind: "text", Name: "GPT-5.5 Mini", Enabled: true}, Routes: []ModelRoute{
 			route("text.gpt-5-5-mini.chatgpt", "gpt-5-5-mini", "chatgpt", "gpt-5-5-mini", "gpt-5-5-mini", 100, textProfile()),

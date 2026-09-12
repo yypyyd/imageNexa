@@ -2559,6 +2559,8 @@ func sizeFromRatioRes(ratio, resolution string) string {
 	}
 	w, h := long, long
 	switch strings.TrimSpace(ratio) {
+	case "21:9":
+		w, h = long, long*9/21
 	case "16:9":
 		w, h = long, long*9/16
 	case "9:16":

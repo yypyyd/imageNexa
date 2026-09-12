@@ -443,7 +443,7 @@ Release verification should cover:
 
 ### 2026-09-10 — Dola 视频协议与账号调度
 
-Dola 使用 `seedance_v2.5`，提供 30 秒、720p 文生视频，以及最多 10 张参考图的图生视频。公共模型 `dola-seedance-2.5` 仅路由到 Dola，原通用 Seedance 2.5 路由保留兼容；两者共享账号日期额度桶。迁移 000019 保留账号绑定的 enabled、entitled、cooldown，不重置额度。参考视频和音频仍不对外发布。
+Dola 使用 `seedance_v2.5`，提供 30 秒、720p 文生视频，以及最多 10 张参考图的图生视频。比例与官网视频菜单一致：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`、`21:9`。公共模型 `dola-seedance-2.5` 仅路由到 Dola，原通用 Seedance 2.5 路由保留兼容；两者共享账号日期额度桶。迁移 000019 保留账号绑定的 enabled、entitled、cooldown，不重置额度。参考视频和音频仍不对外发布。
 
 每个账号同时处理一个请求，每天最多两次，每次预占 1 generation；多个账号可以并行处理请求。UTC 00:00（北京时间 08:00）是本地记账边界，尚不代表已验证的上游重置时间。首次建桶使用 ON CONFLICT DO NOTHING，扣次使用 SELECT FOR UPDATE；结算始终指向预占时的日期桶，避免跨日退款增加新一天额度。网页或独立脚本消耗的次数需单独校准。
 
@@ -528,3 +528,11 @@ Dola 的发布验证重点包括请求结构、时长限制、导入识别、就
 **Reason**: The official Dola video panel accepts up to ten reference images. The public route previously advertised text-to-video only because the protocol path rejected attachments, so clients sending `input_reference` received `unsupported parameters`.
 
 **Impact**: `POST /v1/videos` with one to ten `input_reference` images matches the Dola route. Text-only 30s/720p requests are unchanged. More than ten images, or any reference video/audio, still fail capability matching.
+
+### 2026-09-12 — Dola Seedance 2.5 official ratios
+
+**Change**: `dola-seedance-2.5` now advertises the six ratios returned by Dola's live `/samantha/skill/pack` video panel (`1:1`, `3:4`, `4:3`, `9:16`, `16:9`, `21:9`). Migration 000024 updates the live route. `size` mapping also recognizes `21:9` so ultrawide `WxH` is not collapsed to `16:9`.
+
+**Reason**: The previous five-ratio list was copied from an older web-picker comment and omitted `21:9`, which the official Dola video menu currently lists.
+
+**Impact**: Clients can send `21:9` (for example `size: 1680x720` at 720p). Duration remains 30s only; the website picker is still 5s/10s. Resolution stays 720p.
