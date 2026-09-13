@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '../components/Icon.vue'
 import Logo from '../components/Logo.vue'
@@ -9,76 +9,87 @@ import { isDark, toggleTheme } from '../theme'
 const route = useRoute()
 const router = useRouter()
 const mobileOpen = ref(false)
+const userOpen = ref(false)
+const userWrap = ref(null)
 const currentLabel = computed(() => route.meta?.label || '')
 const adminName = computed(() => auth.admin?.username || auth.admin?.name || auth.admin?.email || '超级管理员')
+const adminInitial = computed(() => String(adminName.value || '管').trim().slice(0, 1).toUpperCase())
 
 const tabs = [
   { label: '概览', to: '/admin/overview', icon: 'overview' },
   { label: '模型', to: '/admin/models', icon: 'models' },
   { label: '账号', to: '/admin/accounts', icon: 'plug' },
-  { label: 'API Key', to: '/admin/api-keys', icon: 'shield' },
+  { label: 'API 密钥', to: '/admin/api-keys', icon: 'shield' },
   { label: '日志 / 成品', to: '/admin/logs', icon: 'files' },
   { label: '违禁词', to: '/admin/banned-words', icon: 'ban' },
   { label: '系统设置', to: '/admin/settings', icon: 'config' },
   { label: 'API 文档', to: '/admin/docs', icon: 'book' },
 ]
 
+function onDocClick(event) {
+  if (!userWrap.value?.contains(event.target)) userOpen.value = false
+}
+
+onMounted(() => document.addEventListener('click', onDocClick))
+onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
+
 async function signOut() {
+  userOpen.value = false
   await logout()
   await router.replace('/login')
 }
 </script>
 
 <template>
-  <div class="theme-x h-screen flex bg-[var(--app-bg)] text-[color:var(--fg-2)] overflow-hidden">
-    <div v-if="mobileOpen" class="fixed inset-0 z-30 bg-black/50 md:hidden" @click="mobileOpen = false"></div>
-    <aside class="fixed md:static inset-y-0 left-0 z-40 w-64 shrink-0 border-r border-[color:var(--hairline)] bg-[var(--surface)] backdrop-blur-xl flex flex-col transition-transform md:translate-x-0"
-           :class="mobileOpen ? 'translate-x-0' : '-translate-x-full'">
-      <router-link to="/admin/overview" class="h-16 flex items-center gap-3 px-5 border-b border-[color:var(--hairline)]" @click="mobileOpen = false">
-        <Logo :size="34" class="rounded-xl shadow-lg shadow-violet-500/20 ring-1 ring-white/10" />
-        <div class="leading-tight">
-          <div class="text-sm font-semibold tracking-tight text-[color:var(--fg)]">2API</div>
-          <div class="text-[10px] uppercase tracking-[0.18em] text-[color:var(--fg-3)]">Control plane</div>
-        </div>
+  <div class="shell">
+    <div v-if="mobileOpen" class="scrim md:hidden" @click="mobileOpen = false"></div>
+    <aside class="sider" :class="mobileOpen && 'open'">
+      <router-link to="/admin/overview" class="brand" @click="mobileOpen = false">
+        <Logo :size="28" />
+        <span>2API</span>
       </router-link>
-
-      <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-        <router-link v-for="tab in tabs" :key="tab.to" :to="tab.to" class="admin-link group" active-class="active" @click="mobileOpen = false">
-          <span class="active-bar"></span>
-          <Icon :name="tab.icon" class="w-4 h-4 shrink-0 opacity-70 group-hover:opacity-100" />
-          <span class="text-sm">{{ tab.label }}</span>
+      <nav class="menu">
+        <router-link
+          v-for="tab in tabs"
+          :key="tab.to"
+          :to="tab.to"
+          class="item"
+          active-class="active"
+          @click="mobileOpen = false"
+        >
+          <Icon :name="tab.icon" class="item-icon" />
+          <span>{{ tab.label }}</span>
         </router-link>
       </nav>
-
-      <div class="p-3 border-t border-[color:var(--hairline)] space-y-1">
-        <div class="px-3 py-2 mb-1 min-w-0">
-          <div class="text-[10px] uppercase tracking-wider text-[color:var(--fg-faint)]">当前管理员</div>
-          <div class="mt-1 text-xs font-medium text-[color:var(--fg)] truncate" :title="adminName">{{ adminName }}</div>
-        </div>
-        <button type="button" class="bottom-action" @click="toggleTheme">
-          <Icon :name="isDark ? 'spark' : 'overview'" class="w-3.5 h-3.5" />
-          {{ isDark ? '亮色模式' : '暗色模式' }}
-        </button>
-        <button type="button" class="bottom-action text-rose-400" @click="signOut">
-          <Icon name="open" class="w-3.5 h-3.5 rotate-180" />
-          退出登录
-        </button>
-      </div>
     </aside>
 
-    <div class="flex-1 min-w-0 flex flex-col relative">
-      <div aria-hidden="true" class="pointer-events-none absolute inset-0 overflow-hidden">
-        <div class="absolute -top-40 left-1/3 w-[40rem] h-[40rem] rounded-full bg-violet-500/[0.09] blur-[110px]"></div>
-        <div class="absolute top-1/2 -right-40 w-[36rem] h-[36rem] rounded-full bg-cyan-500/[0.07] blur-[110px]"></div>
-      </div>
-      <header class="relative z-10 h-14 shrink-0 border-b border-[color:var(--hairline)] bg-[var(--app-bg)]/70 backdrop-blur-md flex items-center px-4 md:px-8">
-        <button class="mr-3 md:hidden" @click="mobileOpen = true"><Icon name="models" class="w-5 h-5" /></button>
-        <div class="text-[10px] uppercase tracking-[0.25em] text-[color:var(--fg-3)] font-medium mr-3">2API</div>
-        <div class="text-[color:var(--fg-faint)] mr-3">/</div>
-        <h1 class="text-sm font-semibold tracking-tight text-[color:var(--fg)]">{{ currentLabel }}</h1>
+    <div class="main">
+      <header class="header">
+        <button type="button" class="ghost menu-btn" aria-label="打开菜单" @click="mobileOpen = true">
+          <Icon name="menu" class="w-5 h-5" />
+        </button>
+        <h1>{{ currentLabel }}</h1>
+        <div class="header-right">
+          <button type="button" class="ghost" :title="isDark ? '切换到亮色' : '切换到暗色'" @click="toggleTheme">
+            <Icon :name="isDark ? 'sun' : 'moon'" class="w-4 h-4" />
+          </button>
+          <div ref="userWrap" class="user">
+            <button type="button" class="user-btn" @click="userOpen = !userOpen">
+              <span class="avatar">{{ adminInitial }}</span>
+              <span class="user-name">{{ adminName }}</span>
+              <Icon name="chevron" class="chevron" :class="userOpen && 'up'" />
+            </button>
+            <div v-if="userOpen" class="dropdown">
+              <button type="button" @click="signOut">
+                <Icon name="logout" class="w-3.5 h-3.5" />
+                退出登录
+              </button>
+            </div>
+          </div>
+        </div>
       </header>
-      <main class="theme-text flex-1 overflow-y-auto relative z-10">
-        <div class="px-4 py-5 md:px-8 md:py-7 max-w-[1600px] mx-auto">
+      <main class="theme-text content">
+        <div class="content-inner">
           <router-view />
         </div>
       </main>
@@ -87,10 +98,84 @@ async function signOut() {
 </template>
 
 <style scoped>
-.admin-link { position: relative; display: flex; align-items: center; gap: .75rem; padding: .58rem .875rem; border-radius: .625rem; color: var(--fg-2); font-weight: 500; transition: background .15s, color .15s; }
-.admin-link:hover, .admin-link.active { background: var(--hover); color: var(--fg); }
-.active-bar { position: absolute; left: 0; top: 50%; width: 3px; height: 1.25rem; border-radius: 0 999px 999px 0; transform: translateY(-50%); opacity: 0; background: linear-gradient(180deg,#f0abfc,#8b5cf6); }
-.admin-link.active .active-bar { opacity: 1; }
-.bottom-action { width: 100%; display: flex; align-items: center; gap: .625rem; border-radius: .5rem; padding: .5rem .75rem; font-size: .75rem; transition: background .15s; }
-.bottom-action:hover { background: var(--hover); color: var(--fg); }
+.shell { display: flex; height: 100vh; overflow: hidden; background: var(--app-bg); color: var(--fg-2); }
+.scrim { position: fixed; inset: 0; z-index: 30; background: rgb(0 0 0 / .45); }
+.sider {
+  position: fixed; inset: 0 auto 0 0; z-index: 40; width: 208px;
+  display: flex; flex-direction: column;
+  background: var(--sider-bg);
+  transform: translateX(-100%);
+  transition: transform .2s ease;
+}
+.sider.open { transform: translateX(0); }
+@media (min-width: 768px) {
+  .sider { position: static; transform: none; }
+}
+.brand {
+  height: 56px; flex: none;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 20px;
+  color: #fff; font-size: 16px; font-weight: 600;
+}
+.brand :deep(svg) { border-radius: 6px; }
+.menu { flex: 1; overflow: auto; padding: 8px; }
+.item {
+  display: flex; align-items: center; gap: 10px;
+  height: 40px; padding: 0 14px; margin-bottom: 4px;
+  border-radius: 6px;
+  color: var(--sider-fg); font-size: 14px;
+}
+.item:hover { color: #fff; background: var(--sider-hover); }
+.item.active { color: #fff; background: var(--sider-active); }
+.item-icon { width: 16px; height: 16px; flex: none; }
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.header {
+  height: 56px; flex: none;
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 20px;
+  background: var(--header-bg);
+  box-shadow: 0 1px 4px rgb(0 21 41 / .08);
+}
+.header h1 { margin: 0; flex: 1; font-size: 16px; font-weight: 600; color: var(--fg); }
+.header-right { display: flex; align-items: center; gap: 4px; }
+.ghost {
+  width: 36px; height: 36px; border-radius: 6px;
+  display: grid; place-items: center; color: var(--fg-2);
+}
+.ghost:hover { background: var(--hover); color: var(--fg); }
+.ghost.menu-btn { display: none; }
+@media (max-width: 767px) { .ghost.menu-btn { display: grid; } }
+.user { position: relative; }
+.user-btn {
+  display: flex; align-items: center; gap: 8px;
+  height: 36px; padding: 0 8px 0 4px; border-radius: 6px;
+  color: var(--fg);
+}
+.user-btn:hover { background: var(--hover); }
+.avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: grid; place-items: center;
+  font-size: 12px; font-weight: 600; color: #fff;
+  background: var(--accent);
+}
+.user-name { max-width: 8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.chevron { width: 14px; height: 14px; color: var(--fg-3); transition: transform .15s; }
+.chevron.up { transform: rotate(180deg); }
+.dropdown {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+  min-width: 148px; padding: 6px;
+  background: var(--menu-bg); color: var(--fg);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / .12);
+}
+.dropdown button {
+  width: 100%; display: flex; align-items: center; gap: 8px;
+  height: 36px; padding: 0 10px; border-radius: 6px;
+  font-size: 14px; color: var(--fg-2);
+}
+.dropdown button:hover { background: var(--hover); color: var(--fg); }
+.content { flex: 1; overflow: auto; }
+.content-inner { max-width: 1600px; margin: 0 auto; padding: 20px; }
+@media (min-width: 768px) { .content-inner { padding: 24px; } }
 </style>

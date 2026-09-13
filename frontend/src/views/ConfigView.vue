@@ -35,8 +35,8 @@ const PROXY_INHERIT_DEFAULT = new Set(['chatgpt', 'grok', 'dola'])
 
 const visibleProviders = computed(() => Object.keys(providers).filter((pool) => ACCOUNT_PROVIDERS.includes(pool)).sort())
 const proxyProviders = computed(() => PROXY_PROVIDER_ORDER.filter((pool) => ACCOUNT_PROVIDERS.includes(pool)))
-const hasChannelOverrides = computed(() =>
-  proxyProviders.value.some((pool) => (settings.provider_extract_apis[pool] || '').trim())
+const overridePools = computed(() =>
+  proxyProviders.value.filter((pool) => (settings.provider_extract_apis[pool] || '').trim())
 )
 const showChannelProxies = ref(false)
 
@@ -67,7 +67,6 @@ function applySettings(data) {
     for (const key of Object.keys(providers)) delete providers[key]
     Object.assign(providers, enabled)
   }
-  if (hasChannelOverrides.value) showChannelProxies.value = true
 }
 
 async function load() {
@@ -173,10 +172,14 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
         <label class="block"><span class="label">默认提取 API</span><input v-model="settings.outbound_extract_api" class="field mt-1.5 font-mono text-xs" placeholder="http://host:port/gen?zone=…&count=64" /><span class="hint">链接里的 count 只是上限，单次最多领 64 条。</span></label>
         <label class="block"><span class="label">回退出站网关</span><input v-model="settings.outbound_proxy" class="field mt-1.5 font-mono text-xs" placeholder="http://user:pass@host:port（可选）" /><span class="hint">提取失败时用。Adobe / BytePlus 不走这项。</span></label>
         <div>
-          <button type="button" class="linkish" @click="showChannelProxies = !showChannelProxies">
-            {{ showChannelProxies ? '收起各渠道出口' : '填写各渠道单独出口（可选）' }}
-            <span v-if="hasChannelOverrides && !showChannelProxies" class="dot">已有覆盖</span>
-          </button>
+          <div class="flex flex-wrap items-center gap-2">
+            <button type="button" class="linkish" @click="showChannelProxies = !showChannelProxies">
+              {{ showChannelProxies ? '收起各渠道出口' : '各渠道单独出口' }}
+            </button>
+            <span v-if="!showChannelProxies && overridePools.length" class="chip-row">
+              <span v-for="pool in overridePools" :key="pool" class="chip">{{ providerLabel(pool) }} 已单独指定</span>
+            </span>
+          </div>
           <div v-if="showChannelProxies" class="channel-grid">
             <label v-for="pool in proxyProviders" :key="pool" class="block">
               <span class="label">{{ providerLabel(pool) }}</span>
@@ -216,7 +219,8 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
 .hint code { color: var(--fg-2); }
 .linkish { display: inline-flex; align-items: center; gap: .45rem; font-size: .72rem; font-weight: 600; color: var(--fg-2); }
 .linkish:hover { color: var(--fg); }
-.dot { font-size: .62rem; font-weight: 500; color: rgb(180 83 9); }
+.chip-row { display: inline-flex; flex-wrap: wrap; gap: .35rem; }
+.chip { font-size: .62rem; font-weight: 500; border-radius: 999px; padding: .18rem .55rem; color: rgb(180 83 9); background: rgb(245 158 11 / .12); }
 .channel-grid { display: grid; gap: .85rem; margin-top: .9rem; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); }
 .badge-off { flex: none; font-size: .62rem; border-radius: 999px; padding: .2rem .55rem; color: rgb(190 18 60); background: rgb(244 63 94 / .1); }
 .provider-grid { display: grid; gap: .5rem; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); }
