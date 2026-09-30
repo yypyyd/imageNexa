@@ -155,9 +155,10 @@ onMounted(() => { loadCredentials(); load() })
 <template>
   <section class="space-y-4">
     <div class="flex items-start justify-between gap-4">
-      <div>
-        <h2 class="text-xl font-semibold text-white/90">日志与成品</h2>
-        <p class="mt-1 text-xs text-white/40">按 API Key 归属追踪请求，并查看图片、视频等历史成品。</p>
+      <div class="page-head">
+        <p class="kicker">LOGS / 05</p>
+        <h2 class="page-title">日志与成品</h2>
+        <p class="page-sub">按 API Key 归属追踪请求，并查看图片、视频等历史成品。</p>
       </div>
       <button class="btn-soft" @click="load"><Icon name="refresh" class="w-3.5 h-3.5" />刷新</button>
     </div>

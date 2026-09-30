@@ -2,7 +2,7 @@
 // Administrator session credentials remain in an HttpOnly cookie.
 import { ref } from 'vue'
 
-const KEY = '2api_theme'
+const KEY = 'nexa_theme'
 const mql = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null
 
 function systemTheme() {

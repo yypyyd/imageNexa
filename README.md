@@ -22,6 +22,8 @@
 - 模型目录是闭集。下游不能自行创建模型 ID。
 - 同一产品若有多个渠道，各自使用带渠道前缀的公开 ID；ChatGPT 的 GPT Image 2 使用未加前缀的 `gpt-image-2`。
 
+ChatGPT 账号使用导入的 access token。管理端的“刷新额度”只更新可用次数，不会续期 token；JWT 到期后账号会退出调度，需重新导入有效 token。
+
 ## 鉴权
 
 所有 `/v1` 请求都使用标准 OpenAI Bearer 头：

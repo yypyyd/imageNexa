@@ -621,7 +621,7 @@ func (s *V1Service) ListModels(ctx context.Context, extended bool) ([]map[string
 }
 
 func v1LogicalModelEntry(item model.LogicalModel, routes []model.ModelRoute, created int64, extended bool) map[string]any {
-	entry := map[string]any{"id": item.ID, "object": "model", "created": created, "owned_by": "2api", "shutdown_date": nil}
+	entry := map[string]any{"id": item.ID, "object": "model", "created": created, "owned_by": "nexa", "shutdown_date": nil}
 	if !extended {
 		return entry
 	}

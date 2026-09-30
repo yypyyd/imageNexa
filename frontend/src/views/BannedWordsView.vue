@@ -118,9 +118,10 @@ onMounted(load)
 
 <template>
   <section class="space-y-4">
-    <div>
-      <h2 class="text-xl font-semibold text-white/90">违禁词</h2>
-      <p class="mt-1 text-xs text-white/40">同时检查文本、图片和视频请求，命中记录按 API Key 归属。</p>
+    <div class="page-head">
+      <p class="kicker">BANNED WORDS / 06</p>
+      <h2 class="page-title">违禁词</h2>
+      <p class="page-sub">同时检查文本、图片和视频请求，命中记录按 API Key 归属。</p>
     </div>
 
     <div class="card p-3 flex flex-wrap gap-2 items-center">

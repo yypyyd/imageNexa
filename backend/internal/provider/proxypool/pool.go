@@ -33,7 +33,7 @@ type pool struct {
 	ttl     time.Duration
 	mu      sync.Mutex
 	leases  map[string]lease
-	free    []string
+	free    []lease
 	flight  singleflight.Group
 }
 
@@ -183,13 +183,20 @@ func (p *pool) takeFree(accountID string) (string, bool) {
 		p.mu.Unlock()
 		return url, true
 	}
+	// Extract APIs lease endpoints for a bounded lifetime. Keep that deadline
+	// while an endpoint waits in the free queue; assigning it later must never
+	// grant a fresh TTL to an already-expired residential exit.
+	now := time.Now()
+	for len(p.free) > 0 && (p.free[0].url == "" || !now.Before(p.free[0].expiresAt)) {
+		p.free = p.free[1:]
+	}
 	if len(p.free) == 0 {
 		p.mu.Unlock()
 		return "", false
 	}
 	next := p.free[0]
-	p.free = append([]string(nil), p.free[1:]...)
-	p.leases[accountID] = lease{url: next, expiresAt: time.Now().Add(p.ttl)}
+	p.free = append([]lease(nil), p.free[1:]...)
+	p.leases[accountID] = next
 	low := len(p.free) < 4
 	p.mu.Unlock()
 	if low {
@@ -199,7 +206,7 @@ func (p *pool) takeFree(accountID string) (string, bool) {
 			p.refill(bg, minBatch)
 		}()
 	}
-	return next, true
+	return next.url, true
 }
 
 func (p *pool) drop(accountID string) {
@@ -222,15 +229,19 @@ func (p *pool) refill(ctx context.Context, needed int) {
 		for _, item := range p.leases {
 			used[item.url] = true
 		}
+		now := time.Now()
 		for _, item := range p.free {
-			used[item] = true
+			if item.url != "" && now.Before(item.expiresAt) {
+				used[item.url] = true
+			}
 		}
+		expiresAt := now.Add(p.ttl)
 		for _, next := range urls {
 			if next == "" || used[next] {
 				continue
 			}
 			used[next] = true
-			p.free = append(p.free, next)
+			p.free = append(p.free, lease{url: next, expiresAt: expiresAt})
 		}
 		return nil, nil
 	})

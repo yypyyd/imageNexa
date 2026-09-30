@@ -292,9 +292,10 @@ onUnmounted(() => clearInterval(readinessTimer))
 <template>
   <section class="space-y-4">
     <div class="flex items-start justify-between gap-4">
-      <div>
-        <h2 class="text-xl font-semibold text-white/90">上游账号调度</h2>
-        <p class="mt-1 text-xs text-white/40">账号按真实额度桶调度；每次生成都会刷新额度。</p>
+      <div class="page-head">
+        <p class="kicker">ACCOUNTS / 03</p>
+        <h2 class="page-title">上游账号调度</h2>
+        <p class="page-sub">账号按真实额度桶调度；额度会更新。ChatGPT access token 到期后需重新导入。</p>
       </div>
       <div class="flex items-center gap-2">
         <button v-if="selected.size" class="btn-soft danger" :disabled="busy === 'delete-selected'" @click="removeSelected"><Icon name="trash" class="w-3.5 h-3.5" />删除选中 ({{ selected.size }})</button>
@@ -360,14 +361,14 @@ onUnmounted(() => clearInterval(readinessTimer))
               <input type="number" min="-1000" max="1000" class="compact-input" :value="account.weight ?? 0" title="调度权重，高的优先" @change="patchAccount(account,{weight:Number($event.target.value)},'weight')" />
             </td>
             <td class="status-cell">
-              <span class="status" :class="`status-${account.status}`">{{ statusLabel(account.status) }}</span>
+              <span class="status" :class="`status-${account.status}`">{{ account.dead ? '凭据失效' : statusLabel(account.status) }}</span>
               <div v-if="account.provider === 'dola'" class="dola-ready" :class="account.readiness === 'ready' ? 'ok' : 'warn'" :title="account.readiness_detail">{{ dolaReadinessLabel(account) }}</div>
               <div v-if="account.image_limited || account.video_limited" class="limit-flags"><span v-if="account.image_limited">图片限额</span><span v-if="account.video_limited">视频限额</span></div>
             </td>
             <td>
               <div class="row-actions">
                 <button class="icon-btn test-action" title="账号能力测试" @click="testingAccount = account"><Icon name="test" class="w-3.5 h-3.5" /></button>
-                <button class="icon-btn" :title="account.provider === 'dola' ? '重新验证协议会话（不生成视频）' : '校验账号并刷新真实额度'" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
+                <button class="icon-btn" :title="account.provider === 'dola' ? '重新验证协议会话（不生成视频）' : account.provider === 'chatgpt' ? '刷新额度，不会续期 access token' : '校验账号并刷新真实额度'" :disabled="busy === `${account.id}:quota`" @click="refreshQuota(account)"><Icon name="refresh" class="w-3.5 h-3.5" /></button>
                 <button class="switch" :class="(account.provider === 'dola' ? account.status !== 'disabled' : account.status === 'active') && 'on'" :disabled="account.provider !== 'dola' && !['active','disabled'].includes(account.status)" :title="account.status === 'disabled' ? '启用账号' : (account.provider === 'dola' || account.status === 'active' ? '停用账号' : `${statusLabel(account.status)}状态不可手动切换`)" @click="toggleAccount(account)"><span></span></button>
                 <button class="icon-btn danger" title="删除账号" @click="removeAccount(account)"><Icon name="trash" class="w-3.5 h-3.5" /></button>
               </div>

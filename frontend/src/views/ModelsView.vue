@@ -99,9 +99,10 @@ onMounted(load)
 <template>
   <section class="space-y-4">
     <div class="flex items-start justify-between gap-4">
-      <div>
-        <h2 class="text-xl font-semibold text-white/90">模型与渠道</h2>
-        <p class="mt-1 text-xs text-white/40">同一产品按渠道拆成独立公开 ID；下游选择模型即选择渠道，不再跨 Provider 合并调度。</p>
+      <div class="page-head">
+        <p class="kicker">MODELS / 02</p>
+        <h2 class="page-title">模型与渠道</h2>
+        <p class="page-sub">同一产品按渠道拆成独立公开 ID；下游选择模型即选择渠道，不再跨 Provider 合并调度。</p>
       </div>
       <button class="btn-soft" :disabled="loading" @click="load"><Icon name="refresh" class="w-3.5 h-3.5" />刷新</button>
     </div>

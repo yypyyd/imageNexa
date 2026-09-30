@@ -262,6 +262,10 @@ The SPA contains only the administrator views: overview, models, accounts, API K
 
 Settings expose one enable switch per provider pool (`provider.<pool>.enabled`, surfaced as `providers_enabled` in the settings API). A pool is enabled unless the administrator stores an explicit false-like value, so existing deployments keep every pool schedulable. The switch is enforced at the single route-matching chokepoint used by text, image, video dispatch and the preflight availability probe: routes whose provider is switched off are removed before any account is read, reserved, or contacted. Routes, account bindings, and account state are left untouched, so re-enabling a pool restores it immediately. When capability matching finds routes but every one of them belongs to a disabled pool, the request fails with `provider_disabled` rather than being misreported as unsupported parameters or spending upstream retries.
 
+The settings page also displays each channel's extract API and static proxy URL from `provider_extract_apis` and `provider_proxies`. Both values round-trip through the administrator settings API. The `deai_enabled` boolean controls the `deai.enabled` image-processing flag; absent values default to off.
+
+ChatGPT account imports store an access-token JWT, not a refresh credential. Quota refresh reads remaining image allowance but cannot renew that JWT. Imports reject a JWT whose `exp` is already past, and the maintenance sweep marks previously imported expired ChatGPT JWTs disabled/dead before scheduling. The sweep compares the stored token in its update so a concurrent reimport cannot be disabled by an older scan. The accounts page labels dead credentials clearly and explains that ChatGPT token renewal requires reimport.
+
 ## 10. Data-plane security boundaries
 
 - `/v1` CORS may accept browser origins but never permits credentials; Bearer authentication is still mandatory.

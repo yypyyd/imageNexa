@@ -46,9 +46,10 @@ async function copy(name) {
 
 <template>
   <section class="space-y-6">
-    <div>
-      <h2 class="text-xl font-semibold text-white/90">2API 接入文档</h2>
-      <p class="mt-1 text-xs text-white/40">文本、图片和视频统一使用 OpenAI Bearer 鉴权。多渠道产品使用带渠道前缀的 canonical 模型 ID。</p>
+    <div class="page-head">
+      <p class="kicker">DOCS / 08</p>
+      <h2 class="page-title">Nexa 接入文档</h2>
+      <p class="page-sub">文本、图片和视频统一使用 OpenAI Bearer 鉴权。多渠道产品使用带渠道前缀的 canonical 模型 ID。</p>
     </div>
 
     <div class="callout">
@@ -62,7 +63,7 @@ async function copy(name) {
 
     <article id="models" class="doc-section">
       <div class="doc-title"><span class="get">GET</span><code>/v1/models</code></div>
-      <p class="doc-text">只返回下表 {{ TEXT_MODELS.length + IMAGE_MODELS.length + VIDEO_MODELS.length }} 个闭集 ID，<code>owned_by</code> 固定为 <code>2api</code>。默认返回严格 OpenAI 模型对象；需要比例、分辨率等 2API 能力字段时显式使用 <code>?extended=true</code>。同一产品若有多个渠道，公开 ID 带渠道前缀（例如 <code>gpt-image-2</code> 与 <code>byteplus-gpt-image-2</code>）。内部 route 和上游模型 ID 不能作为请求的 <code>model</code> 值。</p>
+      <p class="doc-text">只返回下表 {{ TEXT_MODELS.length + IMAGE_MODELS.length + VIDEO_MODELS.length }} 个闭集 ID，<code>owned_by</code> 固定为 <code>nexa</code>。默认返回严格 OpenAI 模型对象；需要比例、分辨率等 Nexa 能力字段时显式使用 <code>?extended=true</code>。同一产品若有多个渠道，公开 ID 带渠道前缀（例如 <code>gpt-image-2</code> 与 <code>byteplus-gpt-image-2</code>）。内部 route 和上游模型 ID 不能作为请求的 <code>model</code> 值。</p>
       <div class="grid lg:grid-cols-3 gap-3">
         <div class="model-group"><h4>文本 · {{ TEXT_MODELS.length }}</h4><code v-for="id in TEXT_MODELS" :key="id">{{ id }}</code></div>
         <div class="model-group"><h4>图片 · {{ IMAGE_MODELS.length }}</h4><code v-for="id in IMAGE_MODELS" :key="id">{{ id }}</code></div>
@@ -105,7 +106,7 @@ async function copy(name) {
     </article>
 
     <div class="callout text-[11px] text-white/45">
-      <Icon name="info" class="w-4 h-4 shrink-0 text-amber-300" /><p><code>Idempotency-Key</code> 在同一 API Key 下隔离。一旦上游已受理或提交结果未知，2API 不会换号、换 route 或重提。图片请求未提供时会在响应的 <code>Idempotency-Key</code> / <code>Location</code> 头返回本次生成的恢复句柄；跨重试去重仍应由客户端主动复用稳定的 Key。</p>
+      <Icon name="info" class="w-4 h-4 shrink-0 text-amber-300" /><p><code>Idempotency-Key</code> 在同一 API Key 下隔离。一旦上游已受理或提交结果未知，Nexa 不会换号、换 route 或重提。图片请求未提供时会在响应的 <code>Idempotency-Key</code> / <code>Location</code> 头返回本次生成的恢复句柄；跨重试去重仍应由客户端主动复用稳定的 Key。</p>
     </div>
   </section>
 </template>

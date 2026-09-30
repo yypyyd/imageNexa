@@ -111,9 +111,10 @@ onMounted(load)
 <template>
   <section class="space-y-4">
     <div class="flex items-start justify-between gap-4">
-      <div>
-        <h2 class="text-xl font-semibold text-white/90">服务 API Key</h2>
-        <p class="mt-1 text-xs text-white/40">下游统一使用 OpenAI 格式 <code>Authorization: Bearer sk-...</code>。</p>
+      <div class="page-head">
+        <p class="kicker">API KEYS / 04</p>
+        <h2 class="page-title">服务 API Key</h2>
+        <p class="page-sub">下游统一使用 OpenAI 格式 <code>Authorization: Bearer sk-...</code>。</p>
       </div>
       <button class="btn-primary" @click="creating = true"><Icon name="plus" class="w-3.5 h-3.5" />创建 Key</button>
     </div>

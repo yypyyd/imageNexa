@@ -177,6 +177,11 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	}
 
 	if m.tokenSvc != nil {
+		if n, err := m.tokenSvc.ExpireChatGPTTokens(ctx); err != nil {
+			log.Printf("maintenance: expire_chatgpt failed")
+		} else if n > 0 {
+			log.Printf("maintenance: expired %d chatgpt token(s)", n)
+		}
 		// 1c. Re-sync Grok accounts through the authenticated credits endpoint.
 		//     It also provides liveness; subscription tier is not a video
 		//     entitlement signal and is intentionally not probed here.

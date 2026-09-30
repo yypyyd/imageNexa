@@ -16,6 +16,7 @@ const settings = reactive({
   dola_session_api: '',
   provider_proxies: Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, ''])),
   provider_extract_apis: Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, ''])),
+  deai_enabled: false,
   logs_retention_days: 30,
   artifacts_retention_days: 30,
 })
@@ -36,9 +37,11 @@ const PROXY_INHERIT_DEFAULT = new Set(['chatgpt', 'grok', 'dola'])
 const visibleProviders = computed(() => Object.keys(providers).filter((pool) => ACCOUNT_PROVIDERS.includes(pool)).sort())
 const proxyProviders = computed(() => PROXY_PROVIDER_ORDER.filter((pool) => ACCOUNT_PROVIDERS.includes(pool)))
 const overridePools = computed(() =>
-  proxyProviders.value.filter((pool) => (settings.provider_extract_apis[pool] || '').trim())
+  proxyProviders.value.filter((pool) =>
+    (settings.provider_extract_apis[pool] || '').trim() || (settings.provider_proxies[pool] || '').trim()
+  )
 )
-const showChannelProxies = ref(false)
+const showChannelProxies = ref(true)
 
 function providerLabel(pool) {
   return PROVIDER_LABELS[pool] || pool[0].toUpperCase() + pool.slice(1)
@@ -87,6 +90,8 @@ async function save() {
     outbound_proxy: settings.outbound_proxy.trim(),
     outbound_extract_api: (settings.outbound_extract_api || '').trim(),
     provider_extract_apis: Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, (settings.provider_extract_apis[pool] || '').trim()])),
+    provider_proxies: Object.fromEntries(ACCOUNT_PROVIDERS.map((pool) => [pool, (settings.provider_proxies[pool] || '').trim()])),
+    deai_enabled: settings.deai_enabled,
     logs_retention_days: Math.max(1, Number(settings.logs_retention_days) || 30),
     artifacts_retention_days: Math.max(1, Number(settings.artifacts_retention_days) || 30),
     providers_enabled: { ...providers },
@@ -129,9 +134,10 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
 <template>
   <section class="space-y-5">
     <div class="flex justify-between items-start gap-4">
-      <div>
+      <div class="page-head">
+        <p class="kicker">SETTINGS / 07</p>
         <h2 class="page-title">系统设置</h2>
-        <p class="page-sub">对外地址、号池开关、上游出口和日志保留。</p>
+        <p class="page-sub">对外地址、号池开关、上游出口、图像处理和数据保留。</p>
       </div>
       <div class="flex flex-wrap items-center justify-end gap-2">
         <span class="health-pill" :class="healthClass(health.live)" :title="'/health/live'">存活 {{ healthText(health.live, '正常', '异常') }}</span>
@@ -167,7 +173,7 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
       <div class="card p-5 space-y-4">
         <div>
           <h3 class="section-heading">上游网络</h3>
-          <p class="section-desc">ChatGPT / Grok / Dola 共用默认提取 API，按账号粘性分配出口。Adobe / BytePlus 留空即直连。</p>
+          <p class="section-desc">ChatGPT / Grok / Dola 共用默认提取 API，按账号粘性分配出口；提取失败时使用固定代理。Adobe / BytePlus 留空即直连。</p>
         </div>
         <label class="block"><span class="label">默认提取 API</span><input v-model="settings.outbound_extract_api" class="field mt-1.5 font-mono text-xs" placeholder="http://host:port/gen?zone=…&count=64" /><span class="hint">链接里的 count 只是上限，单次最多领 64 条。</span></label>
         <label class="block"><span class="label">回退出站网关</span><input v-model="settings.outbound_proxy" class="field mt-1.5 font-mono text-xs" placeholder="http://user:pass@host:port（可选）" /><span class="hint">提取失败时用。Adobe / BytePlus 不走这项。</span></label>
@@ -181,12 +187,21 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
             </span>
           </div>
           <div v-if="showChannelProxies" class="channel-grid">
-            <label v-for="pool in proxyProviders" :key="pool" class="block">
-              <span class="label">{{ providerLabel(pool) }}</span>
-              <input v-model="settings.provider_extract_apis[pool]" class="field mt-1.5 font-mono text-xs" :placeholder="extractHint(pool)" />
-            </label>
+            <div v-for="pool in proxyProviders" :key="pool" class="channel-fields">
+              <h4 class="label">{{ providerLabel(pool) }}</h4>
+              <label class="block"><span class="hint">提取 API</span><input v-model="settings.provider_extract_apis[pool]" class="field mt-1.5 font-mono text-xs" :placeholder="extractHint(pool)" /></label>
+              <label class="block"><span class="hint">固定代理地址</span><input v-model="settings.provider_proxies[pool]" class="field mt-1.5 font-mono text-xs" :placeholder="PROXY_INHERIT_DEFAULT.has(pool) ? '留空则使用回退出站网关' : '留空为直连'" /></label>
+            </div>
           </div>
         </div>
+      </div>
+
+      <div class="card p-5 space-y-4">
+        <div><h3 class="section-heading">图像处理</h3><p class="section-desc">控制图像请求中的去AI特征处理；关闭时请求中的 deai 参数会被忽略。</p></div>
+        <label class="provider-row">
+          <span><strong>启用去AI特征</strong></span>
+          <button type="button" class="switch" :class="settings.deai_enabled && 'on'" :aria-label="settings.deai_enabled ? '关闭去AI特征' : '启用去AI特征'" :aria-pressed="settings.deai_enabled" @click="settings.deai_enabled = !settings.deai_enabled"><span></span></button>
+        </label>
       </div>
 
       <div class="card p-5 space-y-4">
@@ -201,15 +216,11 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
 </template>
 
 <style scoped>
-.page-title { font-size: 1.25rem; line-height: 1.75rem; font-weight: 600; color: var(--fg); }
-.page-sub { margin-top: .25rem; font-size: .75rem; color: var(--fg-3); }
-.notice { border-radius: .7rem; padding: .7rem .9rem; font-size: .72rem; color: rgb(190 18 60); background: rgb(244 63 94 / .09); }
-.health-pill { font-size: .66rem; border-radius: 999px; padding: .28rem .65rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); color: var(--fg-3); }
-.health-pill.ok { color: rgb(4 120 87); background: rgb(16 185 129 / .12); }
-.health-pill.bad { color: rgb(190 18 60); background: rgb(244 63 94 / .1); }
+.notice { border-radius: 12px; padding: .7rem .9rem; font-size: .72rem; color: rgb(190 24 42); background: rgb(220 38 38 / .07); }
+.health-pill { font-size: .68rem; border-radius: 999px; padding: .3rem .75rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); color: var(--fg-3); }
+.health-pill.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); box-shadow: none; }
+.health-pill.bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); box-shadow: none; }
 .health-pill.wait { color: var(--fg-3); }
-:global(html.dark) .health-pill.ok { color: rgb(110 231 183); }
-:global(html.dark) .health-pill.bad { color: rgb(253 164 175); }
 :global(html.dark) .notice { color: rgb(253 164 175); }
 :global(html.dark) .badge-off { color: rgb(253 164 175); }
 .section-heading { font-size: .85rem; font-weight: 600; color: var(--fg); }
@@ -222,6 +233,7 @@ onMounted(() => { load(); checkHealth('live'); checkHealth('ready') })
 .chip-row { display: inline-flex; flex-wrap: wrap; gap: .35rem; }
 .chip { font-size: .62rem; font-weight: 500; border-radius: 999px; padding: .18rem .55rem; color: rgb(180 83 9); background: rgb(245 158 11 / .12); }
 .channel-grid { display: grid; gap: .85rem; margin-top: .9rem; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); }
+.channel-fields { display: grid; gap: .5rem; padding: .8rem; border-radius: .65rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); }
 .badge-off { flex: none; font-size: .62rem; border-radius: 999px; padding: .2rem .55rem; color: rgb(190 18 60); background: rgb(244 63 94 / .1); }
 .provider-grid { display: grid; gap: .5rem; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); }
 .provider-row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .65rem .8rem; border-radius: .65rem; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hairline); cursor: pointer; transition: background .15s; }

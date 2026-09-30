@@ -115,6 +115,26 @@ func (r *TokenRepository) ListStalePending(ctx context.Context, pool string, old
 	return items, err
 }
 
+// ListChatGPTExpiryCandidates reads only credentials that could still enter
+// scheduling. Their JWT exp claim is separate from the quota reset marker.
+func (r *TokenRepository) ListChatGPTExpiryCandidates(ctx context.Context) ([]model.TokenAccount, error) {
+	var items []model.TokenAccount
+	err := r.db.WithContext(ctx).
+		Select("id", "value").
+		Where("pool = ? AND dead = ? AND status IN ?", "chatgpt", false, []string{"active", "quota", "pending"}).
+		Find(&items).Error
+	return items, err
+}
+
+// MarkChatGPTExpired cannot disable a credential that was reimported while the
+// expiry sweep was running. A fresh token changes value before this update.
+func (r *TokenRepository) MarkChatGPTExpired(ctx context.Context, id, expectedValue string) (bool, error) {
+	result := r.db.WithContext(ctx).Model(&model.TokenAccount{}).
+		Where("pool = ? AND id = ? AND value = ? AND dead = ? AND status IN ?", "chatgpt", id, expectedValue, false, []string{"active", "quota", "pending"}).
+		Updates(map[string]any{"status": "disabled", "dead": true, "updated_at": time.Now()})
+	return result.RowsAffected == 1, result.Error
+}
+
 // ListIdentityByIDs returns only id and pool for the requested accounts.
 // Callers that need a credential must Get or ListByIDs afterwards.
 func (r *TokenRepository) ListIdentityByIDs(ctx context.Context, ids []string) ([]model.TokenAccount, error) {

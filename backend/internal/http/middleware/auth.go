@@ -74,7 +74,7 @@ func RequireAPICredential(credentials *service.APICredentialService) gin.Handler
 		credential, err := credentials.AuthenticateBearer(c.Request.Context(), c.GetHeader("Authorization"))
 		if err != nil {
 			if errors.Is(err, service.ErrInvalidAPICredential) {
-				c.Header("WWW-Authenticate", `Bearer realm="2api"`)
+				c.Header("WWW-Authenticate", `Bearer realm="nexa"`)
 				writeOpenAIAuthError(c, http.StatusUnauthorized, "Incorrect API key provided.", "invalid_api_key")
 			} else {
 				writeOpenAIAuthError(c, http.StatusInternalServerError, "Authentication service unavailable.", "internal_error")

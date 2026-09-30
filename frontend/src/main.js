@@ -59,7 +59,7 @@ router.beforeEach(async (to) => {
 })
 
 router.afterEach((route) => {
-  document.title = route.meta?.label ? `2API · ${route.meta.label}` : '2API'
+  document.title = route.meta?.label ? `Nexa · ${route.meta.label}` : 'Nexa'
 })
 
 createApp(App).use(router).mount('#app')

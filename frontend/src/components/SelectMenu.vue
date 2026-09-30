@@ -100,7 +100,7 @@ onUnmounted(() => document.removeEventListener('mousedown', onDocClick))
                   i === active ? 'bg-[var(--hover)] text-[color:var(--fg)]' : 'text-[color:var(--fg-2)]',
                 ]">
           <span class="truncate">{{ o.label }}</span>
-          <Icon v-if="o.value === modelValue" name="check" class="w-4 h-4 shrink-0 text-violet-400" />
+          <Icon v-if="o.value === modelValue" name="check" class="w-4 h-4 shrink-0" style="color: var(--accent)" />
         </button>
         <div v-if="!options.length" class="px-3 py-2 text-xs text-[color:var(--fg-3)]">无选项</div>
       </div>

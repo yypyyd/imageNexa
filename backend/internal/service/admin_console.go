@@ -666,6 +666,9 @@ func (s *AdminConsoleService) UpdateAccount(ctx context.Context, accountID strin
 		if status != "active" && status != "disabled" {
 			return nil, errors.New("status must be active or disabled")
 		}
+		if status == "active" && account.Pool == "chatgpt" && chatGPTTokenExpired(account.Value, time.Now()) {
+			return nil, errors.New("chatgpt access token has expired")
+		}
 		updates["status"] = status
 		// Manual disablement is an operator scheduling choice, not proof that the
 		// credential is dead. Preserve the probe-derived dead flag when disabling;
@@ -942,6 +945,11 @@ func (s *AdminConsoleService) GetSettings(ctx context.Context) (map[string]any, 
 		return nil, err
 	}
 	values["outbound_extract_api"] = strings.TrimSpace(extractAPI)
+	deai, err := s.settings.GetValue(ctx, "deai.enabled")
+	if err != nil {
+		return nil, err
+	}
+	values["deai_enabled"] = parseBoolSetting(deai, false)
 	return values, nil
 }
 
@@ -1034,6 +1042,13 @@ func (s *AdminConsoleService) UpdateSettings(ctx context.Context, input map[stri
 			return nil, err
 		}
 		updates["public.base_url"] = baseURL
+	}
+	if value, ok := input["deai_enabled"]; ok {
+		enabled, valid := value.(bool)
+		if !valid {
+			return nil, errors.New("deai_enabled must be a boolean")
+		}
+		updates["deai.enabled"] = strconv.FormatBool(enabled)
 	}
 	if raw, ok := input["providers_enabled"]; ok {
 		switches, ok := raw.(map[string]any)

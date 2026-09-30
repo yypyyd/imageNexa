@@ -372,7 +372,7 @@ func (r *ModelRouteRepository) RouteConfig(ctx context.Context, route model.Mode
 }
 
 func aggregateModelConfig(logical model.LogicalModel, routes []model.ModelRoute) model.ModelConfig {
-	item := model.ModelConfig{ID: logical.ID, Name: logical.Name, Type: logical.Kind, Provider: "2api", Enabled: logical.Enabled,
+	item := model.ModelConfig{ID: logical.ID, Name: logical.Name, Type: logical.Kind, Provider: "nexa", Enabled: logical.Enabled,
 		Weight: logical.Weight, GenerationCount: logical.GenerationCount, CreatedAt: logical.CreatedAt, UpdatedAt: logical.UpdatedAt}
 	var ratios, resolutions, durations []string
 	for _, route := range routes {

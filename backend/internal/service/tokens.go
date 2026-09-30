@@ -285,6 +285,9 @@ func (s *TokenService) ImportChatGPTToken(ctx context.Context, accessToken, toke
 	if grok.IsGrokToken(accessToken) || grok.IsGrokOAuthToken(accessToken) {
 		return nil, errors.New("this token is grok, not chatgpt")
 	}
+	if chatGPTTokenExpired(accessToken, time.Now()) {
+		return nil, errors.New("chatgpt access token has expired")
+	}
 	// Land as pending and return instantly; a background worker probes quota and
 	// flips the row active/dead (Python import_chatgpt_token). pending tokens are
 	// not schedulable — the pool only hands out status=="active".
@@ -990,6 +993,35 @@ func (s *TokenService) ReprobeStalePendingChatGPT(ctx context.Context, older tim
 			s.RecheckPendingChatGPT(rctx, id, token)
 		}()
 	}
+}
+
+// ExpireChatGPTTokens removes expired JWTs from scheduling. The quota reset
+// marker cannot be used here because quota probes overwrite it independently.
+func (s *TokenService) ExpireChatGPTTokens(ctx context.Context) (int, error) {
+	items, err := s.tokens.ListChatGPTExpiryCandidates(ctx)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	expired := 0
+	for _, item := range items {
+		if !chatGPTTokenExpired(item.Value, now) {
+			continue
+		}
+		marked, err := s.tokens.MarkChatGPTExpired(ctx, item.ID, item.Value)
+		if err != nil {
+			return expired, err
+		}
+		if marked {
+			expired++
+		}
+	}
+	return expired, nil
+}
+
+func chatGPTTokenExpired(token string, now time.Time) bool {
+	_, expiry := parseJWTEmailExpiry(token)
+	return expiry != nil && !expiry.After(now)
 }
 
 // ReprobeStalePendingAdobe re-runs the Adobe import worker for cookies stuck in

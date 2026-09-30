@@ -1,6 +1,6 @@
-# 2API administrator console
+# Nexa administrator console
 
-Vue 3 + Vite single-administrator control plane for the 2API gateway. There is
+Vue 3 + Vite single-administrator control plane for the Nexa gateway. There is
 no public user application: `/` resolves to one-time initialization, login, or
 the authenticated administrator console.
 
