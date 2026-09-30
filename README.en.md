@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="frontend/public/favicon.svg" width="80" alt="2API" />
+<img src="frontend/public/favicon.svg" width="80" alt="Nexa" />
 
-# 2API
+# Nexa
 
 **An OpenAI-compatible API gateway for text, image, and video generation**
 
@@ -12,7 +12,7 @@
 
 ## Scope
 
-2API is a self-hosted API service with a singleton super-administrator console. Downstream clients use one OpenAI-style `Bearer sk-*` API key and canonical model IDs; the gateway handles provider routing, account selection, concurrency, quota reservation, failover, and quota reconciliation internally.
+Nexa is a self-hosted API service with a singleton super-administrator console. Downstream clients use one OpenAI-style `Bearer sk-*` API key and canonical model IDs; the gateway handles provider routing, account selection, concurrency, quota reservation, failover, and quota reconciliation internally.
 
 The product boundary is intentionally small:
 
@@ -99,7 +99,7 @@ Errors use the OpenAI shape:
 
 ## Unified Routing and Account Scheduling
 
-Clients submit the canonical model ID for the channel they want. 2API then:
+Clients submit the canonical model ID for the channel they want. Nexa then:
 
 1. Filters routes by operation, aspect ratio, resolution, duration, and reference-media capabilities.
 2. Removes route-bound accounts that are disabled, cooling down, authentication-invalid, or known to lack enough quota. Eligible accounts currently at their concurrency limit stay at the tail so they can be used when a slot is released.
@@ -107,7 +107,7 @@ Clients submit the canonical model ID for the channel they want. 2API then:
 4. Atomically reserves account concurrency and quota before upstream submission; a definitely unaccepted request releases its reservation.
 5. Re-reads or reconciles the selected account's upstream quota after every generation, updating both the console and the next scheduling decision.
 
-Authentication failures, exhausted quota, and safely retryable pre-acceptance errors may move to another account or route. A temporary failure excludes that credential and immediately tries an unused account: three identical temporary signatures stop the wave as a pool-wide outage, while mixed failures may use up to six distinct accounts. Once an upstream accepts a task, or submission outcome is uncertain, 2API does not switch accounts and resubmit. The sole account-level exception is BytePlus GPT Image 2's exact known beta execution failure after that account's one live pre-submit and three post-failure balance snapshots all remain known and unchanged. Within the same BytePlus route, 2API may then walk a bounded chain of at most six distinct accounts. Every failed account must independently pass the four-snapshot no-charge proof; the chain never returns to an attempted account, enters the ordinary temporary-account budget, or switches routes. An unknown, changed, or unavailable balance, or an ambiguous submission outcome, stops the chain immediately. Send a stable, unique `Idempotency-Key` on image and video creation requests. If an image request omits it, the server creates one for that request and returns it in the `Idempotency-Key` and `Location` headers so accepted work can be recovered. That generated key is not automatically present on a later client retry and does not replace client-side reuse.
+Authentication failures, exhausted quota, and safely retryable pre-acceptance errors may move to another account or route. A temporary failure excludes that credential and immediately tries an unused account: three identical temporary signatures stop the wave as a pool-wide outage, while mixed failures may use up to six distinct accounts. Once an upstream accepts a task, or submission outcome is uncertain, Nexa does not switch accounts and resubmit. The sole account-level exception is BytePlus GPT Image 2's exact known beta execution failure after that account's one live pre-submit and three post-failure balance snapshots all remain known and unchanged. Within the same BytePlus route, Nexa may then walk a bounded chain of at most six distinct accounts. Every failed account must independently pass the four-snapshot no-charge proof; the chain never returns to an attempted account, enters the ordinary temporary-account budget, or switches routes. An unknown, changed, or unavailable balance, or an ambiguous submission outcome, stops the chain immediately. Send a stable, unique `Idempotency-Key` on image and video creation requests. If an image request omits it, the server creates one for that request and returns it in the `Idempotency-Key` and `Location` headers so accepted work can be recovered. That generated key is not automatically present on a later client retry and does not replace client-side reuse.
 
 ## Importing BytePlus Accounts
 

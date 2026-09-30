@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="frontend/public/favicon.svg" width="80" alt="2API" />
+<img src="frontend/public/favicon.svg" width="80" alt="Nexa" />
 
-# 2API
+# Nexa
 
 **面向文本、图片与视频生成的 OpenAI 兼容 API 网关**
 
@@ -12,7 +12,7 @@
 
 ## 项目定位
 
-2API 是一个自托管的 API 服务与单一超级管理员控制台。下游只需使用一个 OpenAI 风格的 `Bearer sk-*` API Key 和 canonical 模型 ID；系统在内部完成 Provider 路由、账号选择、并发控制、额度预占、故障转移与额度刷新。
+Nexa 是一个自托管的 API 服务与单一超级管理员控制台。下游只需使用一个 OpenAI 风格的 `Bearer sk-*` API Key 和 canonical 模型 ID；系统在内部完成 Provider 路由、账号选择、并发控制、额度预占、故障转移与额度刷新。
 
 产品边界固定为：
 
@@ -101,7 +101,7 @@ Authorization: Bearer sk-your-api-key
 
 ## 统一路由与账号调度
 
-下游只提交所选渠道的 canonical 模型 ID。2API 会：
+下游只提交所选渠道的 canonical 模型 ID。Nexa 会：
 
 1. 按操作类型、比例、分辨率、时长和参考素材能力筛选可用 route。
 2. 在 route 绑定的账号中排除停用、冷却、鉴权失效或已知额度不足的账号；并发已满的合格账号保留在候选队尾，以便槽位释放后继续使用。
@@ -119,7 +119,7 @@ Cookie 必须同时包含有效会话信息和非空 `csrfToken`。单独的 CSR
 
 Lumina 当前登录会话约 48 小时。系统从 `digest` JWT 的 `exp` 记录本地调度截止时间：已明确过期的账号不会承接普通流量，管理端会显示临期或过期状态。`AccountID` 只经 SHA-256 后用于识别同一账号；重新登录后导入新 Cookie 会覆盖原账号行，不会每次新建重复账号。
 
-配置了账密的 Lumina 账号由 2API 自己续期，不依赖外部注册服务：后台按 `digest.exp` 在到期前 6 小时进入续期队列，使用 BytePlus 的密码登录协议换取新 Cookie，校验新旧 `AccountID` 一致后原位覆盖。失败按 5–60 分钟退避重试；旧 Cookie 在真实到期前仍可继续调度。没有账密的旧导入保持手工重导模式。
+配置了账密的 Lumina 账号由 Nexa 自己续期，不依赖外部注册服务：后台按 `digest.exp` 在到期前 6 小时进入续期队列，使用 BytePlus 的密码登录协议换取新 Cookie，校验新旧 `AccountID` 一致后原位覆盖。失败按 5–60 分钟退避重试；旧 Cookie 在真实到期前仍可继续调度。没有账密的旧导入保持手工重导模式。
 
 Cookie 是高敏感凭据：不要写入日志、截图、文档、`.env` 或 Git。
 

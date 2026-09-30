@@ -1,11 +1,11 @@
-# 2API Design
+# Nexa Design
 
 Status: locked product architecture
 Last updated: 2026-09-13
 
 ## 1. Goals and boundaries
 
-2API is an OpenAI-compatible data plane plus a singleton super-administrator control plane. It exposes text, image, image-edit, and video generation while hiding provider-specific protocols, credentials, upstream model names, and account selection.
+Nexa is an OpenAI-compatible data plane plus a singleton super-administrator control plane. It exposes text, image, image-edit, and video generation while hiding provider-specific protocols, credentials, upstream model names, and account selection.
 
 The design has five fixed goals:
 
@@ -67,7 +67,7 @@ Plaintext keys are returned only on create or rotate. PostgreSQL stores the hash
 
 | Method | Path | Contract |
 |---|---|---|
-| `GET` | `/v1/models` | Closed canonical catalog. The default returns `id`, `object`, `created`, `owned_by`, and `shutdown_date` (`null` in 2API); `extended=true` opts into capability metadata. |
+| `GET` | `/v1/models` | Closed canonical catalog. The default returns `id`, `object`, `created`, `owned_by`, and `shutdown_date` (`null` in Nexa); `extended=true` opts into capability metadata. |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions JSON and SSE. |
 | `POST` | `/v1/images/generations` | Synchronous image generation by default; async is opt-in with `Prefer: respond-async` or `async=true`. |
 | `POST` | `/v1/images/edits` | Multipart image editing with PNG/JPEG/GIF/WebP reference images; unsupported mask semantics are rejected. |
@@ -176,7 +176,7 @@ Before submission:
 
 All trusted manual and automatic balance probes update the same scheduling quota bucket, preserving outstanding holds. Account reset recovery probes every supported provider. Maintenance also claims up to 20 stale/reset-due quota buckets with PostgreSQL `FOR UPDATE SKIP LOCKED` and probes with four workers; successful snapshots expire for probing after 15 minutes, and `updated_at` supplies a five-minute retry delay for failed claims without pretending the balance was refreshed. Unknown/auth-failed probes never replace a balance with zero.
 
-After every generation, 2API refreshes or reconciles the selected account's upstream quota. Reconciliation releases only that request's reservation and writes `upstream remaining - other active reservations`. Concurrent completions therefore cannot overwrite each other's holds.
+After every generation, Nexa refreshes or reconciles the selected account's upstream quota. Reconciliation releases only that request's reservation and writes `upstream remaining - other active reservations`. Concurrent completions therefore cannot overwrite each other's holds.
 
 Outcome rules:
 
@@ -231,7 +231,7 @@ The Cookie must include a non-empty `csrfToken` and valid session data. A standa
 
 The observed Lumina login contract gives `digest` JWTs a fixed 48-hour lifetime while keeping `AccountID` stable across logins. The service hashes `AccountID` to form a non-secret identity fingerprint, uses it to update the existing provider-account row on Cookie rotation, and reads the unverified `digest.exp` claim only as a local scheduling deadline. A known-expired session is excluded from ordinary dispatch; legacy credentials whose expiry cannot be parsed remain probeable so an unknown claim format does not destroy an otherwise valid account. An explicit administrator account test may still select an expired row for diagnosis.
 
-Optional Lumina password-login material lives in private `refresh_profiles` columns and is never serialized by the control plane. The 2API maintenance worker owns renewal end to end: a profile becomes due six hours before `digest.exp`, performs the narrow BytePlus `getLoginCredential` + `mixtureLogin` protocol, verifies that the new Cookie hashes to the same stable `AccountID`, and atomically rotates the existing credential generation. Failures use bounded backoff without killing a still-valid old session. Imports without email/password remain valid but cannot auto-renew.
+Optional Lumina password-login material lives in private `refresh_profiles` columns and is never serialized by the control plane. The Nexa maintenance worker owns renewal end to end: a profile becomes due six hours before `digest.exp`, performs the narrow BytePlus `getLoginCredential` + `mixtureLogin` protocol, verifies that the new Cookie hashes to the same stable `AccountID`, and atomically rotates the existing credential generation. Failures use bounded backoff without killing a still-valid old session. Imports without email/password remain valid but cannot auto-renew.
 
 The Cookie is stored only in private account credential storage. It must never appear in event logs, model discovery, content URLs, errors, or administrator list responses.
 
@@ -412,7 +412,7 @@ Release verification should cover:
 
 ### 2026-09-01 — Restore retained control-plane operations after the rebuild
 
-**Change**: Restored account inventory details and actions that remain valid in the 2API product: per-account success/failure counters, created/last-used timestamps, batch selection/deletion, dead-account cleanup, expandable quota-bucket and failure details, image/video limit markers, and per-account canonical route authorization switches. Restored custom OpenAI-compatible upstream add/edit, account- and model-level pinned capability testing, retained operational overview analytics, and banned-word batch deletion. Restored log type/source filters, source badges, prompt/error copy actions, successful artifact previews, and corrected model capability rendering for array-backed route profiles.
+**Change**: Restored account inventory details and actions that remain valid in the Nexa product: per-account success/failure counters, created/last-used timestamps, batch selection/deletion, dead-account cleanup, expandable quota-bucket and failure details, image/video limit markers, and per-account canonical route authorization switches. Restored custom OpenAI-compatible upstream add/edit, account- and model-level pinned capability testing, retained operational overview analytics, and banned-word batch deletion. Restored log type/source filters, source badges, prompt/error copy actions, successful artifact previews, and corrected model capability rendering for array-backed route profiles.
 
 **Reason**: The compact control-plane rebuild retained the corresponding database fields and administrator APIs but omitted their UI surfaces. The artifact gallery also emitted private object keys as if the retired public `/images` handler still existed, so ordinary API-key artifacts could not be previewed by an administrator.
 
@@ -422,7 +422,7 @@ Release verification should cover:
 
 **Change**: Restored the account-row capability-test action and its text/image/video result dialog. Tests use only canonical models already authorized for the selected account and are pinned to that account rather than the normal provider pool.
 
-**Reason**: The 2API control-plane rebuild removed the previous account-test UI even though operators still need to verify one credential independently of scheduler failover.
+**Reason**: The Nexa control-plane rebuild removed the previous account-test UI even though operators still need to verify one credential independently of scheduler failover.
 
 **Impact**: Administrators can test an individual account again without creating or charging a downstream API credential. The mutation endpoint requires the normal administrator session and CSRF token; generated test artifacts are available only through an administrator-session-protected endpoint and cannot expose ordinary API-key artifacts.
 
@@ -450,7 +450,7 @@ Release verification should cover:
 
 **Impact**: The public catalog is now 19 models (4 text, 6 image, 9 video). Requests using a retired ID receive `model_not_found`; historical event rows remain readable.
 
-### 2026-09-01 — 2API product lock
+### 2026-09-01 — Nexa product lock
 
 **Change**: Reframed the repository as a data-plane API plus singleton administrator console; standardized Bearer API credentials; installed a 24-model canonical catalog; separated logical models, provider routes, account bindings, quota buckets, reservations, and dispatch attempts; and made model-aware quota reconciliation part of every generation lifecycle.
 
