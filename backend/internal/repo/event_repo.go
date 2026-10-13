@@ -76,7 +76,7 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration, 
 			query = query.Where(`NOT EXISTS (
 				SELECT 1 FROM dispatch_attempts attempt
 				WHERE attempt.event_id = event_logs.id
-				  AND attempt.state IN ?
+				  AND (attempt.state IN ? OR (attempt.state = 'succeeded' AND attempt.upstream_task_id <> ''))
 			)`, []string{"accepted", "unknown", "submitting"})
 		}
 		if err := query.
@@ -100,6 +100,7 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration, 
 			Updates(map[string]any{
 				"status":     "failed",
 				"error":      gorm.Expr("COALESCE(NULLIF(error, ''), ?)", "abandoned (process restarted or request interrupted)"),
+				"elapsed_ms": gorm.Expr("GREATEST(1, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ts)) * 1000)::bigint"),
 				"updated_at": time.Now(),
 			}).Error
 	})
@@ -149,6 +150,7 @@ func (r *EventRepository) MarkVideoReady(ctx context.Context, eventID, fileURL s
 		Where("id = ? AND status <> ?", eventID, "success").
 		Updates(map[string]any{
 			"status":     "success",
+			"phase":      "completed",
 			"file":       fileURL,
 			"error":      "",
 			"elapsed_ms": elapsedMS,
@@ -193,6 +195,12 @@ func (r *EventRepository) UpdateStatus(ctx context.Context, eventID, status, err
 		"elapsed_ms": elapsedMS,
 		"updated_at": time.Now(),
 	}
+	if elapsedMS <= 0 && (status == "failed" || status == "success") {
+		patch["elapsed_ms"] = gorm.Expr("GREATEST(1, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ts)) * 1000)::bigint")
+	}
+	if status == "success" {
+		patch["phase"] = "completed"
+	}
 	if strings.TrimSpace(errMsg) != "" {
 		patch["error"] = strings.TrimSpace(errMsg)
 	} else if status == "success" {
@@ -202,6 +210,11 @@ func (r *EventRepository) UpdateStatus(ctx context.Context, eventID, status, err
 		Model(&model.EventLog{}).
 		Where("id = ? AND status <> ?", eventID, status).
 		Updates(patch).Error
+}
+
+func (r *EventRepository) SetPhase(ctx context.Context, eventID, phase string) error {
+	return r.db.WithContext(ctx).Model(&model.EventLog{}).Where("id = ? AND status = 'pending'", eventID).
+		Updates(map[string]any{"phase": phase, "updated_at": time.Now()}).Error
 }
 
 func (r *EventRepository) SetAccount(ctx context.Context, eventID, accountID, accountEmail string) error {

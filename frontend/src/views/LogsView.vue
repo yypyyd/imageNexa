@@ -191,9 +191,9 @@ onMounted(() => { loadCredentials(); load() })
             <td><div class="text-[10px] text-white/50">{{ row.provider || '—' }}</div><div class="mt-1 text-[10px] text-white/30">{{ row.account_label || row.account_id || '—' }}</div></td>
             <td class="max-w-72"><button class="line-clamp-2 text-left text-[11px] leading-4 text-white/65 hover:text-white" :class="row.prompt && 'cursor-copy'" :title="row.prompt ? `${row.prompt}（点击复制）` : ''" @click="copyPrompt(row)">{{ row.prompt || '—' }}</button></td>
             <td><div class="text-[10px] font-mono text-white/55 whitespace-nowrap" :title="requestParams(row)">{{ requestParams(row) }}</div></td>
-            <td><span class="status" :class="`status-${row.status}`">{{ statusName(row.status) }}</span></td>
+            <td><span class="status" :class="`status-${row.status}`">{{ statusName(row.status) }}</span><small v-if="row.phase" class="block mt-1 text-white/40">{{ ({ validation: '参数校验', dispatch: '等待调度', submitting: '提交生成', retrieving: '获取结果', storage: '保存结果', recovery: '恢复原任务', completed: '已完成', outcome_unknown: '结果未能确认' })[row.phase] || row.phase }}</small></td>
             <td class="tabular-nums text-white/45">{{ fmtMs(row.duration_ms || row.elapsed_ms) }}</td>
-            <td class="max-w-56"><button class="line-clamp-2 text-left text-[10px]" :class="[row.status === 'failed' ? 'text-rose-300' : (row.status === 'success' || row.status === 'succeeded' ? 'text-emerald-300/70' : 'text-sky-300/70'), row.error && 'cursor-copy']" :title="row.error ? `${row.error}（点击复制）` : resultName(row)" @click="copyError(row)">{{ resultName(row) }}</button></td>
+            <td class="max-w-56"><button class="line-clamp-2 text-left text-[10px]" :class="[row.status === 'failed' ? 'text-rose-300' : (row.status === 'success' || row.status === 'succeeded' ? 'text-emerald-300/70' : 'text-sky-300/70'), row.error && 'cursor-copy']" :title="row.error ? `${row.error}（点击复制）` : resultName(row)" @click="copyError(row)">{{ row.error_param ? row.error_param + ': ' : '' }}{{ resultName(row) }}</button></td>
           </tr></tbody>
         </table>
       </div>

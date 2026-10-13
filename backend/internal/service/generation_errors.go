@@ -29,6 +29,10 @@ func publicGenerationError(cause error) error {
 	if cause == nil {
 		return nil
 	}
+	var paramErr *ParameterError
+	if errors.As(cause, &paramErr) {
+		return paramErr
+	}
 	// Display a safe terminal content rejection even when the submission wrapper
 	// deliberately hides its cause from the retry/quota classifier.
 	var submitted *dola.VideoSubmissionError
@@ -45,7 +49,18 @@ func publicGenerationError(cause error) error {
 	if errors.As(cause, &submitted) && errors.Is(submitted.Cause, dola.ErrContentRejected) {
 		return ErrContentRejected
 	}
+	var grokSubmitted *grok.VideoSubmissionError
+	if errors.As(cause, &grokSubmitted) {
+		switch {
+		case errors.Is(grokSubmitted.Cause, grok.ErrQuotaExhausted):
+			return ErrProviderQuota
+		case errors.Is(grokSubmitted.Cause, grok.ErrVideoRejected), errors.Is(grokSubmitted.Cause, grok.ErrInvalidTaskHandle):
+			return ErrProviderExecution
+		}
+	}
 	switch {
+	case errors.Is(cause, ErrGenerationOutcomeUnknown):
+		return ErrGenerationOutcomeUnknown
 	case errors.Is(cause, dola.ErrVideoNotStarted):
 		return ErrDolaDurationRejected
 	case errors.Is(cause, ErrIdempotencyConflict):
@@ -85,6 +100,7 @@ func publicGenerationError(cause error) error {
 		errors.Is(cause, oreate.ErrQuotaExhausted), errors.Is(cause, dola.ErrQuotaExhausted), errors.Is(cause, custom.ErrQuotaExhausted):
 		return ErrProviderQuota
 	case errors.Is(cause, ErrProviderTemporary), errors.Is(cause, context.Canceled), errors.Is(cause, context.DeadlineExceeded),
+		errors.Is(cause, chatgpt.ErrTaskAccepted), errors.Is(cause, chatgpt.ErrTaskSubmissionUnknown), errors.Is(cause, grok.ErrTaskAccepted),
 		errors.Is(cause, adobe.ErrTemporaryUpstream), errors.Is(cause, byteplus.ErrTemporaryUpstream),
 		errors.Is(cause, chatgpt.ErrTemporaryUpstream), errors.Is(cause, runway.ErrTemporaryUpstream),
 		errors.Is(cause, grok.ErrTemporaryUpstream), errors.Is(cause, oreate.ErrTemporaryUpstream), errors.Is(cause, dola.ErrTemporaryUpstream),
@@ -113,6 +129,7 @@ func safeStoredGenerationError(raw string) string {
 		return ""
 	}
 	for _, safe := range []error{
+		ErrGenerationOutcomeUnknown,
 		ErrDolaDurationRejected, ErrDolaCopyrightRejected, ErrDolaAudioCopyrightRejected,
 		ErrUnknownModel, ErrIdempotencyConflict, ErrInsufficientFunds, ErrUnsupportedParams,
 		ErrBannedPrompt, ErrContentRejected, ErrNoProviderAccount,

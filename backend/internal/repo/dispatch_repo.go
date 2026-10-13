@@ -8,6 +8,7 @@ import (
 
 	"backend/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type DispatchRepository struct{ db *gorm.DB }
@@ -33,8 +34,10 @@ func (r *DispatchRepository) Finish(ctx context.Context, attemptID, state, failu
 	now := time.Now()
 	patch := map[string]any{
 		"state": state, "failure_class": failureClass,
-		"upstream_task_id": clipDispatchField(upstreamTaskID, 255),
-		"finished_at":      &now, "updated_at": now,
+		"finished_at": &now, "updated_at": now,
+	}
+	if upstreamTaskID != "" {
+		patch["upstream_task_id"] = clipDispatchField(upstreamTaskID, 255)
 	}
 	if cause != nil {
 		// Provider errors can contain reflected request bodies, URLs, cookies, or
@@ -43,6 +46,28 @@ func (r *DispatchRepository) Finish(ctx context.Context, attemptID, state, failu
 		patch["error"] = dispatchFailureMessage(state, failureClass)
 	}
 	return r.db.WithContext(ctx).Model(&model.DispatchAttempt{}).Where("id = ?", attemptID).Updates(patch).Error
+}
+
+// AcceptLatest commits the recovery handle while the provider's stream is still
+// open. Dispatches for an event are sequential, including account failover.
+func (r *DispatchRepository) AcceptLatest(ctx context.Context, eventID, accountID, routeID, taskID string) error {
+	if strings.TrimSpace(taskID) == "" {
+		return errors.New("missing accepted task id")
+	}
+	var attempt model.DispatchAttempt
+	if err := r.db.WithContext(ctx).Where("event_id = ? AND account_id = ? AND model_route_id = ? AND state = ?", eventID, accountID, routeID, "submitting").Order("started_at DESC").First(&attempt).Error; err != nil {
+		return err
+	}
+	result := r.db.WithContext(ctx).Model(&model.DispatchAttempt{}).Where("id = ? AND state = ?", attempt.ID, "submitting").Updates(map[string]any{
+		"state": "accepted", "upstream_task_id": clipDispatchField(taskID, 255), "updated_at": time.Now(),
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("dispatch no longer submitting")
+	}
+	return nil
 }
 
 func (r *DispatchRepository) Get(ctx context.Context, attemptID string) (*model.DispatchAttempt, error) {
@@ -60,7 +85,7 @@ func (r *DispatchRepository) Get(ctx context.Context, attemptID string) (*model.
 func (r *DispatchRepository) LatestAcceptedForEvent(ctx context.Context, eventID string) (*model.DispatchAttempt, error) {
 	var item model.DispatchAttempt
 	err := r.db.WithContext(ctx).
-		Where("event_id = ? AND state = ? AND upstream_task_id <> ''", strings.TrimSpace(eventID), "accepted").
+		Where("event_id = ? AND state IN ? AND upstream_task_id <> ''", strings.TrimSpace(eventID), []string{"accepted", "succeeded"}).
 		Order("started_at DESC").First(&item).Error
 	if err != nil {
 		return nil, err
@@ -74,9 +99,67 @@ func (r *DispatchRepository) ListAccepted(ctx context.Context, limit int) ([]mod
 	}
 	var items []model.DispatchAttempt
 	err := r.db.WithContext(ctx).
-		Where("state = ? AND upstream_task_id <> ''", "accepted").
+		Where("state IN ? AND upstream_task_id <> ''", []string{"accepted", "succeeded"}).
+		Where("EXISTS (SELECT 1 FROM event_logs e WHERE e.id = dispatch_attempts.event_id AND e.status = 'pending' AND e.kind = 'image')").
 		Order("started_at ASC").Limit(limit).Find(&items).Error
 	return items, err
+}
+
+// ListAcceptedVideos returns durable video handles that still need their final
+// artifact URL. Failed events are included for backwards repair: older builds
+// incorrectly marked a polling timeout as a terminal failure even though the
+// accepted upstream task continued rendering. Only providers with a durable,
+// provider-specific resume handle are eligible here.
+func (r *DispatchRepository) ListAcceptedVideos(ctx context.Context, limit int) ([]model.DispatchAttempt, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	var items []model.DispatchAttempt
+	err := r.db.WithContext(ctx).
+		Where("state IN ? AND upstream_task_id <> ''", []string{"accepted", "succeeded"}).
+		Where("model_route_id LIKE 'video.%' AND (model_route_id LIKE '%.dola' OR model_route_id LIKE '%.grok')").
+		Where("EXISTS (SELECT 1 FROM event_logs e WHERE e.id = dispatch_attempts.event_id AND e.kind = 'video' AND e.provider IN ('dola','grok') AND e.status IN ('pending','failed') AND COALESCE(e.file, '') = '')").
+		Order("started_at ASC").Limit(limit).Find(&items).Error
+	return items, err
+}
+
+// ListInterrupted selects only orphan candidates after the longest live work
+// deadline (video: 35 minutes). The service also checks its in-flight registry.
+func (r *DispatchRepository) ListInterrupted(ctx context.Context, before time.Time, limit int) ([]model.DispatchAttempt, error) {
+	var items []model.DispatchAttempt
+	err := r.db.WithContext(ctx).Where("state IN ? AND started_at < ?", []string{"submitting", "unknown", "accepted", "succeeded"}, before).
+		Where("EXISTS (SELECT 1 FROM event_logs e WHERE e.id = dispatch_attempts.event_id AND e.status = 'pending')").
+		Order("updated_at ASC").Limit(limit).Find(&items).Error
+	return items, err
+}
+
+// ResolveInterrupted commits the client verdict and dispatch state together so
+// another restart cannot strand a pending event behind a terminal attempt.
+func (r *DispatchRepository) ResolveInterrupted(ctx context.Context, attempt model.DispatchAttempt, success bool, mimeType, message string) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var event model.EventLog
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&event, "id = ?", attempt.EventID).Error; err != nil {
+			return err
+		}
+		if event.Status != "pending" {
+			return nil
+		}
+		events := NewEventRepository(tx)
+		state, status, class := "unresolved", "failed", "outcome_unknown"
+		var cause error = errors.New(message)
+		if success {
+			state, status, class, cause = "succeeded", "success", "", nil
+			if err := events.SetMimeType(ctx, event.ID, mimeType); err != nil {
+				return err
+			}
+		} else if err := events.SetPhase(ctx, event.ID, "outcome_unknown"); err != nil {
+			return err
+		}
+		if err := events.UpdateStatus(ctx, event.ID, status, message, 0); err != nil {
+			return err
+		}
+		return NewDispatchRepository(tx).Finish(ctx, attempt.ID, state, class, attempt.UpstreamTaskID, cause)
+	})
 }
 
 // ListUnknown returns ambiguous submissions that finished before the cutoff and
@@ -88,6 +171,7 @@ func (r *DispatchRepository) ListUnknown(ctx context.Context, finishedBefore tim
 	var items []model.DispatchAttempt
 	err := r.db.WithContext(ctx).
 		Where("state = ? AND COALESCE(finished_at, started_at) <= ?", "unknown", finishedBefore).
+		Where("model_route_id LIKE 'image.%' AND model_route_id LIKE '%.byteplus'").
 		Order("started_at ASC").Limit(limit).Find(&items).Error
 	return items, err
 }
@@ -117,6 +201,8 @@ func dispatchFailureMessage(state, failureClass string) string {
 		return "provider task accepted; recovery pending"
 	case "unknown":
 		return "provider submission outcome unknown"
+	case "unresolved":
+		return "provider result unavailable; submission may have succeeded; do not resubmit"
 	}
 	switch strings.ToLower(strings.TrimSpace(failureClass)) {
 	case "auth", "entitlement", "authorization":

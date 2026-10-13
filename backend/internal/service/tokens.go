@@ -2208,10 +2208,12 @@ func (s *TokenService) probeQuota(ctx context.Context, pool, id string) (map[str
 		patch := map[string]any{}
 		metaPatch := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 		unknown := boolValueWithDefault(data["unknown"], false)
+		metaPatch["quota_probe_unknown"] = unknown || authFailed
+		metaPatch["quota_probe_error"] = safeQuotaProbeError(data)
 		rem, exhausted := chatgptRemaining(data)
 		// Only trust a definitive reading. An unknown read (403/429/timeout) must
 		// not clobber the cached balance with a bogus 0 nor sink the account.
-		if !unknown {
+		if !unknown && !authFailed {
 			metaPatch["cached_quota_remaining"] = rem
 		}
 		resetAfter := strings.TrimSpace(stringValue(data["reset_after"]))

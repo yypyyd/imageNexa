@@ -65,6 +65,8 @@ type EventLog struct {
 	AccountEmail string  `gorm:"size:255"`
 	Cost         float64 `gorm:"not null;default:0"`
 	ElapsedMS    int     `gorm:"not null;default:0"`
+	Phase        string  `gorm:"size:32;not null;default:''"`
+	ErrorParam   string  `gorm:"size:64;not null;default:''"`
 	File         string  `gorm:"size:500;index"`
 	Error        string  `gorm:"type:text"`
 	CreatedAt    time.Time

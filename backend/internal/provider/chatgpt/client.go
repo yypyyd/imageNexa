@@ -449,7 +449,7 @@ func applyAssistantEvent(raw []byte, current string, active bool) (string, bool,
 	return current, active, updated
 }
 
-func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
+func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool, accepted ...func(string) error) ([]byte, map[string]any, error) {
 	// Every chatgpt.com call goes through the proxy: Cloudflare rejects the
 	// local egress with an HTML 403 on the sentinel/conversation/content
 	// endpoints. Only the raw blob upload host stays on direct local egress.
@@ -496,7 +496,7 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if err != nil {
 		return nil, nil, err
 	}
-	conversationID, fileIDs, sedimentIDs, err := c.startImageGeneration(ctx, submitSession, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs)
+	conversationID, fileIDs, sedimentIDs, err := c.startImageGeneration(ctx, submitSession, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs, accepted...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -508,14 +508,14 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	sedimentIDs = dropIDs(sedimentIDs, refIDs)
 	fileIDs, sedimentIDs, err = c.pollForImage(ctx, session, accessToken, conversationID, fileIDs, sedimentIDs, refIDs, pollBudget(ctx))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, AcceptedFailure(conversationID, err)
 	}
 	urls, err := c.resolveImageURLs(ctx, session, accessToken, conversationID, fileIDs, sedimentIDs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, AcceptedFailure(conversationID, err)
 	}
 	if len(urls) == 0 {
-		return nil, nil, errors.New("no image urls resolved")
+		return nil, nil, AcceptedFailure(conversationID, errors.New("no image urls resolved"))
 	}
 	meta := map[string]any{
 		"provider":        "chatgpt",
@@ -530,10 +530,10 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	}
 	images, err := c.downloadBytes(ctx, session, accessToken, urls)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, AcceptedFailure(conversationID, err)
 	}
 	if len(images) == 0 {
-		return nil, nil, errors.New("download produced no bytes")
+		return nil, nil, AcceptedFailure(conversationID, errors.New("download produced no bytes"))
 	}
 	return images[0], meta, nil
 }
@@ -1429,7 +1429,7 @@ func (c *Client) prepareImageConversation(ctx context.Context, session tlsclient
 	return strings.TrimSpace(stringValue(data["conduit_token"])), nil
 }
 
-func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.HttpClient, accessToken, prompt string, reqs *chatRequirements, conduitToken, model string, refs []uploadedReference) (string, []string, []string, error) {
+func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.HttpClient, accessToken, prompt string, reqs *chatRequirements, conduitToken, model string, refs []uploadedReference, accepted ...func(string) error) (string, []string, []string, error) {
 	path := "/backend-api/f/conversation"
 	content := map[string]any{"content_type": "text", "parts": []string{prompt}}
 	metadata := map[string]any{
@@ -1477,12 +1477,15 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	req.Header = c.imageHeaders(accessToken, path, reqs, conduitToken, "text/event-stream")
 	resp, err := session.Do(req)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+		return "", nil, nil, AcceptedFailure("", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err := ensureOK(resp.StatusCode, respBody, "image_start"); err != nil {
+			if resp.StatusCode >= 500 {
+				return "", nil, nil, AcceptedFailure("", err)
+			}
 			return "", nil, nil, err
 		}
 	}
@@ -1533,6 +1536,13 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 			if match := conversationIDRE.FindStringSubmatch(payload); len(match) >= 2 {
 				conversationID = match[1]
 				close(convFound)
+				for _, notify := range accepted {
+					if notify != nil {
+						if err := notify(conversationID); err != nil {
+							return conversationID, nil, nil, AcceptedFailure(conversationID, err)
+						}
+					}
+				}
 			}
 		}
 		newFiles, newSeds := scanForIDs(payload)
@@ -1560,12 +1570,22 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	// acknowledged so polling can take over. HTTP/2 reports that close as a read
 	// error; once conversationID exists -- including through the accumulated-chunk
 	// fallback above -- it is not a failed submit.
+	previousID := conversationID
 	conversationID, err = finalizeImageStartStream(conversationID, chunks, scanner.Err())
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, AcceptedFailure("", err)
 	}
 	if conversationID == "" {
-		return "", nil, nil, errors.New("chatgpt SSE closed without conversation_id")
+		return "", nil, nil, AcceptedFailure("", errors.New("chatgpt SSE closed without conversation_id"))
+	}
+	if previousID == "" {
+		for _, notify := range accepted {
+			if notify != nil {
+				if err := notify(conversationID); err != nil {
+					return conversationID, nil, nil, AcceptedFailure(conversationID, err)
+				}
+			}
+		}
 	}
 	// A conversation id is the authoritative acknowledgement that the submit was
 	// accepted. The async marker is only an SSE optimisation: the web backend now

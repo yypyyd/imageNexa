@@ -1642,4 +1642,61 @@ var migrationSources = map[string]string{
 		"SET capabilities = '[{\"operations\":[\"generation\"],\"ratios\":[\"1:1\",\"3:4\",\"4:3\",\"9:16\",\"16:9\",\"21:9\"],\"resolutions\":[\"720p\"],\"durations\":[\"30s\"],\"max_reference_images\":10,\"max_reference_media\":10,\"supports_audio_output\":true,\"reference_mode\":\"asset\"}]'::jsonb,\n" +
 		"    updated_at = NOW()\n" +
 		"WHERE id = 'video.dola-seedance-2.5.dola';\n",
+	"000025_chatgpt_image_landscape_ratio.sql": "-- Admit 3:2 GPT image sizes such as 1200x800 and 1536x1024.\n" +
+		"-- Extend only the ChatGPT route; retain all other capability fields.\n" +
+		"UPDATE model_routes\n" +
+		"SET capabilities = jsonb_set(capabilities, '{0,ratios}',\n" +
+		"        (capabilities -> 0 -> 'ratios') || '[\"3:2\"]'::jsonb),\n" +
+		"    updated_at = NOW()\n" +
+		"WHERE id = 'image.gpt-image-2.chatgpt'\n" +
+		"  AND logical_model_id = 'gpt-image-2'\n" +
+		"  AND provider = 'chatgpt'\n" +
+		"  AND jsonb_array_length(capabilities) = 1\n" +
+		"  AND jsonb_typeof(capabilities -> 0 -> 'ratios') = 'array'\n" +
+		"  AND NOT (capabilities -> 0 -> 'ratios') @> '[\"3:2\"]'::jsonb;\n",
+	"000026_chatgpt_image_free_ratios.sql": "-- Ratios verified on ChatGPT Free accounts on 2026-10-03.\n" +
+		"-- Append only missing ratios; preserve resolution, reference limits, pricing,\n" +
+		"-- provider switches, and every other route.\n" +
+		"WITH additions AS (\n" +
+		"    SELECT id, (\n" +
+		"        SELECT jsonb_agg(ratio ORDER BY position)\n" +
+		"        FROM jsonb_array_elements_text('[\"2:3\",\"5:4\",\"4:5\",\"2:1\",\"1:2\",\"21:9\",\"9:21\"]'::jsonb)\n" +
+		"            WITH ORDINALITY AS candidate(ratio, position)\n" +
+		"        WHERE NOT (capabilities -> 0 -> 'ratios') ? ratio\n" +
+		"    ) AS ratios\n" +
+		"    FROM model_routes\n" +
+		"    WHERE id = 'image.gpt-image-2.chatgpt'\n" +
+		"      AND logical_model_id = 'gpt-image-2'\n" +
+		"      AND provider = 'chatgpt'\n" +
+		"      AND jsonb_array_length(capabilities) = 1\n" +
+		"      AND jsonb_typeof(capabilities -> 0 -> 'ratios') = 'array'\n" +
+		")\n" +
+		"UPDATE model_routes AS route\n" +
+		"SET capabilities = jsonb_set(route.capabilities, '{0,ratios}',\n" +
+		"        (route.capabilities -> 0 -> 'ratios') || additions.ratios),\n" +
+		"    updated_at = NOW()\n" +
+		"FROM additions\n" +
+		"WHERE route.id = additions.id AND additions.ratios IS NOT NULL;\n",
+	"000027_chatgpt_image_existing_scope.sql": "-- Restore the existing ChatGPT image scope after the Free capability audit.\n" +
+		"-- Remove only the seven ratios added by migration 26; retain the original\n" +
+		"-- 3:2 request fix and every other route/capability field.\n" +
+		"UPDATE model_routes\n" +
+		"SET capabilities = jsonb_set(capabilities, '{0,ratios}',\n" +
+		"        (capabilities -> 0 -> 'ratios') - ARRAY['2:3','5:4','4:5','2:1','1:2','21:9','9:21']),\n" +
+		"    updated_at = NOW()\n" +
+		"WHERE id = 'image.gpt-image-2.chatgpt'\n" +
+		"  AND logical_model_id = 'gpt-image-2'\n" +
+		"  AND provider = 'chatgpt'\n" +
+		"  AND jsonb_array_length(capabilities) = 1\n" +
+		"  AND jsonb_typeof(capabilities -> 0 -> 'ratios') = 'array'\n" +
+		"  AND (capabilities -> 0 -> 'ratios') ?| ARRAY['2:3','5:4','4:5','2:1','1:2','21:9','9:21'];\n",
+	"000028_generation_phase.sql": `ALTER TABLE event_logs ADD COLUMN IF NOT EXISTS phase VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE event_logs ADD COLUMN IF NOT EXISTS error_param VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE event_logs ALTER COLUMN elapsed_ms TYPE BIGINT;
+`,
+	"000029_unresolved_dispatch_state.sql": `ALTER TABLE dispatch_attempts DROP CONSTRAINT IF EXISTS dispatch_attempts_state_valid;
+ALTER TABLE dispatch_attempts ADD CONSTRAINT dispatch_attempts_state_valid CHECK (state IN ('created','submitting','accepted','unknown','succeeded','failed','unresolved'));
+ALTER TABLE dispatch_attempts DROP CONSTRAINT IF EXISTS dispatch_attempts_failure_valid;
+ALTER TABLE dispatch_attempts ADD CONSTRAINT dispatch_attempts_failure_valid CHECK (failure_class IN ('','auth','quota','entitlement','temporary','request','content','outcome_unknown'));
+`,
 }

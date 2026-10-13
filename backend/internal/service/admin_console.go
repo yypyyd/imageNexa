@@ -334,6 +334,9 @@ func (s *AdminConsoleService) CountAccountHealthByProvider(ctx context.Context) 
 		}
 		counts[row.Provider][bucket] += row.Count
 	}
+	if err := s.countQuotaHealth(ctx, counts); err != nil {
+		return nil, err
+	}
 	return counts, nil
 }
 
@@ -438,10 +441,11 @@ func assembleAccountRow(account model.TokenAccount, bindings []model.AccountMode
 			"refreshed_at": bucket.RefreshedAt,
 		})
 	}
+	quotaState := accountQuotaState(account.Pool, buckets, time.Now())
 	health := "healthy"
 	if account.Dead || account.Status == "disabled" {
 		health = "unhealthy"
-	} else if account.Status == "quota" || account.Status == "pending" || account.Fails > 0 {
+	} else if account.Status == "quota" || account.Status == "pending" || account.Fails > 0 || quotaState == "empty" || quotaState == "unknown" || quotaState == "stale" {
 		health = "degraded"
 	}
 	readiness, readinessDetail := dolaReadinessView(account)
@@ -465,6 +469,7 @@ func assembleAccountRow(account model.TokenAccount, bindings []model.AccountMode
 		"id": account.ID, "provider": account.Pool, "label": label, "email": account.AccountEmail,
 		"status": account.Status, "weight": account.Weight, "max_concurrency": account.Concurrency,
 		"active_jobs": activeJobs, "health": health, "routes": routeRows, "quota_buckets": quotaRows,
+		"quota_state": quotaState, "primary_quota_bucket": primaryQuotaBucket(account.Pool, time.Now()),
 		"success_total": account.SuccessTotal, "fail_total": account.FailTotal,
 		"consecutive_failures": account.Fails, "upstream_failures": account.UpstreamFails,
 		"image_limited": account.ImageLimited, "video_limited": account.VideoLimited,
@@ -860,7 +865,7 @@ func (s *AdminConsoleService) ListLogs(ctx context.Context, filter LogListFilter
 		row := map[string]any{
 			"id": event.ID, "request_id": event.RequestID, "model": event.Model, "kind": event.Kind,
 			"status": event.Status, "provider": event.Provider, "account_id": event.AccountID, "account_label": event.AccountEmail,
-			"duration_ms": event.ElapsedMS, "error": safeStoredGenerationError(event.Error), "created_at": event.TS,
+			"duration_ms": event.ElapsedMS, "phase": event.Phase, "error_param": event.ErrorParam, "error": safeStoredGenerationError(event.Error), "created_at": event.TS,
 			"api_credential_id": event.APICredentialID, "credential": credential,
 			"prompt": event.Prompt, "ratio": event.Ratio, "resolution": event.Resolution,
 			"duration": event.Duration, "refs": event.Refs, "deai": event.DeAI, "source": event.Source,
@@ -1099,10 +1104,6 @@ func normalizeProxyURL(raw, field string) (string, error) {
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
 	return parsed.String(), nil
-}
-
-func normalizeDolaSessionAPI(raw string) (string, error) {
-	return normalizeExtractAPI(raw, "dola_session_api")
 }
 
 func normalizeExtractAPI(raw, field string) (string, error) {

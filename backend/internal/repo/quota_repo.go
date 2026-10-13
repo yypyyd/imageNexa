@@ -37,6 +37,16 @@ func durableID(prefix string) string {
 
 func quotaBucketID(accountID, bucketKey string) string { return accountID + ":" + bucketKey }
 
+// Import-time probes may fail before any bucket exists. Seed an unknown row so
+// those accounts participate in bounded background refreshes as well.
+func (r *QuotaRepository) EnsureProviderBuckets(ctx context.Context, pool, bucketKey, unit string) error {
+	return r.db.WithContext(ctx).Exec(`INSERT INTO account_quota_buckets
+		(id, account_id, bucket_key, unit, reserved, revision, created_at, updated_at)
+		SELECT id || ':' || ?, id, ?, ?, 0, 0, NOW(), TIMESTAMPTZ '2000-01-01'
+		FROM provider_accounts WHERE pool=? AND status IN ('active','quota') AND dead=false AND value<>''
+		ON CONFLICT (account_id, bucket_key) DO NOTHING`, bucketKey, bucketKey, unit, pool).Error
+}
+
 func (r *QuotaRepository) Get(ctx context.Context, accountID, bucketKey string) (*model.AccountQuotaBucket, error) {
 	var item model.AccountQuotaBucket
 	if err := r.db.WithContext(ctx).First(&item, "account_id = ? AND bucket_key = ?", accountID, bucketKey).Error; err != nil {
@@ -79,6 +89,7 @@ func (r *QuotaRepository) ClaimRefreshDue(ctx context.Context, now time.Time, li
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("bucket_key NOT LIKE ?", model.DolaDailyVideoBucket+":%").
+			Where("bucket_key IN ?", []string{"chatgpt.image", "byteplus.computing_points", "grok.media", "adobe.credits", "runway.credits", "oreate.points"}).
 			Where("updated_at <= ?", now.Add(-5*time.Minute)).
 			Where("refreshed_at IS NULL OR refreshed_at <= ? OR (reset_at <= ? AND refreshed_at < reset_at)", now.Add(-15*time.Minute), now).
 			Where(`EXISTS (SELECT 1 FROM provider_accounts a WHERE a.id = account_quota_buckets.account_id

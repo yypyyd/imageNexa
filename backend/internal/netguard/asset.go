@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -194,6 +196,50 @@ func GuardResponse(resp *http.Response, kind MediaKind, maxBytes int64) (io.Read
 		return nil, "", ErrInvalidMedia
 	}
 	return GuardStream(resp.Body, resp.Header.Get("Content-Type"), resp.ContentLength, kind, maxBytes)
+}
+
+var contentRangePattern = regexp.MustCompile(`(?i)^bytes ([0-9]+)-([0-9]+)/([0-9]+)$`)
+
+// GuardPartialResponse validates a single HTTP 206 media response. A range
+// beginning at byte zero can still be checked by payload magic; later ranges
+// have no file signature, so they are accepted only with a valid video/image
+// Content-Type and a bounded, internally consistent Content-Range.
+func GuardPartialResponse(resp *http.Response, kind MediaKind, maxBytes int64) (io.ReadCloser, string, error) {
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusPartialContent || maxBytes <= 0 {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return nil, "", ErrInvalidMedia
+	}
+	matches := contentRangePattern.FindStringSubmatch(strings.TrimSpace(resp.Header.Get("Content-Range")))
+	if len(matches) != 4 {
+		resp.Body.Close()
+		return nil, "", ErrInvalidMedia
+	}
+	start, startErr := strconv.ParseInt(matches[1], 10, 64)
+	end, endErr := strconv.ParseInt(matches[2], 10, 64)
+	total, totalErr := strconv.ParseInt(matches[3], 10, 64)
+	if startErr != nil || endErr != nil || totalErr != nil || start < 0 || end < start || total <= end || total > maxBytes {
+		resp.Body.Close()
+		return nil, "", ErrInvalidMedia
+	}
+	rangeLength := end - start + 1
+	if resp.ContentLength >= 0 && resp.ContentLength != rangeLength {
+		resp.Body.Close()
+		return nil, "", ErrInvalidMedia
+	}
+	if start == 0 {
+		return GuardStream(resp.Body, resp.Header.Get("Content-Type"), rangeLength, kind, maxBytes)
+	}
+	headerType := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
+	if parsed, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err == nil && parsed != "" {
+		headerType = strings.ToLower(parsed)
+	}
+	if !mediaAllowed(kind, headerType) {
+		resp.Body.Close()
+		return nil, "", ErrInvalidMedia
+	}
+	return &boundedReadCloser{reader: resp.Body, closer: resp.Body, remaining: rangeLength}, headerType, nil
 }
 
 func GuardStream(body io.ReadCloser, rawContentType string, contentLength int64, kind MediaKind, maxBytes int64) (io.ReadCloser, string, error) {

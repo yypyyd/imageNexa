@@ -40,8 +40,8 @@ func New(cfg *config.Config, auth *service.AuthService, credentials *service.API
 	v1.Use(cors.New(cors.Config{
 		AllowOriginFunc:  func(origin string) bool { return strings.TrimSpace(origin) != "" },
 		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
-		AllowHeaders:     []string{"Authorization", "Content-Type", "Idempotency-Key", "Prefer", "X-Request-Id"},
-		ExposeHeaders:    []string{"Idempotency-Key", "Location", "Preference-Applied", "Retry-After", "X-Request-Id"},
+		AllowHeaders:     []string{"Authorization", "Content-Type", "Idempotency-Key", "Prefer", "Range", "X-Request-Id"},
+		ExposeHeaders:    []string{"Accept-Ranges", "Content-Length", "Content-Range", "Idempotency-Key", "Location", "Preference-Applied", "Retry-After", "X-Request-Id"},
 		AllowCredentials: false,
 	}), middleware.RequireAPICredential(credentials))
 	{
@@ -101,6 +101,7 @@ func New(cfg *config.Config, auth *service.AuthService, credentials *service.API
 		authed.PATCH("/accounts/:id/routes/:binding_id", handlers.Admin.SetAccountRoute)
 		authed.POST("/accounts/:id/refresh-quota", handlers.Admin.RefreshAccountQuota)
 		authed.POST("/test", handlers.V1.AdminTest)
+		authed.GET("/test/events/:id", handlers.V1.AdminTestStatus)
 		authed.GET("/test/artifacts/:id", handlers.V1.AdminTestArtifact)
 
 		authed.GET("/logs", handlers.Admin.Logs)

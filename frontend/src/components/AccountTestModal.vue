@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { api, jsonBody } from '../api'
 import Icon from './Icon.vue'
 import SelectMenu from './SelectMenu.vue'
@@ -29,6 +29,8 @@ const status = ref('')
 const error = ref('')
 const resultURL = ref('')
 const resultText = ref('')
+let mounted = true
+onBeforeUnmount(() => { mounted = false })
 
 const currentModel = computed(() => availableModels.value.find((model) => model.id === selectedModel.value) || null)
 const currentKind = computed(() => currentModel.value?.kind || currentModel.value?.type || '')
@@ -39,6 +41,41 @@ const capabilities = computed(() => {
   return Array.isArray(value) ? (value[0] || {}) : (value || {})
 })
 const firstOf = (value, fallback = '') => Array.isArray(value) && value.length ? value[0] : fallback
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function pollVideoTest(eventID) {
+  const deadline = Date.now() + (2 * 60 * 60 * 1000)
+  while (mounted && Date.now() < deadline) {
+    await wait(5000)
+    if (!mounted) return
+    const response = await api(`/test/events/${encodeURIComponent(eventID)}`)
+    if (!response.ok) {
+      busy.value = false
+      status.value = ''
+      error.value = response.error
+      return
+    }
+    const elapsed = Number(response.data?.elapsed_ms || 0)
+    const suffix = elapsed > 0 ? ` · ${(elapsed / 1000).toFixed(0)}s` : ''
+    if (response.data?.status === 'success') {
+      busy.value = false
+      resultURL.value = response.data?.url || `/admin/api/test/artifacts/${encodeURIComponent(eventID)}`
+      status.value = `测试完成${suffix}`
+      return
+    }
+    if (response.data?.status === 'failed') {
+      busy.value = false
+      status.value = ''
+      error.value = response.data?.error || '账号能力测试失败'
+      return
+    }
+    status.value = `${response.data?.phase === 'recovery' ? '上游已接收，正在继续等待视频…' : '正在生成视频，请耐心等待…'}${suffix}`
+  }
+  if (mounted) {
+    busy.value = false
+    status.value = '任务仍在后台生成，可稍后在日志中查看结果'
+  }
+}
 
 async function run() {
   if (!selectedModel.value) { error.value = '请选择模型'; return }
@@ -56,12 +93,18 @@ async function run() {
     resolution: firstOf(capabilities.value.resolutions),
     duration: firstOf(capabilities.value.durations, currentKind.value === 'video' ? '5s' : ''),
   }))
-  busy.value = false
   if (!response.ok) {
+    busy.value = false
     status.value = ''
     error.value = response.error
     return
   }
+  if (currentKind.value === 'video' && response.data?.event_id && ['queued', 'pending'].includes(response.data?.status)) {
+    status.value = '视频任务已提交，正在生成…'
+    await pollVideoTest(response.data.event_id)
+    return
+  }
+  busy.value = false
   resultText.value = response.data?.content || ''
   resultURL.value = response.data?.url || ''
   status.value = `测试完成${response.data?.elapsed_ms != null ? ` · ${(Number(response.data.elapsed_ms) / 1000).toFixed(1)}s` : ''}`
@@ -69,14 +112,14 @@ async function run() {
 </script>
 
 <template>
-  <div class="test-modal-bg" @click.self="!busy && emit('close')">
+  <div class="test-modal-bg" @click.self="emit('close')">
     <div class="test-modal-card">
       <div class="flex items-start justify-between gap-3">
         <div class="min-w-0">
           <h3 class="font-semibold text-white/90">账号能力测试</h3>
           <p class="mt-1 text-[11px] text-white/45 truncate">{{ account.email || account.label || account.id }} · {{ account.provider }}</p>
         </div>
-        <button type="button" class="text-white/45 hover:text-white" :disabled="busy" @click="emit('close')"><Icon name="close" class="w-4 h-4" /></button>
+        <button type="button" class="text-white/45 hover:text-white" @click="emit('close')"><Icon name="close" class="w-4 h-4" /></button>
       </div>
 
       <label class="block">

@@ -54,24 +54,38 @@ func (h *V1Handler) AdminTest(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+// AdminTestStatus lets the account-test modal follow a long video render after
+// the initiating HTTP request has returned. The route is administrator-session
+// protected and never exposes the provider's signed artifact URL.
+func (h *V1Handler) AdminTestStatus(c *gin.Context) {
+	result, err := h.v1.AdminTestStatus(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "test event not found"})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 // AdminTestArtifact streams only artifacts created by an administrator test.
 // The surrounding router group authenticates the admin session before this
 // handler is reached; event ownership then rejects ordinary API-key artifacts.
 func (h *V1Handler) AdminTestArtifact(c *gin.Context) {
 	principal := &service.APIPrincipal{TokenType: "admin"}
 	body, contentType, imageErr := h.v1.OpenImageContent(c.Request.Context(), principal, c.Param("id"))
-	if imageErr != nil {
-		body, contentType, imageErr = h.v1.OpenVideoContent(c.Request.Context(), principal, c.Param("id"))
+	if imageErr == nil {
+		defer body.Close()
+		c.Header("Content-Type", contentType)
+		c.Header("Cache-Control", "private, no-store")
+		c.Status(http.StatusOK)
+		_, _ = io.Copy(c.Writer, body)
+		return
 	}
-	if imageErr != nil {
+	video, videoErr := h.v1.OpenVideoContentRange(c.Request.Context(), principal, c.Param("id"), c.GetHeader("Range"))
+	if videoErr != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "test artifact not found"})
 		return
 	}
-	defer body.Close()
-	c.Header("Content-Type", contentType)
-	c.Header("Cache-Control", "private, no-store")
-	c.Status(http.StatusOK)
-	_, _ = io.Copy(c.Writer, body)
+	writeVideoContent(c, video)
 }
 
 // AdminArtifact restores the administrator log/gallery preview. The route is
@@ -79,19 +93,20 @@ func (h *V1Handler) AdminTestArtifact(c *gin.Context) {
 // ownership internally, so no downstream bearer credential is exposed to the
 // browser.
 func (h *V1Handler) AdminArtifact(c *gin.Context) {
-	body, contentType, err := h.v1.OpenAdminArtifact(c.Request.Context(), c.Param("id"))
+	content, err := h.v1.OpenAdminArtifactRange(c.Request.Context(), c.Param("id"), c.GetHeader("Range"))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "artifact not found"})
 		return
 	}
-	defer body.Close()
-	c.Header("Content-Type", contentType)
-	c.Header("Cache-Control", "private, no-store")
-	c.Status(http.StatusOK)
-	_, _ = io.Copy(c.Writer, body)
+	writeVideoContent(c, content)
 }
 
 func adminTestError(c *gin.Context, err error) {
+	var parameter *service.ParameterError
+	if errors.As(err, &parameter) {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": parameter.Message, "param": parameter.Param, "supported_values": parameter.Supported})
+		return
+	}
 	switch {
 	case errors.Is(err, service.ErrUnknownModel):
 		c.JSON(http.StatusNotFound, gin.H{"detail": "测试模型不存在或未启用"})
@@ -564,15 +579,39 @@ func (h *V1Handler) GetVideo(c *gin.Context) {
 func (h *V1Handler) GetVideoContent(c *gin.Context) {
 	principal := apiPrincipal(c)
 	var err error
-	body, contentType, err := h.v1.OpenVideoContent(c.Request.Context(), principal, c.Param("id"))
+	content, err := h.v1.OpenVideoContentRange(c.Request.Context(), principal, c.Param("id"), c.GetHeader("Range"))
 	if err != nil {
 		h.writeV1Error(c, err, nil)
 		return
 	}
-	defer body.Close()
-	c.Header("Content-Type", contentType)
-	c.Status(http.StatusOK)
-	_, _ = io.Copy(c.Writer, body)
+	writeVideoContent(c, content)
+}
+
+func writeVideoContent(c *gin.Context, content *service.VideoContent) {
+	if content == nil || content.Body == nil {
+		c.Status(http.StatusBadGateway)
+		return
+	}
+	defer content.Body.Close()
+	status := content.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	c.Header("Content-Type", content.ContentType)
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("X-Accel-Buffering", "no")
+	if content.AcceptRanges != "" {
+		c.Header("Accept-Ranges", content.AcceptRanges)
+	}
+	if content.ContentRange != "" {
+		c.Header("Content-Range", content.ContentRange)
+	}
+	if content.ContentLength >= 0 {
+		c.Header("Content-Length", strconv.FormatInt(content.ContentLength, 10))
+	}
+	c.Status(status)
+	_, _ = io.Copy(c.Writer, content.Body)
 }
 
 // GetImageContent — GET /v1/images/{id}/content. The surrounding /v1 group
@@ -679,13 +718,23 @@ func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]a
 }
 
 func v1ErrorResponse(err error, payload map[string]any) (int, any) {
+	var parameter *service.ParameterError
+	if errors.As(err, &parameter) {
+		detail := gin.H{"message": parameter.Message, "type": "invalid_request_error", "param": parameter.Param, "code": "unsupported_parameter"}
+		if len(parameter.Supported) > 0 {
+			detail["supported_values"] = parameter.Supported
+		}
+		return http.StatusBadRequest, gin.H{"error": detail}
+	}
 	switch {
+	case errors.Is(err, service.ErrGenerationOutcomeUnknown):
+		return http.StatusBadGateway, openaiErrorResponse("server_error", "generation_outcome_unknown", service.ErrGenerationOutcomeUnknown.Error())
 	case errors.Is(err, service.ErrIdempotencyConflict):
 		return http.StatusConflict, openaiErrorResponse("invalid_request_error", "idempotency_key_conflict", "Idempotency key was already used with a different request.")
 	case errors.Is(err, service.ErrUnknownModel):
 		return http.StatusNotFound, openaiErrorResponse("invalid_request_error", "model_not_found", "The requested model does not exist.")
 	case errors.Is(err, service.ErrUnsupportedParams):
-		return http.StatusBadRequest, openaiErrorResponse("invalid_request_error", "", "The request contains unsupported parameters.")
+		return http.StatusBadRequest, openaiErrorResponse("invalid_request_error", "unsupported_parameter", "The request contains unsupported parameters. Check the model's capability profiles.")
 	case errors.Is(err, service.ErrBannedPrompt):
 		return http.StatusBadRequest, openaiErrorResponse("invalid_request_error", "content_policy_violation", "The prompt violates the configured content policy.")
 	case errors.Is(err, service.ErrContentRejected):

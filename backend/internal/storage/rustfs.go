@@ -82,6 +82,42 @@ func (c *Client) Check(ctx context.Context) error {
 	return nil
 }
 
+// EnsureBucket creates only a missing bucket. Existing buckets are left intact;
+// authentication errors must never be mistaken for a missing bucket.
+func (c *Client) EnsureBucket(ctx context.Context) error {
+	if !c.Configured() {
+		return fmt.Errorf("rustfs is not configured")
+	}
+	resp, err := c.do(ctx, http.MethodHead, c.bucket, nil, nil, "", nil)
+	if err != nil {
+		return err
+	}
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status >= http.StatusOK && status < http.StatusMultipleChoices {
+		return nil
+	}
+	if status != http.StatusNotFound {
+		return fmt.Errorf("rustfs bucket check: status %d", status)
+	}
+	resp, err = c.do(ctx, http.MethodPut, c.bucket, nil, nil, "", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		var result struct {
+			Code string `xml:"Code"`
+		}
+		if xml.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&result) != nil || result.Code != "BucketAlreadyOwnedByYou" {
+			return fmt.Errorf("rustfs bucket creation conflict")
+		}
+	} else if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("rustfs bucket creation: status %d", resp.StatusCode)
+	}
+	return c.Check(ctx)
+}
+
 // Put uploads body under key with the given content type.
 func (c *Client) Put(ctx context.Context, key string, body []byte, contentType string) error {
 	resp, err := c.do(ctx, http.MethodPut, c.bucket+"/"+key, nil, body, contentType, nil)

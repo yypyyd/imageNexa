@@ -102,7 +102,7 @@ func (s *V1Service) firstAvailableRoute(ctx context.Context, logicalID, kind str
 		return nil, err
 	}
 	if len(routes) == 0 {
-		return nil, ErrUnsupportedParams
+		return nil, s.unsupportedRouteParameters(ctx, logicalID, req)
 	}
 	for _, route := range routes {
 		routeCtx := withDispatchRoute(ctx, route, defaultRouteCost(route, req))
@@ -503,7 +503,9 @@ func evaluateRouteCost(route model.ModelRoute, req model.RouteRequirements) (flo
 }
 
 func noRouteFailover(err error) bool {
-	return errors.Is(err, dola.ErrTaskAccepted) || errors.Is(err, dola.ErrTaskSubmissionUnknown) ||
+	return errors.Is(err, chatgpt.ErrTaskAccepted) || errors.Is(err, chatgpt.ErrTaskSubmissionUnknown) ||
+		errors.Is(err, dola.ErrTaskAccepted) || errors.Is(err, dola.ErrTaskSubmissionUnknown) ||
+		errors.Is(err, grok.ErrTaskAccepted) ||
 		errors.Is(err, byteplus.ErrTaskAccepted) || errors.Is(err, byteplus.ErrTaskSubmissionUnknown) ||
 		errors.Is(err, byteplus.ErrRetryableTaskFailed) || errors.Is(err, errBytePlusRetryBudgetExhausted)
 }
@@ -547,11 +549,23 @@ func runTextRouteFailover(routes []model.ModelRoute, attempt func(model.ModelRou
 }
 
 func dispatchFailureClass(err error) (state, class string) {
+	if errors.Is(err, chatgpt.ErrContentPolicy) {
+		return "failed", "content"
+	}
 	var dolaSubmission *dola.VideoSubmissionError
 	if errors.As(err, &dolaSubmission) && errors.Is(dolaSubmission.Cause, dola.ErrContentRejected) {
 		// A final rejection is no longer in flight. Keep the accepted wrapper
 		// for no-retry and quota settlement, separately from dispatch lifecycle.
 		return "failed", "request"
+	}
+	var grokSubmission *grok.VideoSubmissionError
+	if errors.As(err, &grokSubmission) {
+		switch {
+		case errors.Is(grokSubmission.Cause, grok.ErrQuotaExhausted):
+			return "failed", "quota"
+		case errors.Is(grokSubmission.Cause, grok.ErrVideoRejected), errors.Is(grokSubmission.Cause, grok.ErrInvalidTaskHandle):
+			return "failed", "request"
+		}
 	}
 	switch {
 	case err == nil:
@@ -561,9 +575,9 @@ func dispatchFailureClass(err error) (state, class string) {
 		// decides whether a verified uncharged attempt is released or conservatively
 		// settled, while this failed dispatch always retains its upstream task ID.
 		return "failed", "temporary"
-	case errors.Is(err, byteplus.ErrTaskAccepted), errors.Is(err, dola.ErrTaskAccepted):
+	case errors.Is(err, byteplus.ErrTaskAccepted), errors.Is(err, dola.ErrTaskAccepted), errors.Is(err, chatgpt.ErrTaskAccepted), errors.Is(err, grok.ErrTaskAccepted):
 		return "accepted", "temporary"
-	case errors.Is(err, byteplus.ErrTaskSubmissionUnknown), errors.Is(err, dola.ErrTaskSubmissionUnknown):
+	case errors.Is(err, byteplus.ErrTaskSubmissionUnknown), errors.Is(err, dola.ErrTaskSubmissionUnknown), errors.Is(err, chatgpt.ErrTaskSubmissionUnknown):
 		return "unknown", "temporary"
 	case errors.Is(err, adobe.ErrEntitlement):
 		return "failed", "entitlement"

@@ -108,6 +108,14 @@ func (m *MaintenanceService) refreshDueQuota(ctx context.Context) {
 	}
 	go func() {
 		defer m.quotaRefreshing.Store(false)
+		for _, provider := range SchedulableProviders() {
+			if key, unit, ok := providerSnapshotScope(provider); ok {
+				if err := m.models.Quotas().EnsureProviderBuckets(ctx, provider, key, unit); err != nil {
+					recordBookkeepingError("seed unknown quota buckets", err)
+					return
+				}
+			}
+		}
 		buckets, err := m.models.Quotas().ClaimRefreshDue(ctx, time.Now(), 20)
 		if err != nil {
 			recordBookkeepingError("claim quota refresh", err)
@@ -138,7 +146,9 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	if m.tokenSvc != nil {
 		m.tokenSvc.ReprobeDolaReadiness(ctx)
 	}
+	m.reconcileInterruptedDispatches(ctx)
 	m.resumeAcceptedImages(ctx)
+	m.resumeAcceptedVideos(ctx)
 	// Verified-absent submissions flip to failed here so the reservation sweep
 	// below releases their hold in the same tick.
 	m.reconcileUnknownSubmissions(ctx)
@@ -280,6 +290,28 @@ func (m *MaintenanceService) resumeAcceptedImages(ctx context.Context) {
 	}
 }
 
+// resumeAcceptedVideos repairs Dola/Grok renders that outlive the request's
+// initial polling window. It also heals historical rows produced by older
+// builds that marked the event failed while retaining a durable task handle.
+func (m *MaintenanceService) resumeAcceptedVideos(ctx context.Context) {
+	if m.recovery == nil || m.models == nil || m.events == nil {
+		return
+	}
+	attempts, err := m.models.Dispatch().ListAcceptedVideos(ctx, 100)
+	if err != nil {
+		log.Printf("maintenance: list accepted video tasks failed")
+		return
+	}
+	for _, attempt := range attempts {
+		event, eventErr := m.events.GetByID(ctx, attempt.EventID)
+		if eventErr != nil {
+			log.Printf("maintenance: load accepted video event failed")
+			continue
+		}
+		m.recovery.startAcceptedVideoRecovery(ctx, event)
+	}
+}
+
 // Ambiguous create_task outcomes are verified against the provider's own task
 // history only after the create timeout has fully elapsed, so a slowly accepted
 // task cannot be missed. Past the hard cap an event whose account can no longer
@@ -323,6 +355,9 @@ func (m *MaintenanceService) reconcileUnknownSubmissions(ctx context.Context) {
 			// The event was closed by another path; the attempt row is historical.
 			// Mark it so the reservation sweep can release the hold.
 			m.finishUnknownSubmission(ctx, attempt, event)
+			continue
+		}
+		if event.Provider != "byteplus" {
 			continue
 		}
 		verdict, taskID := m.verifyUnknownSubmission(ctx, attempt, event)
@@ -480,6 +515,11 @@ func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context)
 		reservationID := item.Reservation.ID
 		switch state {
 		case "failed":
+			if item.Attempt != nil && item.Attempt.UpstreamTaskID != "" && failureClass != "quota" {
+				// A known upstream task may have consumed quota even when the
+				// result was rejected. Fall through to conservative settlement.
+				break
+			}
 			if failureClass == "quota" {
 				zero := 0.0
 				if err := m.models.Quotas().Settle(ctx, reservationID, &zero); err != nil {
@@ -489,7 +529,7 @@ func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context)
 				log.Printf("maintenance: release reservation %s failed", reservationID)
 			}
 			continue
-		case "unknown", "submitting", "created":
+		case "unknown", "submitting", "created", "unresolved":
 			if err := m.models.Quotas().MarkUncertain(ctx, reservationID); err != nil {
 				log.Printf("maintenance: mark reservation %s uncertain failed", reservationID)
 				continue
@@ -502,7 +542,7 @@ func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context)
 			continue
 		}
 		remaining := m.refreshRecoveredQuota(ctx, account, item.Bucket.BucketKey)
-		if remaining == nil && (state == "unknown" || state == "submitting" || state == "created") {
+		if remaining == nil && (state == "unknown" || state == "submitting" || state == "created" || state == "unresolved") {
 			continue
 		}
 		if err := m.models.Quotas().Settle(ctx, reservationID, remaining); err != nil {

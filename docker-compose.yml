@@ -2,8 +2,15 @@
 # Copy .env.example to .env, replace every secret, then run:
 #   docker compose up -d --build
 # TLS terminates at your reverse proxy in front of host port 2000.
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   postgres:
+    logging: *bounded-logging
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-vivid_ai}
@@ -19,6 +26,7 @@ services:
     restart: unless-stopped
 
   redis:
+    logging: *bounded-logging
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
     environment:
@@ -36,6 +44,7 @@ services:
   # on port 9000. Generated media is served through Bearer-protected /v1 content
   # endpoints, so the bucket stays private.
   rustfs:
+    logging: *bounded-logging
     image: rustfs/rustfs:latest
     environment:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}
@@ -46,27 +55,23 @@ services:
       - rustfsdata:/data
     restart: unless-stopped
 
-  # One-shot: wait for RustFS, create the bucket, then exit. mc (the MinIO client)
-  # speaks S3 so it works against RustFS too.
+  # One-shot: wait for RustFS and create the bucket if missing.
   createbucket:
-    image: minio/mc:latest
+    logging: *bounded-logging
+    build:
+      context: ./backend
+      target: bucketinit
     depends_on:
       - rustfs
     environment:
+      RUSTFS_ENDPOINT: http://rustfs:9000
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in .env}
       RUSTFS_BUCKET: ${RUSTFS_BUCKET:-twoapi}
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set s3 http://rustfs:9000 $$RUSTFS_ACCESS_KEY $$RUSTFS_SECRET_KEY; do
-        echo 'waiting for rustfs...'; sleep 2;
-      done;
-      mc mb -p s3/$$RUSTFS_BUCKET || true;
-      echo 'bucket ready';
-      "
     restart: "no"
 
   backend:
+    logging: *bounded-logging
     init: true
     build:
       context: ./backend
@@ -109,6 +114,7 @@ services:
     restart: unless-stopped
 
   web:
+    logging: *bounded-logging
     build:
       context: ./frontend
     # nginx serves the SPA + proxies the API on container port 2000 (HTTP only).

@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/textproto"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -44,7 +45,7 @@ var videoURLRe = regexp.MustCompile(`"videoUrl":"([^"]+)"`)
 // through ("9:16" etc.); resolution is the tier ("720p"); seconds is the clip
 // length (6 or 10). When downloadResult is false, returns nil bytes and the
 // artifact URL in meta["video_url"]; otherwise downloads the mp4.
-func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, resolution string, seconds int, frames [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
+func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, resolution string, seconds int, frames [][]byte, downloadResult bool, onAccepted func(taskURL string) error) ([]byte, map[string]any, error) {
 	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
 	if token == "" {
 		return nil, nil, ErrAuth
@@ -109,6 +110,10 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	if err != nil {
 		return nil, nil, err
 	}
+	recoveryURL := ""
+	if userID != "" {
+		recoveryURL = fmt.Sprintf("%susers/%s/generated/%s/generated_video.mp4", assetBase, userID, postID)
+	}
 
 	videoCfg := map[string]any{
 		"parentPostId":       postID,
@@ -134,16 +139,24 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 
 	// body may be partial when psErr != nil — still worth scanning.
 	streamCtx, cancelStream := context.WithTimeout(ctx, grokVideoStreamWait)
-	body, psErr := c.postStream(streamCtx, submitClient, token, "/rest/app-chat/conversations/new", payload)
+	body, psErr := c.postStreamAccepted(streamCtx, submitClient, token, "/rest/app-chat/conversations/new", payload, recoveryURL, onAccepted)
 	cancelStream()
 	if dir := strings.TrimSpace(os.Getenv("GROK_DUMP")); dir != "" {
 		_ = os.WriteFile(dir+"/grok_body_"+postID+".txt", []byte(body), 0o644)
 	}
 	// Out-of-credits surfaces as a stream error (HTTP is still 200) — not retryable.
 	if strings.Contains(body, "usagePoolExhausted") || strings.Contains(body, "media generation credits") {
-		return nil, nil, fmt.Errorf("%w: media generation credits exhausted", ErrQuotaExhausted)
+		cause := fmt.Errorf("%w: media generation credits exhausted", ErrQuotaExhausted)
+		if recoveryURL != "" {
+			return nil, nil, AcceptedFailure(recoveryURL, cause)
+		}
+		return nil, nil, cause
 	}
-	if psErr != nil && (errors.Is(psErr, ErrAuth) || errors.Is(psErr, ErrQuotaExhausted)) {
+	// A non-200 response never ran the acceptance callback and is safe to return
+	// through the normal account/route policy. Only the accepted wrapper means
+	// the request reached HTTP 200 (or its transport outcome is ambiguous) and
+	// therefore authorizes polling the deterministic artifact URL.
+	if psErr != nil && !errors.Is(psErr, ErrTaskAccepted) {
 		return nil, nil, psErr
 	}
 	// A fatal stream error means grok definitively rejected this generation
@@ -151,7 +164,11 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	// or any other account — fails identically and only burns the pool, so fail
 	// fast with a non-temporary error the pool won't fail over on.
 	if strings.Contains(body, "STREAM_ERROR_SEVERITY_FATAL") {
-		return nil, nil, fmt.Errorf("grok: video generation rejected by upstream (fatal stream error): %s", clip([]byte(body), 200))
+		cause := fmt.Errorf("%w: fatal stream error", ErrVideoRejected)
+		if recoveryURL != "" {
+			return nil, nil, AcceptedFailure(recoveryURL, cause)
+		}
+		return nil, nil, cause
 	}
 	// Fast path: the artifact appears as "videoUrl":"users/.../generated_video.mp4".
 	artifact := ""
@@ -163,14 +180,16 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	if artifact == "" && userID != "" {
 		// Stream ended without the artifact (dropped connection or early close):
 		// the render continues upstream — wait for the deterministic asset URL.
-		url := fmt.Sprintf("%susers/%s/generated/%s/generated_video.mp4", assetBase, userID, postID)
-		if werr := c.waitForAsset(ctx, directClient, token, url); werr == nil {
-			artifact = url
-		} else if errors.Is(werr, ErrAuth) || errors.Is(werr, context.Canceled) || errors.Is(werr, context.DeadlineExceeded) {
-			return nil, nil, werr
+		if werr := c.waitForAsset(ctx, directClient, token, recoveryURL); werr == nil {
+			artifact = recoveryURL
+		} else if recoveryURL != "" {
+			return nil, nil, AcceptedFailure(recoveryURL, errors.Join(psErr, werr))
 		}
 	}
 	if artifact == "" {
+		if recoveryURL != "" {
+			return nil, nil, AcceptedFailure(recoveryURL, errors.Join(psErr, ErrTemporaryUpstream))
+		}
 		if psErr != nil {
 			return nil, nil, psErr
 		}
@@ -297,6 +316,9 @@ func (c *Client) createPost(ctx context.Context, client tlsclient.HttpClient, to
 	if postID == "" {
 		return "", "", fmt.Errorf("%w: media post missing id", ErrTemporaryUpstream)
 	}
+	if userID == "" {
+		return "", "", fmt.Errorf("%w: media post missing user id", ErrTemporaryUpstream)
+	}
 	return postID, userID, nil
 }
 
@@ -342,6 +364,31 @@ func (c *Client) waitForAsset(ctx context.Context, client tlsclient.HttpClient, 
 	}
 }
 
+// ResumeVideoTask polls the deterministic asset of a previously submitted Grok
+// video. It performs no create or conversation request and therefore cannot
+// consume credits a second time.
+func (c *Client) ResumeVideoTask(ctx context.Context, token, taskURL string) (map[string]any, error) {
+	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+	if token == "" {
+		return nil, ErrAuth
+	}
+	parsed, err := url.Parse(strings.TrimSpace(taskURL))
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), "assets.grok.com") ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		!strings.HasPrefix(parsed.EscapedPath(), "/users/") || !strings.HasSuffix(parsed.EscapedPath(), "/generated_video.mp4") ||
+		!strings.Contains(parsed.EscapedPath(), "/generated/") {
+		return nil, ErrInvalidTaskHandle
+	}
+	client, err := c.newDirectTLSClient()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.waitForAsset(ctx, client, token, parsed.String()); err != nil {
+		return nil, err
+	}
+	return map[string]any{"provider": "grok", "video_url": parsed.String()}, nil
+}
+
 // postJSON does an authed JSON POST and parses a single JSON object response.
 func (c *Client) postJSON(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) (map[string]any, error) {
 	raw, err := c.postWithChallengeRetry(ctx, client, token, path, body)
@@ -361,6 +408,47 @@ func (c *Client) postJSON(ctx context.Context, client tlsclient.HttpClient, toke
 // postStream does an authed JSON POST and returns the full (streamed) text body.
 func (c *Client) postStream(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) (string, error) {
 	raw, err := c.postWithChallengeRetry(ctx, client, token, path, body)
+	return string(raw), err
+}
+
+// postStreamAccepted persists the deterministic artifact handle only after the
+// non-idempotent generation endpoint acknowledges the request with HTTP 200,
+// and before its long response body is read. A transport failure has an
+// ambiguous submission outcome, so it is also persisted conservatively: the
+// caller can poll the known asset without risking a duplicate paid submit.
+func (c *Client) postStreamAccepted(ctx context.Context, client tlsclient.HttpClient, token, path string, body any, taskURL string, onAccepted func(string) error) (string, error) {
+	accepted := func(cause error) error {
+		if strings.TrimSpace(taskURL) == "" {
+			return cause
+		}
+		if onAccepted != nil {
+			if err := onAccepted(taskURL); err != nil {
+				cause = errors.Join(cause, err)
+			}
+		}
+		return AcceptedFailure(taskURL, cause)
+	}
+	attempt := func() ([]byte, error) {
+		raw, status, err := c.doPostAccepted(ctx, client, token, path, body, func() error {
+			if onAccepted == nil {
+				return nil
+			}
+			return onAccepted(taskURL)
+		})
+		if err != nil {
+			if status == http.StatusOK {
+				return raw, AcceptedFailure(taskURL, err)
+			}
+			if status == 0 {
+				return raw, accepted(err)
+			}
+			return raw, err
+		}
+		return raw, mapStatus(path, status, raw)
+	}
+	raw, err := retryChallengeOnce(ctx, attempt, func(ctx context.Context) error {
+		return c.refreshChallenge(ctx, client)
+	})
 	return string(raw), err
 }
 
@@ -392,6 +480,13 @@ func retryChallengeOnce(ctx context.Context, attempt func() ([]byte, error), ref
 }
 
 func (c *Client) doPost(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) ([]byte, int, error) {
+	return c.doPostAccepted(ctx, client, token, path, body, nil)
+}
+
+// doPostAccepted invokes accepted immediately after HTTP 200 response headers
+// arrive, before reading a potentially minutes-long stream. It never invokes
+// accepted for a challenge or another explicit HTTP rejection.
+func (c *Client) doPostAccepted(ctx context.Context, client tlsclient.HttpClient, token, path string, body any, accepted func() error) ([]byte, int, error) {
 	var reader io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -408,6 +503,11 @@ func (c *Client) doPost(ctx context.Context, client tlsclient.HttpClient, token,
 		return nil, 0, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK && accepted != nil {
+		if err := accepted(); err != nil {
+			return nil, resp.StatusCode, err
+		}
+	}
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// Mid-body stream drops ("unexpected EOF", HTTP/2 resets) are common on

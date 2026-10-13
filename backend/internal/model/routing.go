@@ -267,6 +267,7 @@ func secondsRange(first, last int) []string {
 // the unprefixed `gpt-image-2` ID. Oreate, Runway, and Custom are not public.
 func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 	commonImageRatios := []string{"1:1", "16:9", "9:16", "4:3", "3:4"}
+	chatGPTImageRatios := []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2"}
 	adobeWideRatios := []string{"1:1", "5:4", "9:16", "21:9", "16:9", "4:3", "3:2", "4:5", "3:4", "2:3"}
 	// Official Dola /samantha/skill/pack video_generation.ratio options.
 	dolaRatios := []string{"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
@@ -285,7 +286,7 @@ func CanonicalRoutingCatalog() []CanonicalModelDefinition {
 		}},
 
 		{Model: LogicalModel{ID: "gpt-image-2", Kind: "image", Name: "ChatGPT GPT Image 2", Enabled: true}, Routes: []ModelRoute{
-			route("image.gpt-image-2.chatgpt", "gpt-image-2", "chatgpt", "gpt-image-2", "gpt-image-2", 100, imageProfile(commonImageRatios, []string{"1K"}, 6)),
+			route("image.gpt-image-2.chatgpt", "gpt-image-2", "chatgpt", "gpt-image-2", "gpt-image-2", 100, imageProfile(chatGPTImageRatios, []string{"1K"}, 6)),
 		}},
 		{Model: LogicalModel{ID: "byteplus-gpt-image-2", Kind: "image", Name: "BytePlus GPT Image 2", Enabled: true}, Routes: []ModelRoute{
 			route("image.gpt-image-2.byteplus", "byteplus-gpt-image-2", "byteplus", "lumina-gpt-image-2", "6824519374061285743", 100, imageProfile(commonImageRatios, []string{"1K", "2K", "4K"}, 14)),

@@ -61,6 +61,10 @@ type VideoOptions struct {
 	// uploaded through the ImageX chain and attached to the message. The
 	// public Seedance 2.5 route accepts up to ten.
 	ReferenceImages []MediaReference
+	// OnAccepted persists the upstream conversation before the long poll starts.
+	// Once this callback succeeds, callers must recover this exact conversation
+	// instead of replaying the non-idempotent generation request.
+	OnAccepted func(conversationID string) error
 }
 
 // GenerateVideo submits one text-to-video or image-to-video request and
@@ -106,6 +110,11 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 	if err != nil {
 		return nil, nil, err
 	}
+	if options.OnAccepted != nil {
+		if err := options.OnAccepted(conversationID); err != nil {
+			return nil, nil, AcceptedFailure(conversationID, err)
+		}
+	}
 	videoURL, err := c.pollVideo(ctx, pollingAccount, conversationID, webTabID)
 	if err != nil {
 		if !errors.Is(err, ErrQuotaExhausted) && !errors.Is(err, ErrVideoNotStarted) {
@@ -119,6 +128,37 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 		"video_url":       videoURL,
 	}
 	return nil, meta, nil
+}
+
+// ResumeVideoTask continues only the polling half of a previously accepted
+// Dola generation. It never submits a prompt, uploads references, or consumes a
+// second daily generation. The account bootstrap is repeated because protocol
+// query/device state is process-local and is lost across restarts.
+func (c *Client) ResumeVideoTask(ctx context.Context, account Account, conversationID string) (map[string]any, error) {
+	account = account.normalized()
+	conversationID = strings.TrimSpace(conversationID)
+	if account.Cookie == "" {
+		return nil, ErrAuth
+	}
+	if conversationID == "" {
+		return nil, errors.New("dola: conversation id required")
+	}
+	if c.usesProtocol() {
+		prepared, err := c.prepareProtocolAccount(ctx, account)
+		if err != nil {
+			return nil, err
+		}
+		account = prepared
+	}
+	videoURL, err := c.pollVideo(ctx, account, conversationID, uuid.NewString())
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"provider":        "dola",
+		"conversation_id": conversationID,
+		"video_url":       videoURL,
+	}, nil
 }
 
 // submitVideo posts the chat completion and returns the conversation the

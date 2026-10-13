@@ -38,7 +38,15 @@ server {
     }
 
     # ---- API / media / health -> backend ----
-    location ^~ /admin/api/ { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
+    location ^~ /admin/api/ {
+        proxy_pass http://backend:6666;
+        # Administrator image/video previews share this prefix. Do not spool a
+        # media response to nginx's proxy temp directory before the browser can
+        # consume its requested byte range.
+        proxy_buffering off;
+        proxy_cache off;
+        add_header Cache-Control "no-store" always;
+    }
     location = /health/live  { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
     location = /health/ready { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
     # /v1 is per-API-key authenticated — never cache.

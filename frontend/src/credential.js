@@ -5,18 +5,6 @@
 import { strFromU8, unzipSync } from 'fflate'
 import { ACCOUNT_PROVIDERS } from './models.js'
 
-export function parseCredentialInput(value) {
-  const trimmed = String(value ?? '').trim()
-  if (!trimmed) return ''
-
-  try {
-    const parsed = JSON.parse(trimmed)
-    return parsed !== null && typeof parsed === 'object' ? parsed : trimmed
-  } catch {
-    return trimmed
-  }
-}
-
 function decodeJWTPayload(value) {
   try {
     let payload = String(value || '').replace(/^Bearer\s+/i, '').trim().split('.')[1]
@@ -310,7 +298,7 @@ function parseJSONDocument(text, label) {
 }
 
 /** Parse one JSON or ZIP export using the same limits as the previous importer. */
-export function parseCredentialFileBytes(bytes, filename = 'accounts.json') {
+function parseCredentialFileBytes(bytes, filename = 'accounts.json') {
   const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
   if (data.byteLength > MAX_IMPORT_FILE_BYTES) throw new Error('导入文件不能超过 20 MB')
 

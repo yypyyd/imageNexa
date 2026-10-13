@@ -10,6 +10,19 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: imagenexa_optimization_test_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      IMAGENEXA_TEST_DSN: host=localhost user=postgres password=test-only-password dbname=imagenexa_optimization_test_ci port=5432 sslmode=disable
     defaults:
       run:
         working-directory: backend
@@ -23,6 +36,8 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      - name: Test
+        run: go test ./...
       - name: Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 

@@ -43,7 +43,3 @@ export const ACCOUNT_PROVIDERS = Object.freeze([
   'grok',
   'dola',
 ])
-
-export function isCanonicalModel(id) {
-  return Object.hasOwn(MODEL_KIND, id)
-}

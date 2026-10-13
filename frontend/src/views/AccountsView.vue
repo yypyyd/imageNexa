@@ -115,7 +115,12 @@ function toggleSelectAll() {
 }
 
 function firstQuota(account) {
-  return (account.quota_buckets || [])[0] || null
+  const buckets = account.quota_buckets || []
+  return buckets.find((bucket) => bucket.name === account.primary_quota_bucket) || (account.primary_quota_bucket ? null : buckets[0]) || null
+}
+
+function quotaStateLabel(value) {
+  return ({ available: '有额度', empty: '额度已耗尽', unknown: '额度待确认', stale: '额度待刷新', unmetered: '按上游额度' })[value] || '额度待确认'
 }
 
 function quotaPercent(bucket) {
@@ -137,7 +142,7 @@ function fmtTime(value) {
 }
 
 function statusLabel(value) {
-  return ({ active: '可用', quota: '额度受限', pending: '待校验', disabled: '已禁用', auth_error: '凭据失效', cooldown: '冷却中' })[value] || value || '未知'
+  return ({ active: '已启用', quota: '额度受限', pending: '待校验', disabled: '已禁用', auth_error: '凭据失效', cooldown: '冷却中' })[value] || value || '未知'
 }
 
 function dolaReadinessLabel(account) {
@@ -308,13 +313,15 @@ onUnmounted(() => clearInterval(readinessTimer))
 
     <div class="provider-stock" aria-label="各平台账号数量">
       <button v-for="option in PROVIDER_OPTIONS" :key="option.value" :class="provider === option.value && 'on'" @click="selectProvider(option.value)">
-        <span>{{ option.label }}</span><strong>{{ Number(providerCounts[option.value] || 0).toLocaleString('zh-CN') }}</strong><small title="可用 / 失效 / 限额"><i class="ok">{{ providerHealth[option.value]?.active || 0 }}</i> / <i class="bad">{{ providerHealth[option.value]?.dead || 0 }}</i> / <i class="warn">{{ providerHealth[option.value]?.quota || 0 }}</i></small>
+        <span>{{ option.label }}</span><strong>{{ Number(providerCounts[option.value] || 0).toLocaleString('zh-CN') }}</strong>
+        <small title="有额度为已启用账号的最近媒体额度快照；具体模型可用性还受权限和并发限制">有额度 <i class="ok">{{ providerHealth[option.value]?.quota_available || 0 }}</i> · 待确认 <i class="warn">{{ (providerHealth[option.value]?.quota_unknown || 0) + (providerHealth[option.value]?.quota_stale || 0) }}</i></small>
+        <small>启用 {{ providerHealth[option.value]?.active || 0 }} · 失效 {{ providerHealth[option.value]?.dead || 0 }} · 无额度 {{ (providerHealth[option.value]?.quota_empty || 0) + (providerHealth[option.value]?.quota || 0) }}</small>
       </button>
     </div>
 
     <div class="card p-3 flex flex-wrap items-center gap-2">
       <SelectMenu v-model="provider" class="w-36" :options="[{ value: '', label: '全部 Provider' }, ...PROVIDER_OPTIONS]" @update:model-value="search" />
-      <SelectMenu v-model="status" class="w-32" :options="[{value:'',label:'全部状态'},{value:'active',label:'可用'},{value:'quota',label:'额度受限'},{value:'pending',label:'待校验'},{value:'disabled',label:'已禁用'},{value:'auth_error',label:'凭据失效'},{value:'cooldown',label:'冷却中'}]" @update:model-value="search" />
+      <SelectMenu v-model="status" class="w-32" :options="[{value:'',label:'全部状态'},{value:'active',label:'已启用'},{value:'quota',label:'额度受限'},{value:'pending',label:'待校验'},{value:'disabled',label:'已禁用'},{value:'auth_error',label:'凭据失效'},{value:'cooldown',label:'冷却中'}]" @update:model-value="search" />
       <input v-model="query" class="field !py-1.5 text-xs flex-1 min-w-52" placeholder="搜索标签、邮箱或 ID…" @keyup.enter="search" />
       <button class="btn-soft" @click="search"><Icon name="refresh" class="w-3.5 h-3.5" />查询</button>
     </div>
@@ -351,6 +358,7 @@ onUnmounted(() => clearInterval(readinessTimer))
                 <div class="quota-bar"><span :style="{ width: `${quotaPercent(firstQuota(account))}%` }"></span></div>
               </template>
               <span v-else class="muted">未获取</span>
+              <small class="block mt-1" :class="account.quota_state === 'available' ? 'ok' : 'warn'">{{ quotaStateLabel(account.quota_state) }}</small>
             </td>
             <td class="stats-cell"><div><b>{{ account.active_jobs || 0 }}</b> 在途</div><small><span class="ok">{{ account.success_total || 0 }}</span> / <span :class="Number(account.fail_total || 0) > 0 && 'bad'">{{ account.fail_total || 0 }}</span></small></td>
             <td class="time-cell"><div title="最后使用">{{ fmtTime(account.last_used_at) }}</div><small title="导入/创建时间">{{ fmtTime(account.created_at) }}</small><small v-if="account.provider === 'byteplus'" :class="{ warn: account.session_state === 'expiring', bad: account.session_state === 'expired' }" :title="sessionLabel(account)">{{ sessionLabel(account) }} {{ fmtTime(account.session_expires_at) }}</small></td>

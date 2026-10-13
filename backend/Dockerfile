@@ -9,6 +9,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/init-bucket ./cmd/init-bucket
+
+# One-shot storage setup uses our existing S3 client and build toolchain.
+FROM scratch AS bucketinit
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/init-bucket /init-bucket
+USER 65534:65534
+ENTRYPOINT ["/init-bucket"]
 
 # --- Stage 2: minimal runtime image ---
 FROM alpine:3.20

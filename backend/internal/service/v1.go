@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -192,6 +193,10 @@ type V1Service struct {
 	// BytePlus task. The recovery path only resumes an accepted task id; it never
 	// replays create_task.
 	imageRecoveries sync.Map
+	// videoRecoveries provides the same single-flight guarantee for accepted
+	// video tasks. Recovery only polls a durable upstream handle; it never
+	// resubmits the generation prompt.
+	videoRecoveries sync.Map
 
 	// inflight maps an in-progress event ID → the cancel func of its generation
 	// work context, so the maintenance sweep can stop a stuck generation the
@@ -392,7 +397,7 @@ func normalizeImageResponseFormat(value string) (string, error) {
 	case "b64_json":
 		return "b64_json", nil
 	default:
-		return "", fmt.Errorf("%w: response_format must be b64_json or url", ErrUnsupportedParams)
+		return "", invalidParameter("response_format", "response_format must be b64_json or url.", "b64_json", "url")
 	}
 }
 
@@ -539,18 +544,24 @@ func (s *V1Service) checkBannedPrompt(ctx context.Context, principal *APIPrincip
 // logRejectedEvent records a request rejected BEFORE the pending event exists
 // (banned word, concurrency full, unknown model, insufficient credits…) as a
 // failed event, so every attempt shows up in the logs.
-func (s *V1Service) logRejectedEvent(ctx context.Context, kind, modelID string, principal *APIPrincipal, prompt, source, reason string) {
+func (s *V1Service) logRejectedEvent(ctx context.Context, kind, modelID string, principal *APIPrincipal, prompt, source string, reason error) {
 	event := &model.EventLog{
 		ID:        "evt-" + randomUpper(12),
 		TS:        time.Now(),
 		Kind:      kind,
 		Status:    "failed",
+		Phase:     "validation",
 		Model:     strings.TrimSpace(modelID),
 		Prompt:    prompt,
 		Source:    source,
-		Error:     reason,
+		Error:     safeGenerationErrorText(reason),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
+	}
+	var parameter *ParameterError
+	if errors.As(reason, &parameter) {
+		event.Error = ErrUnsupportedParams.Error()
+		event.ErrorParam = parameter.Param
 	}
 	if m, err := s.models.Get(ctx, event.Model); err == nil {
 		event.Model = m.ID
@@ -824,7 +835,7 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 		return nil, ErrUnsupportedParams
 	}
 	if err := s.checkBannedPrompt(ctx, principal, prompt); err != nil {
-		s.logRejectedEvent(context.WithoutCancel(ctx), "text", modelName, principal, prompt, source, err.Error())
+		s.logRejectedEvent(context.WithoutCancel(ctx), "text", modelName, principal, prompt, source, err)
 		return nil, err
 	}
 
@@ -836,7 +847,7 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 			return nil, gateErr
 		}
 		if !admitted {
-			s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, ErrUserConcurrencyFull.Error())
+			s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, ErrUserConcurrencyFull)
 			return nil, ErrUserConcurrencyFull
 		}
 	}
@@ -851,7 +862,7 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 	price, err := s.chargeForModel(bookCtx, principal, logicalItem, "text", "request", "", 0, true)
 	if err != nil {
 		releaseUser()
-		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, err.Error())
+		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, err)
 		return nil, err
 	}
 	eventID, err := s.logPendingEvent(bookCtx, "text", logicalItem, principal, prompt, "", "", "", 0, price, "", source, nil, false, "", "")
@@ -1265,6 +1276,9 @@ func (s *V1Service) waitForImageResult(ctx context.Context, principal *APIPrinci
 					"created": current["created"], "data": current["data"], "model": current["model"], "kind": "image",
 				}, nil
 			case "failed":
+				if current["error"] == ErrGenerationOutcomeUnknown.Error() {
+					return nil, ErrGenerationOutcomeUnknown
+				}
 				return nil, fmt.Errorf("%w: previous idempotent image request failed", ErrProviderExecution)
 			case "queued", "in_progress":
 				// The event row is durable and already carries request_id/poll_url.
@@ -1431,7 +1445,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	}
 	if source != "admin" {
 		if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
-			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err)
 			return nil, err
 		}
 	}
@@ -1452,7 +1466,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			return nil, gateErr
 		}
 		if !admitted {
-			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull)
 			return nil, ErrUserConcurrencyFull
 		}
 		defer s.credentialRelease(ctx, principal.Credential.ID, slot)
@@ -1460,7 +1474,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 
 	modelItem, resolution, aspectRatio, price, err := s.prepareImage(ctx, principal, in, charge)
 	if err != nil {
-		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
+		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err)
 		return nil, err
 	}
 	refCount := len(in.ReferenceImages)
@@ -1498,6 +1512,10 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	imageBytes, upstreamURL, execErr := s.dispatchImageRoutes(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
 	if execErr != nil {
 		if noRouteFailover(execErr) {
+			if errors.Is(execErr, chatgpt.ErrContentPolicy) {
+				recordBookkeepingError("update rejected image event", s.events.UpdateStatus(ctx, eventID, "failed", ErrContentRejected.Error(), int(time.Since(startedAt).Milliseconds())))
+				return nil, ErrContentRejected
+			}
 			// create_task is non-idempotent. Accepted and submission-unknown
 			// outcomes stay pending so task lookup can resume a known task id or
 			// conservatively await maintenance without ever resubmitting.
@@ -1508,15 +1526,15 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				recordBookkeepingError("update failed beta image event", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
 				return nil, publicGenerationError(execErr)
 			}
-			if errors.Is(execErr, byteplus.ErrTaskAccepted) {
+			if errors.Is(execErr, byteplus.ErrTaskAccepted) || errors.Is(execErr, chatgpt.ErrTaskAccepted) {
 				if event, lookupErr := s.events.GetByID(ctx, eventID); lookupErr == nil {
 					s.startAcceptedImageRecovery(ctx, event)
 				} else {
 					recordBookkeepingError("load accepted image event", lookupErr)
 				}
-				return nil, errors.Join(ErrProviderTemporary, byteplus.ErrTaskAccepted)
+				return nil, errors.Join(ErrProviderTemporary, execErr)
 			}
-			return nil, errors.Join(ErrProviderTemporary, byteplus.ErrTaskSubmissionUnknown)
+			return nil, errors.Join(ErrProviderTemporary, execErr)
 		}
 		recordBookkeepingError("update failed image event", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
 		return nil, publicGenerationError(execErr)
@@ -1547,6 +1565,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		// The object key and metadata follow payload magic, never a provider URL
 		// suffix or stale Content-Type. This matters for BytePlus, whose resource
 		// endpoint can label JPEG/WebP/AVIF results as PNG.
+		recordBookkeepingError("mark image storage phase", s.events.SetPhase(ctx, eventID, "storage"))
 		relativePath = replaceMediaExtension(relativePath, imageExtension)
 		if !apiRequest {
 			fileURL = replaceMediaExtension(fileURL, imageExtension)
@@ -1693,6 +1712,7 @@ func (s *V1Service) imageTaskFromEvent(ctx context.Context, principal *APIPrinci
 		"event_id":   event.ID,
 		"created":    event.TS.Unix(),
 		"model":      event.Model,
+		"phase":      event.Phase,
 		"data":       []any{},
 	}
 	switch event.Status {
@@ -1754,10 +1774,15 @@ func storedImageResponseFormat(value string) string {
 }
 
 // startAcceptedImageRecovery launches one background resume for a durable
-// BytePlus parent task. Unknown submissions have no task id and deliberately do
+// provider task. Unknown submissions have no task id and deliberately do
 // nothing here: replaying create_task could double-charge the account.
 func (s *V1Service) startAcceptedImageRecovery(parent context.Context, event *model.EventLog) {
-	if event == nil || event.Status != "pending" || event.Provider != "byteplus" || s.byteplus == nil || s.store == nil {
+	if event == nil || event.Status != "pending" || s.store == nil ||
+		(event.Provider != "byteplus" && event.Provider != "chatgpt") ||
+		(event.Provider == "byteplus" && s.byteplus == nil) || (event.Provider == "chatgpt" && s.chatgpt == nil) {
+		return
+	}
+	if s.inflight != nil && s.inflight.Active(event.ID) {
 		return
 	}
 	attempt, err := s.models.Dispatch().LatestAcceptedForEvent(parent, event.ID)
@@ -1779,17 +1804,33 @@ func (s *V1Service) startAcceptedImageRecovery(parent context.Context, event *mo
 		defer cancel()
 		s.inflight.Add(event.ID, cancel)
 		defer s.inflight.Done(event.ID)
+		recordBookkeepingError("mark image recovery phase", s.events.SetPhase(ctx, event.ID, "recovery"))
 
-		account, accountErr := s.tokens.Get(ctx, "byteplus", attempt.AccountID)
+		account, accountErr := s.tokens.Get(ctx, event.Provider, attempt.AccountID)
 		if accountErr != nil || account == nil || strings.TrimSpace(account.Value) == "" {
 			recordBookkeepingError("load accepted image account", accountErr)
 			return
 		}
-		data, _, resumeErr := s.byteplus.ResumeImageTask(ctx, account.Value, attempt.UpstreamTaskID, true)
+		var data []byte
+		var resumeErr error
+		if event.Provider == "chatgpt" {
+			var meta map[string]any
+			_, meta, resumeErr = s.chatgpt.ResumeImageTask(ctx, account.Value, attempt.UpstreamTaskID)
+			if resumeErr == nil {
+				var body io.ReadCloser
+				var ct string
+				body, ct, resumeErr = s.chatgpt.OpenAsset(ctx, account.Value, stringValue(meta["image_url"]))
+				if resumeErr == nil {
+					data, resumeErr = readProviderArtifact(body, ct, netguard.MediaImage, netguard.MaxImageBytes)
+				}
+			}
+		} else {
+			data, _, resumeErr = s.byteplus.ResumeImageTask(ctx, account.Value, attempt.UpstreamTaskID, true)
+		}
 		if resumeErr != nil {
 			// A transient poll/download failure keeps the accepted task recoverable.
 			// Explicit terminal provider outcomes can safely close the event.
-			if errors.Is(resumeErr, byteplus.ErrQuotaExhausted) || errors.Is(resumeErr, byteplus.ErrRiskControl) || errors.Is(resumeErr, byteplus.ErrInvalidParams) || errors.Is(resumeErr, byteplus.ErrTaskFailed) {
+			if errors.Is(resumeErr, byteplus.ErrQuotaExhausted) || errors.Is(resumeErr, byteplus.ErrRiskControl) || errors.Is(resumeErr, byteplus.ErrInvalidParams) || errors.Is(resumeErr, byteplus.ErrTaskFailed) || errors.Is(resumeErr, chatgpt.ErrContentPolicy) {
 				publicErr := publicGenerationError(resumeErr)
 				if errors.Is(resumeErr, byteplus.ErrTaskFailed) {
 					publicErr = ErrProviderExecution
@@ -1822,13 +1863,108 @@ func (s *V1Service) startAcceptedImageRecovery(parent context.Context, event *mo
 		}
 		recordBookkeepingError("complete accepted image dispatch", s.models.Dispatch().Finish(ctx, attempt.ID, "succeeded", "", attempt.UpstreamTaskID, nil))
 		recordBookkeepingError("complete accepted image route", s.models.Routes().RecordAccountRouteResult(ctx, attempt.AccountID, attempt.ModelRouteID, "", true))
-		_, updateErr := s.tokens.Update(ctx, "byteplus", account.ID, map[string]any{
+		_, updateErr := s.tokens.Update(ctx, event.Provider, account.ID, map[string]any{
 			"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
 		})
 		recordBookkeepingError("complete accepted image account", updateErr)
-		_ = s.refreshDispatchQuota(withDispatchRoute(ctx, mustDispatchRoute(ctx, s.models, attempt.ModelRouteID), 0), "byteplus", *account, "image")
+		_ = s.refreshDispatchQuota(withDispatchRoute(ctx, mustDispatchRoute(ctx, s.models, attempt.ModelRouteID), 0), event.Provider, *account, "image")
 		recordBookkeepingError("increment accepted image generation", s.models.IncrementGenerationCount(ctx, event.Model))
 	}(*event, *attempt)
+}
+
+const acceptedVideoRecoveryWindow = 20 * time.Minute
+
+// startAcceptedVideoRecovery continues an already accepted video task without
+// replaying its prompt. Dola conversations and Grok deterministic artifact URLs
+// are durable across request timeouts and restarts, so slow renders remain
+// pending until this path obtains a final URL or an explicit terminal verdict.
+func (s *V1Service) startAcceptedVideoRecovery(parent context.Context, event *model.EventLog) {
+	if event == nil || event.Kind != "video" || (event.Status != "pending" && event.Status != "failed") {
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(event.Provider))
+	if (provider != "dola" && provider != "grok") || (provider == "dola" && s.dola == nil) || (provider == "grok" && s.grok == nil) {
+		return
+	}
+	// The original generation poll may still be alive. Running a second poll is
+	// harmless upstream but wastes a residential lease and can race its cleanup.
+	if s.inflight != nil && s.inflight.Active(event.ID) {
+		return
+	}
+	attempt, err := s.models.Dispatch().LatestAcceptedForEvent(parent, event.ID)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			recordBookkeepingError("load accepted video dispatch", err)
+		}
+		return
+	}
+	if !strings.HasSuffix(attempt.ModelRouteID, "."+provider) || strings.TrimSpace(attempt.UpstreamTaskID) == "" {
+		return
+	}
+	if _, loaded := s.videoRecoveries.LoadOrStore(attempt.ID, struct{}{}); loaded {
+		return
+	}
+	go func(event model.EventLog, attempt model.DispatchAttempt) {
+		defer s.videoRecoveries.Delete(attempt.ID)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), acceptedVideoRecoveryWindow)
+		defer cancel()
+		s.inflight.Add(event.ID, cancel)
+		defer s.inflight.Done(event.ID)
+		s.applyGlobalProxy(ctx)
+		recordBookkeepingError("mark video recovery phase", s.events.SetPhase(ctx, event.ID, "recovery"))
+
+		account, accountErr := s.tokens.Get(ctx, provider, attempt.AccountID)
+		if accountErr != nil || account == nil || strings.TrimSpace(account.Value) == "" {
+			recordBookkeepingError("load accepted video account", accountErr)
+			return
+		}
+		var meta map[string]any
+		var resumeErr error
+		switch provider {
+		case "dola":
+			meta, resumeErr = s.dola.ResumeVideoTask(ctx, dolaAccountFromToken(*account), attempt.UpstreamTaskID)
+		case "grok":
+			meta, resumeErr = s.grok.ResumeVideoTask(ctx, account.Value, attempt.UpstreamTaskID)
+		}
+		if resumeErr != nil {
+			if terminalVideoRecoveryError(provider, resumeErr) {
+				publicErr := publicGenerationError(resumeErr)
+				recordBookkeepingError("finish accepted video event", s.events.UpdateStatus(ctx, event.ID, "failed", publicErr.Error(), 0))
+				recordBookkeepingError("finish accepted video dispatch", s.models.Dispatch().Finish(ctx, attempt.ID, "failed", dispatchFailureClassName(resumeErr), attempt.UpstreamTaskID, publicErr))
+			}
+			return
+		}
+		videoURL := strings.TrimSpace(stringValue(meta["video_url"]))
+		if videoURL == "" {
+			return
+		}
+		elapsed := int(time.Since(event.TS).Milliseconds())
+		if updateErr := s.events.MarkVideoReady(ctx, event.ID, videoURL, elapsed); updateErr != nil {
+			recordBookkeepingError("complete accepted video event", updateErr)
+			return
+		}
+		recordBookkeepingError("complete accepted video dispatch", s.models.Dispatch().Finish(ctx, attempt.ID, "succeeded", "", attempt.UpstreamTaskID, nil))
+		recordBookkeepingError("complete accepted video route", s.models.Routes().RecordAccountRouteResult(ctx, attempt.AccountID, attempt.ModelRouteID, "", true))
+		_, updateErr := s.tokens.Update(ctx, provider, account.ID, map[string]any{
+			"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
+		})
+		recordBookkeepingError("complete accepted video account", updateErr)
+		recordBookkeepingError("increment accepted video generation", s.models.IncrementGenerationCount(ctx, event.Model))
+	}(*event, *attempt)
+}
+
+func terminalVideoRecoveryError(provider string, err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	switch provider {
+	case "dola":
+		return !errors.Is(err, dola.ErrTemporaryUpstream) && !errors.Is(err, dola.ErrAuth) && !errors.Is(err, dola.ErrChallenge)
+	case "grok":
+		return errors.Is(err, grok.ErrInvalidTaskHandle) || errors.Is(err, grok.ErrVideoRejected)
+	default:
+		return false
+	}
 }
 
 func dispatchFailureClassName(err error) string {
@@ -1849,9 +1985,11 @@ func mustDispatchRoute(ctx context.Context, models *repo.ModelRepository, routeI
 // background; the render captures only the UPSTREAM video URL (no download, no
 // RustFS). GET /v1/videos/{id} polls status; /content proxies the upstream URL.
 
-// prepareAdminVideoTest executes one synchronous video capability test through
-// the selected account. The artifact stays behind the administrator session and
-// the upstream URL is never returned to the browser.
+// prepareAdminVideoTest queues a video capability test through the selected
+// account. Video renders can exceed reverse-proxy request deadlines, so the
+// browser polls the durable event instead of holding one HTTP request open.
+// The artifact stays behind the administrator session and the upstream URL is
+// never returned to the browser.
 func (s *V1Service) prepareAdminVideoTest(ctx context.Context, in V1VideoRequest) (map[string]any, error) {
 	s.applyGlobalProxy(ctx)
 	ctx = context.WithoutCancel(ctx)
@@ -1865,6 +2003,14 @@ func (s *V1Service) prepareAdminVideoTest(ctx context.Context, in V1VideoRequest
 	if err != nil {
 		return nil, err
 	}
+	go s.runAdminVideoTest(ctx, in, modelItem, eventID, aspectRatio, resolution, duration)
+	return map[string]any{
+		"kind": "video", "model": modelItem.EffectiveName(), "event_id": eventID,
+		"status": "queued", "status_url": "/admin/api/test/events/" + eventID,
+	}, nil
+}
+
+func (s *V1Service) runAdminVideoTest(ctx context.Context, in V1VideoRequest, modelItem *model.ModelConfig, eventID, aspectRatio, resolution, duration string) {
 	genCtx, cancel := context.WithTimeout(ctx, videoGenerationTimeout)
 	defer cancel()
 	s.inflight.Add(eventID, cancel)
@@ -1873,22 +2019,50 @@ func (s *V1Service) prepareAdminVideoTest(ctx context.Context, in V1VideoRequest
 
 	_, videoURL, execErr := s.dispatchVideoRoutes(genCtx, eventID, modelItem, in, aspectRatio, resolution, duration, false)
 	if execErr != nil {
+		if acceptedVideoRecoveryPending(execErr) {
+			recordBookkeepingError("queue accepted admin video recovery", s.events.SetPhase(ctx, eventID, "recovery"))
+			return
+		}
 		recordBookkeepingError("update failed admin video test", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
-		return nil, publicGenerationError(execErr)
+		return
 	}
 	if strings.TrimSpace(videoURL) == "" {
 		recordBookkeepingError("update empty admin video test", s.events.UpdateStatus(ctx, eventID, "failed", ErrProviderExecution.Error(), 0))
-		return nil, ErrProviderExecution
+		return
 	}
 	elapsedMS := int(time.Since(startedAt).Milliseconds())
 	if err := s.events.MarkVideoReady(ctx, eventID, videoURL, elapsedMS); err != nil {
-		return nil, err
+		return
 	}
 	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
-	return map[string]any{
-		"kind": "video", "model": modelItem.EffectiveName(), "event_id": eventID,
-		"url": "/admin/api/test/artifacts/" + eventID, "elapsed_ms": elapsedMS,
-	}, nil
+}
+
+// AdminTestStatus exposes only the durable state of an administrator-owned test
+// event. The provider artifact URL remains private; successful media is served
+// through the authenticated test artifact endpoint.
+func (s *V1Service) AdminTestStatus(ctx context.Context, eventID string) (map[string]any, error) {
+	event, err := s.events.GetByID(ctx, strings.TrimSpace(eventID))
+	if err != nil {
+		return nil, err
+	}
+	if event == nil || event.Source != "admin" {
+		return nil, ErrNotFound
+	}
+	elapsedMS := event.ElapsedMS
+	if event.Status == "pending" {
+		elapsedMS = int(time.Since(event.TS).Milliseconds())
+	}
+	result := map[string]any{
+		"event_id": event.ID, "kind": event.Kind, "model": event.Model,
+		"status": event.Status, "phase": event.Phase, "elapsed_ms": elapsedMS,
+	}
+	switch event.Status {
+	case "success":
+		result["url"] = "/admin/api/test/artifacts/" + event.ID
+	case "failed":
+		result["error"] = safeStoredGenerationError(event.Error)
+	}
+	return result, nil
 }
 
 // StartVideoJob validates+charges, creates the job event, kicks the render off in
@@ -1916,12 +2090,12 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 	ctx = context.WithoutCancel(ctx)
 	ctx = withSchedulingCache(ctx)
 	if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
-		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
+		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err)
 		return nil, err
 	}
 	modelItem, resolution, aspectRatio, duration, price, err := s.prepareVideo(ctx, principal, in, true)
 	if err != nil {
-		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
+		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err)
 		return nil, err
 	}
 	// Source "v1": no output file is allocated — the result is the upstream URL,
@@ -2025,6 +2199,10 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 	// (grok URLs are auth-gated → fetched with the generating account's token).
 	_, videoURL, execErr := s.dispatchVideoRoutes(genCtx, eventID, modelItem, in, aspectRatio, resolution, duration, false)
 	if execErr != nil {
+		if acceptedVideoRecoveryPending(execErr) {
+			recordBookkeepingError("queue accepted async video recovery", s.events.SetPhase(ctx, eventID, "recovery"))
+			return
+		}
 		_ = s.refundIfNeeded(ctx, principal, eventID, price)
 		recordBookkeepingError("update async video failure", s.events.UpdateStatus(ctx, eventID, "failed", safeGenerationErrorText(execErr), 0))
 		return
@@ -2039,6 +2217,22 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		return
 	}
 	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
+}
+
+func acceptedVideoRecoveryPending(err error) bool {
+	var dolaSubmission *dola.VideoSubmissionError
+	if errors.As(err, &dolaSubmission) {
+		return !errors.Is(dolaSubmission.Cause, dola.ErrContentRejected) &&
+			!errors.Is(dolaSubmission.Cause, dola.ErrVideoNotStarted) &&
+			!errors.Is(dolaSubmission.Cause, dola.ErrQuotaExhausted)
+	}
+	var grokSubmission *grok.VideoSubmissionError
+	if errors.As(err, &grokSubmission) {
+		return !errors.Is(grokSubmission.Cause, grok.ErrVideoRejected) &&
+			!errors.Is(grokSubmission.Cause, grok.ErrQuotaExhausted) &&
+			!errors.Is(grokSubmission.Cause, grok.ErrInvalidTaskHandle)
+	}
+	return false
 }
 
 // VideoJob returns the OpenAI video object for a job, scoped to the caller.
@@ -2065,62 +2259,196 @@ func (s *V1Service) VideoJob(ctx context.Context, principal *APIPrincipal, id st
 	return videoJobObject(ev.ID, modelName, status, progress, ev.Duration, sizeFromRatioRes(ev.Ratio, ev.Resolution), ev.TS.Unix(), completedAt, errMsg), nil
 }
 
-// OpenVideoContent streams a completed job's video by proxying the stored
-// upstream URL (downloaded on demand — never persisted).
+// VideoContent carries the upstream response metadata required by HTML5 video
+// players. In particular, a browser Range request must remain a 206 with its
+// Content-Range intact; turning it into a chunked 200 prevents reliable seeking
+// and can stop MP4 files whose metadata is near the end from starting at all.
+type VideoContent struct {
+	Body          io.ReadCloser
+	ContentType   string
+	StatusCode    int
+	ContentLength int64
+	ContentRange  string
+	AcceptRanges  string
+}
+
+// OpenVideoContent keeps the original no-range service contract for internal
+// callers. HTTP handlers use OpenVideoContentRange so browser range metadata is
+// preserved end to end.
 func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
-	_ = s.applyGlobalProxy(ctx)
-	ev, err := s.videoEventForUser(ctx, principal, id)
+	content, err := s.OpenVideoContentRange(ctx, principal, id, "")
 	if err != nil {
 		return nil, "", err
 	}
+	return content.Body, content.ContentType, nil
+}
+
+// OpenVideoContentRange streams a completed video's requested byte range.
+func (s *V1Service) OpenVideoContentRange(ctx context.Context, principal *APIPrincipal, id, rawRange string) (*VideoContent, error) {
+	_ = s.applyGlobalProxy(ctx)
+	ev, err := s.videoEventForUser(ctx, principal, id)
+	if err != nil {
+		return nil, err
+	}
 	if ev.Status != "success" || strings.TrimSpace(ev.File) == "" {
-		return nil, "", ErrVideoNotReady
+		return nil, ErrVideoNotReady
+	}
+	rangeHeader, err := normalizeVideoRange(rawRange)
+	if err != nil {
+		return nil, err
+	}
+	file := strings.TrimSpace(ev.File)
+	if !strings.Contains(file, "://") {
+		if s.store == nil || !s.store.Configured() {
+			return nil, fmt.Errorf("%w: video storage unavailable", ErrProviderTemporary)
+		}
+		resp, getErr := s.store.Get(ctx, file, rangeHeader)
+		if getErr != nil {
+			return nil, fmt.Errorf("%w: fetch stored video failed", ErrProviderTemporary)
+		}
+		return videoContentFromResponse(resp, rangeHeader)
 	}
 	// grok asset URLs (assets.grok.com) are auth-gated — a plain GET 403s. Stream
 	// them through the SAME account that generated the clip, using its token. If
 	// that account is gone (grok pools churn often), the clip is unrecoverable.
+	// Grok's provider client currently exposes a guarded full stream rather than
+	// raw response metadata, so it safely falls back to a normal 200 response.
 	if ev.Provider == "grok" && s.grok != nil {
 		acct, _ := s.tokens.Get(ctx, "grok", ev.AccountID)
 		if acct == nil || strings.TrimSpace(acct.Value) == "" {
-			return nil, "", fmt.Errorf("%w: grok account no longer available for this video", ErrProviderTemporary)
+			return nil, fmt.Errorf("%w: grok account no longer available for this video", ErrProviderTemporary)
 		}
-		return s.grok.OpenAsset(ctx, acct.Value, ev.File)
+		body, contentType, openErr := s.grok.OpenAsset(ctx, acct.Value, file)
+		if openErr != nil {
+			return nil, openErr
+		}
+		return &VideoContent{Body: body, ContentType: contentType, StatusCode: http.StatusOK, ContentLength: -1}, nil
 	}
 	// Other providers return publicly-fetchable URLs. Validate the initial URL and
 	// every redirect before direct local egress so an upstream-provided URL cannot
-	// turn this API into an internal-network proxy.
+	// turn this API into an internal-network proxy. Dola VOD is normally public;
+	// if local egress is rejected, retry the idempotent GET through the generating
+	// account's sticky proxy instead of failing playback or spending proxy traffic
+	// on every successful direct request.
 	allowedHosts, err := s.assetAllowedHosts(ctx, ev)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	assetURL, err := netguard.ValidateAssetURL(ctx, ev.File, allowedHosts)
+	content, directErr := openPublicVideoContent(ctx, file, allowedHosts, rangeHeader, "")
+	if directErr == nil || !strings.EqualFold(strings.TrimSpace(ev.Provider), "dola") || s.dola == nil {
+		return content, directErr
+	}
+	acct, accountErr := s.tokens.Get(ctx, "dola", ev.AccountID)
+	if accountErr != nil || acct == nil || strings.TrimSpace(acct.Value) == "" {
+		return nil, directErr
+	}
+	proxyURL, proxyErr := s.dola.AccountProxy(ctx, dolaAccountFromToken(*acct))
+	if proxyErr != nil || strings.TrimSpace(proxyURL) == "" {
+		return nil, directErr
+	}
+	content, proxyFetchErr := openPublicVideoContent(ctx, file, allowedHosts, rangeHeader, proxyURL)
+	if proxyFetchErr != nil {
+		return nil, fmt.Errorf("%w: fetch upstream video failed", ErrProviderTemporary)
+	}
+	return content, nil
+}
+
+func normalizeVideoRange(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if len(raw) > 128 {
+		return "", fmt.Errorf("%w: invalid video range", ErrUnsupportedParams)
+	}
+	unit, spec, ok := strings.Cut(raw, "=")
+	if !ok || !strings.EqualFold(strings.TrimSpace(unit), "bytes") || strings.Contains(spec, ",") {
+		return "", fmt.Errorf("%w: invalid video range", ErrUnsupportedParams)
+	}
+	first, last, ok := strings.Cut(strings.TrimSpace(spec), "-")
+	if !ok || strings.Contains(last, "-") || first == "" && last == "" {
+		return "", fmt.Errorf("%w: invalid video range", ErrUnsupportedParams)
+	}
+	var firstByte, lastByte uint64
+	var parseErr error
+	if first != "" {
+		firstByte, parseErr = strconv.ParseUint(first, 10, 63)
+		if parseErr != nil {
+			return "", fmt.Errorf("%w: invalid video range", ErrUnsupportedParams)
+		}
+	}
+	if last != "" {
+		lastByte, parseErr = strconv.ParseUint(last, 10, 63)
+		if parseErr != nil || first == "" && lastByte == 0 || first != "" && lastByte < firstByte {
+			return "", fmt.Errorf("%w: invalid video range", ErrUnsupportedParams)
+		}
+	}
+	return "bytes=" + first + "-" + last, nil
+}
+
+func openPublicVideoContent(ctx context.Context, rawURL string, allowedHosts []string, rangeHeader, proxyRaw string) (*VideoContent, error) {
+	assetURL, err := netguard.ValidateAssetURL(ctx, rawURL, allowedHosts)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: rejected upstream video URL", ErrProviderTemporary)
+		return nil, fmt.Errorf("%w: rejected upstream video URL", ErrProviderTemporary)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL.String(), nil)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	client, err := globalProxyHTTPClient("", 5*time.Minute)
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	client, err := globalProxyHTTPClient(proxyRaw, 5*time.Minute)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	if err := netguard.HardenHTTPClient(client, allowedHosts); err != nil {
-		return nil, "", err
+	if strings.TrimSpace(proxyRaw) == "" {
+		if err := netguard.HardenHTTPClient(client, allowedHosts); err != nil {
+			return nil, err
+		}
+	} else {
+		client.CheckRedirect = netguard.CheckRedirect(allowedHosts)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: fetch upstream video failed", ErrProviderTemporary)
+		return nil, fmt.Errorf("%w: fetch upstream video failed", ErrProviderTemporary)
 	}
-	if resp.StatusCode != http.StatusOK {
+	return videoContentFromResponse(resp, rangeHeader)
+}
+
+func videoContentFromResponse(resp *http.Response, requestedRange string) (*VideoContent, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("%w: empty upstream video response", ErrProviderTemporary)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		resp.Body.Close()
-		return nil, "", fmt.Errorf("%w: upstream video status %d", ErrProviderTemporary, resp.StatusCode)
+		return nil, fmt.Errorf("%w: upstream video status %d", ErrProviderTemporary, resp.StatusCode)
 	}
-	body, ct, guardErr := netguard.GuardResponse(resp, netguard.MediaVideo, netguard.MaxVideoBytes)
+	if resp.StatusCode == http.StatusPartialContent && requestedRange == "" {
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: unsolicited partial upstream video", ErrProviderTemporary)
+	}
+	contentRange := strings.TrimSpace(resp.Header.Get("Content-Range"))
+	acceptRanges := strings.TrimSpace(resp.Header.Get("Accept-Ranges"))
+	contentLength := resp.ContentLength
+	var body io.ReadCloser
+	var contentType string
+	var guardErr error
+	if resp.StatusCode == http.StatusPartialContent {
+		body, contentType, guardErr = netguard.GuardPartialResponse(resp, netguard.MediaVideo, netguard.MaxVideoBytes)
+	} else {
+		body, contentType, guardErr = netguard.GuardResponse(resp, netguard.MediaVideo, netguard.MaxVideoBytes)
+	}
 	if guardErr != nil {
-		return nil, "", fmt.Errorf("%w: invalid upstream video", ErrProviderTemporary)
+		return nil, fmt.Errorf("%w: invalid upstream video", ErrProviderTemporary)
 	}
-	return body, ct, nil
+	if resp.StatusCode == http.StatusPartialContent && acceptRanges == "" {
+		acceptRanges = "bytes"
+	}
+	return &VideoContent{
+		Body: body, ContentType: contentType, StatusCode: resp.StatusCode,
+		ContentLength: contentLength, ContentRange: contentRange, AcceptRanges: acceptRanges,
+	}, nil
 }
 
 // OpenAdminArtifact streams a successful event artifact through the same
@@ -2129,21 +2457,35 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 // principal solely to reuse the event ownership guard without sending that key
 // to the browser.
 func (s *V1Service) OpenAdminArtifact(ctx context.Context, id string) (io.ReadCloser, string, error) {
+	content, err := s.OpenAdminArtifactRange(ctx, id, "")
+	if err != nil {
+		return nil, "", err
+	}
+	return content.Body, content.ContentType, nil
+}
+
+// OpenAdminArtifactRange preserves video range metadata for the administrator
+// gallery while continuing to return ordinary 200 streams for images.
+func (s *V1Service) OpenAdminArtifactRange(ctx context.Context, id, rangeHeader string) (*VideoContent, error) {
 	event, err := s.events.GetByID(ctx, strings.TrimSpace(id))
 	if err != nil || event == nil || event.Status != "success" || strings.TrimSpace(event.File) == "" {
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
-		return nil, "", ErrNotFound
+		return nil, ErrNotFound
 	}
 	principal := adminArtifactPrincipal(event)
 	switch event.Kind {
 	case "image":
-		return s.OpenImageContent(ctx, principal, event.ID)
+		body, contentType, openErr := s.OpenImageContent(ctx, principal, event.ID)
+		if openErr != nil {
+			return nil, openErr
+		}
+		return &VideoContent{Body: body, ContentType: contentType, StatusCode: http.StatusOK, ContentLength: -1}, nil
 	case "video":
-		return s.OpenVideoContent(ctx, principal, event.ID)
+		return s.OpenVideoContentRange(ctx, principal, event.ID, rangeHeader)
 	default:
-		return nil, "", ErrNotFound
+		return nil, ErrNotFound
 	}
 }
 
@@ -2586,13 +2928,13 @@ func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, i
 		n = 1
 	}
 	if n != 1 {
-		return nil, "", "", 0, fmt.Errorf("%w: n must be 1", ErrUnsupportedParams)
+		return nil, "", "", 0, invalidParameter("n", "n must be 1.", "1")
 	}
 	if strings.TrimSpace(in.Background) != "" {
-		return nil, "", "", 0, fmt.Errorf("%w: background is not supported", ErrUnsupportedParams)
+		return nil, "", "", 0, invalidParameter("background", "background is not supported; omit this parameter.")
 	}
 	if strings.TrimSpace(in.OutputFormat) != "" {
-		return nil, "", "", 0, fmt.Errorf("%w: output_format is not supported", ErrUnsupportedParams)
+		return nil, "", "", 0, invalidParameter("output_format", "output_format is not supported; omit this parameter.")
 	}
 	modelItem, err := s.models.Get(ctx, modelID)
 	if err != nil {
@@ -2615,6 +2957,12 @@ func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, i
 	}
 	if _, err := s.firstAvailableRoute(ctx, modelItem.ID, "image", model.RouteRequirements{Operation: operation,
 		Ratio: aspectRatio, Resolution: resolution, Quality: in.Quality, ReferenceImages: len(in.ReferenceImages)}); err != nil {
+		if modelItem.ID == "gpt-image-2" && errors.Is(err, ErrUnsupportedParams) {
+			// Rejected events predate route selection and omit these fields. Keep
+			// bounded parameter diagnostics without prompts, references, or keys.
+			log.Printf("image preflight rejected: request_id=%.191q model=gpt-image-2 size=%.64q quality=%.16q aspect_ratio=%.32q resolution=%.16q resolved_ratio=%.32q resolved_resolution=%.16q n=%d references=%d",
+				in.RequestID, in.Size, in.Quality, in.AspectRatio, in.Resolution, aspectRatio, resolution, n, len(in.ReferenceImages))
+		}
 		return nil, "", "", 0, err
 	}
 	return modelItem, resolution, aspectRatio, 0, nil
@@ -2628,7 +2976,7 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 		return nil, "", "", "", 0, fmt.Errorf("%w: model and prompt are required", ErrUnsupportedParams)
 	}
 	if duration == "" {
-		return nil, "", "", "", 0, fmt.Errorf("%w: duration is required", ErrUnsupportedParams)
+		return nil, "", "", "", 0, invalidParameter("duration", "duration is required.")
 	}
 	modelItem, err := s.models.Get(ctx, modelID)
 	if err != nil {
@@ -2773,6 +3121,7 @@ func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem 
 		TS:             time.Now(),
 		Kind:           kind,
 		Status:         "pending",
+		Phase:          "dispatch",
 		Model:          modelItem.EffectiveName(),
 		Prompt:         prompt,
 		Ratio:          ratio,
@@ -3137,6 +3486,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				}
 			}
 		}
+		recordBookkeepingError("mark generation submission phase", s.events.SetPhase(context.WithoutCancel(ctx), eventID, "submitting"))
 		data, err := attempt(token)
 		var upstreamRemaining *float64
 		if routeID != "" {
@@ -3152,7 +3502,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 		state, failureClass := dispatchFailureClass(err)
 		if reservation != nil {
 			quotaCtx := context.WithoutCancel(ctx)
-			if errors.Is(err, dola.ErrTaskAccepted) {
+			if errors.Is(err, dola.ErrTaskAccepted) || errors.Is(err, chatgpt.ErrTaskAccepted) || errors.Is(err, grok.ErrTaskAccepted) {
 				// A terminal content rejection still consumed an accepted attempt.
 				// Closing its dispatch must not refund the daily generation.
 				recordBookkeepingError("settle accepted Dola dispatch quota", s.models.Quotas().Settle(quotaCtx, reservation.ID, upstreamRemaining))
@@ -3199,6 +3549,12 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			// Entitlement is scoped to this account+route. The durable binding was
 			// disabled above; the credential remains healthy for every other route.
 			return nil, true, false, err
+		}
+		if errors.Is(err, grok.ErrTaskAccepted) && failureClass == "quota" {
+			s.markTokenFailure(ctx, pool, token, kind, false, true)
+		}
+		if errors.Is(err, chatgpt.ErrTaskAccepted) || errors.Is(err, chatgpt.ErrTaskSubmissionUnknown) || errors.Is(err, grok.ErrTaskAccepted) {
+			return nil, false, false, err
 		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
 		if isQuota {
@@ -3250,6 +3606,12 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 }
 
 func dispatchUpstreamTaskID(err error) string {
+	if id := chatgpt.AcceptedTaskID(err); id != "" {
+		return id
+	}
+	if taskURL := grok.AcceptedTaskURL(err); taskURL != "" {
+		return taskURL
+	}
 	var dolaErr *dola.VideoSubmissionError
 	if errors.As(err, &dolaErr) {
 		return dolaErr.ConversationID
@@ -3292,7 +3654,11 @@ func (s *V1Service) refreshDispatchQuota(parent context.Context, pool string, to
 	if !ok || strings.TrimSpace(plan.Route.QuotaBucketKey) == "" || pool == "custom" {
 		return nil
 	}
-	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+	probeTimeout := 30 * time.Second
+	if pool == "chatgpt" {
+		probeTimeout = 10 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), probeTimeout)
 	defer cancel()
 	var data map[string]any
 	var err error
@@ -3358,6 +3724,16 @@ func (s *V1Service) refreshDispatchQuota(parent context.Context, pool string, to
 		metaPatch["cached_quota_used"] = canonicalQuotaNumber(used)
 	}
 	patch := map[string]any{}
+	if pool == "chatgpt" {
+		metaPatch["quota_probe_unknown"] = false
+		metaPatch["quota_probe_error"] = nil
+		if remaining <= 0 {
+			patch["status"] = gorm.Expr("CASE WHEN status = 'active' THEN 'quota' ELSE status END")
+		}
+		if strings.TrimSpace(token.CachedQuotaResetAfter) == "" {
+			patch["cached_quota_reset_after"] = gorm.Expr("COALESCE(NULLIF(cached_quota_reset_after, ''), ?)", time.Now().UTC().Truncate(24*time.Hour).Add(24*time.Hour).Format(time.RFC3339))
+		}
+	}
 	if rawReset := strings.TrimSpace(stringValue(data["reset_after"])); rawReset != "" {
 		patch["cached_quota_reset_after"] = rawReset
 	} else if rawReset := strings.TrimSpace(stringValue(data["available_until"])); rawReset != "" {
@@ -3953,6 +4329,15 @@ func (s *V1Service) generateDolaVideo(ctx context.Context, eventID string, model
 			Ratio:           aspectRatio,
 			Duration:        durationSeconds,
 			ReferenceImages: imageRefs,
+			OnAccepted: func(id string) error {
+				bookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if err := s.models.Dispatch().AcceptLatest(bookCtx, eventID, token.ID, dispatchRouteFromContext(ctx), id); err != nil {
+					return err
+				}
+				recordBookkeepingError("mark Dola video rendering phase", s.events.SetPhase(bookCtx, eventID, "rendering"))
+				return nil
+			},
 		})
 		if genErr != nil {
 			if !errors.Is(genErr, dola.ErrTaskAccepted) && !errors.Is(genErr, dola.ErrTaskSubmissionUnknown) &&
@@ -4083,17 +4468,25 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 	}
 	var videoURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "grok", active, "video", func(token model.TokenAccount) ([]byte, error) {
-		blob, meta, genErr := s.grok.GenerateVideo(ctx, token.Value, in.Prompt, aspectRatio, res, durationSeconds, frames, false)
+		blob, meta, genErr := s.grok.GenerateVideo(ctx, token.Value, in.Prompt, aspectRatio, res, durationSeconds, frames, false, func(taskURL string) error {
+			bookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if err := s.models.Dispatch().AcceptLatest(bookCtx, eventID, token.ID, dispatchRouteFromContext(ctx), taskURL); err != nil {
+				return err
+			}
+			recordBookkeepingError("mark Grok video rendering phase", s.events.SetPhase(bookCtx, eventID, "rendering"))
+			return nil
+		})
 		if genErr == nil {
 			videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
 			if downloadResult {
 				body, contentType, openErr := s.grok.OpenAsset(ctx, token.Value, videoURL)
 				if openErr != nil {
-					return nil, openErr
+					return nil, grok.AcceptedFailure(videoURL, openErr)
 				}
 				blob, genErr = readProviderArtifact(body, contentType, netguard.MediaVideo, netguard.MaxVideoBytes)
 				if genErr != nil {
-					genErr = fmt.Errorf("%w: invalid video artifact", grok.ErrTemporaryUpstream)
+					genErr = grok.AcceptedFailure(videoURL, fmt.Errorf("%w: invalid video artifact", grok.ErrTemporaryUpstream))
 				}
 			}
 		}
@@ -4103,6 +4496,9 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 }
 
 func grokErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	if errors.Is(err, grok.ErrTaskAccepted) {
+		return false, false, false, false
+	}
 	return errors.Is(err, grok.ErrAuth), errors.Is(err, grok.ErrQuotaExhausted), errors.Is(err, grok.ErrTemporaryUpstream), false
 }
 
@@ -4201,46 +4597,6 @@ func (s *V1Service) generateRunwayImage(ctx context.Context, eventID string, mod
 	return data, artURL, err
 }
 
-// reconcileChatGPTQuota re-reads OpenAI's image_gen remaining right after a
-// successful generation and writes it back (negative / unknown clamp to 0),
-// flipping the account to 限额 when it hits 0 — so accounts limit one-by-one as
-// they're used, not all at once on a later batch probe. Runs while the
-// per-account concurrency gate is still held. Best-effort (never fails the render).
-func (s *V1Service) reconcileChatGPTQuota(ctx context.Context, tokenID, accessToken string) {
-	if s.chatgpt == nil {
-		return
-	}
-	data, err := s.chatgpt.FetchImageQuota(ctx, accessToken)
-	if err != nil || boolValueWithDefault(data["auth_failed"], false) {
-		return
-	}
-	// An unknown read (403/429/timeout) right after a successful render must not
-	// clobber the balance with a bogus 0 or 限额 an account that just worked.
-	if boolValueWithDefault(data["unknown"], false) {
-		return
-	}
-	rem, exhausted := chatgptRemaining(data)
-	item, err := s.tokens.Get(ctx, "chatgpt", tokenID)
-	if err != nil {
-		return
-	}
-	metaPatch := map[string]any{
-		"cached_quota_remaining": rem,
-		"cached_quota_at":        int(time.Now().Unix()),
-	}
-	patch := map[string]any{}
-	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
-		patch["cached_quota_reset_after"] = reset
-	} else if strings.TrimSpace(item.CachedQuotaResetAfter) == "" {
-		patch["cached_quota_reset_after"] = time.Unix((time.Now().Unix()/86400+1)*86400, 0).UTC().Format(time.RFC3339)
-	}
-	if exhausted && item.Status == "active" {
-		patch["status"] = "quota"
-	}
-	updateErr := s.tokens.UpdateMergingMeta(ctx, "chatgpt", tokenID, metaPatch, patch)
-	recordBookkeepingError("reconcile chatgpt quota metadata", updateErr)
-}
-
 // chatgpt image URLs are auth-gated (files.oaiusercontent.com — a plain GET
 // 403s), so url-only mode returns the URL for the caller to proxy via
 // OpenImageContent using the generating account's token.
@@ -4267,28 +4623,31 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 		return nil, "", err
 	}
 
-	// Round-robin order; on a transient upstream error FAIL OVER to the next
-	// account. Auth/quota fail over immediately (see runPoolWithFailover).
+	// Only failures before submission may fail over. After acknowledgement,
+	// retrieval failures keep the same conversation and account for recovery.
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "chatgpt", active, "image", func(token model.TokenAccount) ([]byte, error) {
-		d, meta, genErr := s.chatgpt.GenerateImage(ctx, token.Value, in.Prompt, modelItem.ID, aspectRatio, resolution, refs, false)
+		d, meta, genErr := s.chatgpt.GenerateImage(ctx, token.Value, in.Prompt, modelItem.ID, aspectRatio, resolution, refs, false, func(id string) error {
+			bookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if err := s.models.Dispatch().AcceptLatest(bookCtx, eventID, token.ID, dispatchRouteFromContext(ctx), id); err != nil {
+				return err
+			}
+			recordBookkeepingError("mark image retrieval phase", s.events.SetPhase(bookCtx, eventID, "retrieving"))
+			return nil
+		})
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
 			if !urlOnly {
 				body, contentType, openErr := s.chatgpt.OpenAsset(ctx, token.Value, imageURL)
 				if openErr != nil {
-					return nil, openErr
+					return nil, chatgpt.AcceptedFailure(stringValue(meta["conversation_id"]), openErr)
 				}
 				d, genErr = readProviderArtifact(body, contentType, netguard.MediaImage, netguard.MaxImageBytes)
 				if genErr != nil {
-					genErr = fmt.Errorf("%w: invalid image artifact", chatgpt.ErrTemporaryUpstream)
+					genErr = chatgpt.AcceptedFailure(stringValue(meta["conversation_id"]), genErr)
 				}
 			}
-		}
-		if genErr == nil {
-			// Sync the real OpenAI quota BEFORE the concurrency gate releases, so the
-			// freshly-decremented remaining (and 限额 flip at 0) gates the next pick.
-			s.reconcileChatGPTQuota(ctx, token.ID, token.Value)
 		}
 		return d, genErr
 	}, func(e error) (bool, bool, bool, bool) {
@@ -4633,7 +4992,18 @@ func parseImageSize(size, aspectRatio, resolution string) (string, string) {
 }
 
 func resolveImageSize(item *model.ModelConfig, in V1ImageRequest) (string, string) {
-	return parseImageSize(in.Size, in.AspectRatio, in.Resolution)
+	aspectRatio, resolution := parseImageSize(in.Size, in.AspectRatio, in.Resolution)
+	// The ChatGPT GPT Image 2 ID exposes only its 1K route. Compatible clients
+	// commonly omit size or send "auto"; letting the generic image default choose
+	// 2K makes those otherwise valid requests fail capability matching before an
+	// account is selected. Preserve every explicit size/resolution choice.
+	if item.ID == "gpt-image-2" && strings.TrimSpace(in.Resolution) == "" {
+		size := strings.TrimSpace(in.Size)
+		if size == "" || strings.EqualFold(size, "auto") {
+			resolution = "1K"
+		}
+	}
+	return aspectRatio, resolution
 }
 
 func supportsQualityResolutionModel(modelID string) bool {
