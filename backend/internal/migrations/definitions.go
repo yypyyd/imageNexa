@@ -1694,6 +1694,16 @@ var migrationSources = map[string]string{
 ALTER TABLE event_logs ADD COLUMN IF NOT EXISTS error_param VARCHAR(64) NOT NULL DEFAULT '';
 ALTER TABLE event_logs ALTER COLUMN elapsed_ms TYPE BIGINT;
 `,
+	"000030_quota_refresh_schedule.sql": `ALTER TABLE account_quota_buckets
+ ADD COLUMN refresh_after TIMESTAMPTZ,
+ ADD COLUMN refresh_failures INTEGER NOT NULL DEFAULT 0,
+ ADD COLUMN last_probe_at TIMESTAMPTZ,
+ ADD COLUMN probe_id TEXT NOT NULL DEFAULT '',
+ ADD COLUMN probe_until TIMESTAMPTZ,
+ ADD COLUMN refresh_requested_at TIMESTAMPTZ;
+UPDATE account_quota_buckets SET refresh_after = refreshed_at + INTERVAL '24 hours';
+CREATE INDEX idx_quota_refresh_after ON account_quota_buckets(refresh_after);
+`,
 	"000029_unresolved_dispatch_state.sql": `ALTER TABLE dispatch_attempts DROP CONSTRAINT IF EXISTS dispatch_attempts_state_valid;
 ALTER TABLE dispatch_attempts ADD CONSTRAINT dispatch_attempts_state_valid CHECK (state IN ('created','submitting','accepted','unknown','succeeded','failed','unresolved'));
 ALTER TABLE dispatch_attempts DROP CONSTRAINT IF EXISTS dispatch_attempts_failure_valid;

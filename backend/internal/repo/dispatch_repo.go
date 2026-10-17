@@ -162,6 +162,57 @@ func (r *DispatchRepository) ResolveInterrupted(ctx context.Context, attempt mod
 	})
 }
 
+// ResolveUnknown closes client waiting and records the evidence for quota
+// settlement in one transaction. Only a verified absence permits a refund;
+// a timeout leaves both the dispatch and its reservation uncertain. Locking
+// and rechecking the attempt prevents a late history probe from overwriting
+// another worker's accepted task handle.
+func (r *DispatchRepository) ResolveUnknown(ctx context.Context, attempt model.DispatchAttempt, verifiedAbsent bool, message string) (bool, error) {
+	applied := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var event model.EventLog
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&event, "id = ?", attempt.EventID).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if event.Status == "success" {
+			return nil
+		}
+		var current model.DispatchAttempt
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, "id = ?", attempt.ID).Error; err != nil {
+			return err
+		}
+		if current.State != "unknown" {
+			return nil
+		}
+		state, class := "unresolved", "outcome_unknown"
+		if verifiedAbsent {
+			state, class = "failed", "temporary"
+		} else if err := tx.Model(&model.QuotaReservation{}).
+			Where("dispatch_attempt_id = ? AND status = ?", current.ID, "held").
+			Updates(map[string]any{"status": "uncertain", "updated_at": time.Now()}).Error; err != nil {
+			return err
+		}
+		if err := NewDispatchRepository(tx).Finish(ctx, current.ID, state, class, "", errors.New(message)); err != nil {
+			return err
+		}
+		if event.Status == "pending" {
+			events := NewEventRepository(tx)
+			if !verifiedAbsent {
+				if err := events.SetPhase(ctx, event.ID, "outcome_unknown"); err != nil {
+					return err
+				}
+			}
+			if err := events.UpdateStatus(ctx, event.ID, "failed", message, 0); err != nil {
+				return err
+			}
+		}
+		applied = true
+		return nil
+	})
+	return applied && err == nil, err
+}
+
 // ListUnknown returns ambiguous submissions that finished before the cutoff and
 // are therefore old enough for the provider's task history to be authoritative.
 func (r *DispatchRepository) ListUnknown(ctx context.Context, finishedBefore time.Time, limit int) ([]model.DispatchAttempt, error) {

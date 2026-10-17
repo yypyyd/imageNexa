@@ -1,9 +1,0 @@
-#!/bin/sh
-
-# The backend container holds database and object-store credentials. Chromium
-# receives only the minimal process environment it needs, never the parent's.
-exec env -i \
-  HOME=/home/chrome \
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  LANG=C.UTF-8 \
-  /usr/bin/chromium-browser "$@"

@@ -11,6 +11,13 @@ server {
 
     client_max_body_size 320m;
 
+    # Resolve Docker's service name again after backend container replacement.
+    # A variable-based origin also allows nginx to start during a DNS gap and
+    # forwards the original request path and query without adding a URI prefix.
+    resolver 127.0.0.11 valid=5s ipv6=off;
+    resolver_timeout 2s;
+    set $backend_origin http://backend:6666;
+
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     # Append the actual TCP peer. The backend walks this chain from right to
@@ -39,7 +46,7 @@ server {
 
     # ---- API / media / health -> backend ----
     location ^~ /admin/api/ {
-        proxy_pass http://backend:6666;
+        proxy_pass $backend_origin;
         # Administrator image/video previews share this prefix. Do not spool a
         # media response to nginx's proxy temp directory before the browser can
         # consume its requested byte range.
@@ -47,11 +54,11 @@ server {
         proxy_cache off;
         add_header Cache-Control "no-store" always;
     }
-    location = /health/live  { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
-    location = /health/ready { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
+    location = /health/live  { proxy_pass $backend_origin; add_header Cache-Control "no-store" always; }
+    location = /health/ready { proxy_pass $backend_origin; add_header Cache-Control "no-store" always; }
     # /v1 is per-API-key authenticated — never cache.
     location ^~ /v1/ {
-        proxy_pass http://backend:6666;
+        proxy_pass $backend_origin;
         # Stream chat SSE and media responses without nginx buffering. Sync
         # image generation still waits for one final JSON response so provider
         # failures retain their real non-2xx HTTP status.

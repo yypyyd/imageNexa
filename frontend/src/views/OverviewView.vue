@@ -6,26 +6,18 @@ import { ACCOUNT_PROVIDERS } from '../models'
 
 const loading = ref(true)
 const error = ref('')
-const models = ref([])
-const accounts = ref([])
-const credentials = ref([])
 const logs = ref([])
 const ready = ref(null)
 const overview = ref({})
 
-const totals = computed(() => ({
-  models: models.value.filter((m) => m.enabled !== false).length,
-  routes: models.value.reduce((n, m) => n + (m.routes || []).filter((r) => r.enabled !== false).length, 0),
-  accounts: accounts.value.filter((a) => ['active', 'enabled', 'healthy'].includes(a.status || 'active')).length,
-  keys: credentials.value.filter((k) => k.enabled !== false && k.status !== 'revoked').length,
-}))
+const totals = computed(() => overview.value.totals || { models: 0, routes: 0, accounts: 0, keys: 0 })
 const last24 = computed(() => overview.value.last_24h || {})
 const hourly = computed(() => overview.value.hourly || [])
 const hourMax = computed(() => Math.max(1, ...hourly.value.map((bucket) => Number(bucket.text || 0) + Number(bucket.image || 0) + Number(bucket.video || 0))))
 const providerRows = computed(() => Object.entries(overview.value.provider_health || {}).filter(([name]) => ACCOUNT_PROVIDERS.includes(name)).map(([name, counts]) => ({
   name,
   ...counts,
-  total: Object.values(counts || {}).reduce((sum, value) => sum + Number(value || 0), 0),
+  total: ['active', 'quota', 'dead', 'disabled', 'pending'].reduce((sum, state) => sum + Number(counts?.[state] || 0), 0),
 })))
 const topModelMax = computed(() => Math.max(1, ...(overview.value.top_models || []).map((item) => Number(item.count || 0))))
 
@@ -44,24 +36,19 @@ function fmtMs(value) {
 async function load() {
   loading.value = true
   error.value = ''
-  const [m, a, k, l, o] = await Promise.all([
-    api('/logical-models'),
-    api('/accounts?limit=200'),
-    api('/api-credentials?limit=200'),
-    api('/logs?limit=8'),
-    api('/overview'),
-  ])
-  models.value = listOf(m.data)
-  accounts.value = listOf(a.data)
-  credentials.value = listOf(k.data)
-  logs.value = listOf(l.data)
-  overview.value = o.ok ? (o.data || {}) : {}
-  error.value = [m, a, k, l, o].find((r) => !r.ok)?.error || ''
   try {
+    const [l, o] = await Promise.all([api('/logs?limit=8'), api('/overview')])
+    logs.value = listOf(l.data)
+    overview.value = o.ok ? (o.data || {}) : {}
+    error.value = [l, o].find((r) => !r.ok)?.error || ''
     const response = await fetch(apiURL('/health/ready'), { headers: { Accept: 'application/json' } })
     ready.value = response.ok
-  } catch { ready.value = false }
-  loading.value = false
+  } catch {
+    ready.value = false
+    error.value ||= '无法连接服务，请稍后重试'
+  } finally {
+    loading.value = false
+  }
 }
 
 onMounted(load)
@@ -100,7 +87,7 @@ onMounted(load)
       </div>
       <div class="stat">
         <div class="stat-chip"><Icon name="accounts" class="w-4.5 h-4.5" /></div>
-        <span class="stat-label">可用账号</span>
+        <span class="stat-label" title="启用且未标记失效的账号；实际调度还取决于模型、额度和并发">启用账号</span>
         <strong class="stat-num">{{ totals.accounts }}</strong>
       </div>
       <div class="stat">
@@ -120,7 +107,7 @@ onMounted(load)
 
     <div class="grid xl:grid-cols-2 gap-4">
       <div class="card overflow-hidden">
-        <div class="panel-title"><h3>Provider 健康</h3><span>可用 / 限额 / 失效 / 总数</span></div>
+        <div class="panel-title"><h3>Provider 健康</h3><span>启用 / 限额 / 失效 / 总数</span></div>
         <div class="provider-health">
           <div v-for="item in providerRows" :key="item.name">
             <span class="dot" :class="item.active ? 'ok' : (item.total ? 'warn' : 'bad')"></span>

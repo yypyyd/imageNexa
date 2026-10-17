@@ -9,7 +9,7 @@ Go data plane and singleton-administrator control plane for 2API. The public API
 - The control plane has exactly one administrator and uses an HttpOnly, SameSite=Strict session cookie plus CSRF protection.
 - First initialization also requires `X-Admin-Bootstrap-Token`, matching the deployment-only `ADMIN_BOOTSTRAP_TOKEN`.
 - PostgreSQL stores downstream API-key hashes and durable routing/quota state. Redis stores short-lived concurrency/session state. RustFS stores private generated artifacts.
-- The production backend container runs as an unprivileged user. Docker's default seccomp profile prevents Chromium user namespaces, so the Oreate signer uses `--no-sandbox`; its empty environment, ephemeral profile, parent-death/process-group teardown, and restricted provider-only use are mandatory compensating controls.
+- The production backend container runs as an unprivileged user. Native provider requests use HTTP; Dola uses a local Node protocol signer. Retired Oreate, Runway, and Custom adapters and their Chromium runtime are removed.
 
 ## Local dependencies
 
@@ -34,14 +34,18 @@ Never commit the real `.env` or any provider credential. The backend imports Byt
 
 Migration definitions are compiled from `internal/migrations/definitions.go`; no separate SQL files or manual SQL execution are required. Existing migration names and checksums remain unchanged. Append new versions instead of editing applied definitions.
 
-Forward-only, checksummed migrations create administrator/API-credential identity, the 26-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Provider-account deletion cascades through its route bindings, quota buckets, and bucket-owned reservations, while event logs and nullable dispatch history remain. Startup refuses unknown or modified applied migrations. `AutoMigrate` is limited to compatible columns on retained operational tables and does not seed retired models.
+Forward-only, checksummed migrations create administrator/API-credential identity, the 21-model canonical catalog, model routes, account-route entitlements, quota buckets/reservations, dispatch attempts, and API-key-attributed events. Provider-account deletion cascades through its route bindings, quota buckets, and bucket-owned reservations, while event logs and nullable dispatch history remain. Startup refuses unknown or modified applied migrations. The migration lock covers initial history creation, and the legacy refresh table is bootstrapped on empty databases before historical migrations. `AutoMigrate` adds compatible operational columns afterwards and does not seed retired models.
 
 ## Verification
 
 ```powershell
 go vet ./...
 go build ./cmd/api
+go test ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 ```
+
+Set `IMAGENEXA_TEST_DSN` to an isolated PostgreSQL test database whose name starts with `imagenexa_optimization_test`. Integration tests roll back their fixtures; migration tests also create and drop temporary databases, requiring `CREATEDB`. CI runs these tests against PostgreSQL 16. From `frontend`, run `npm run test:proxy` with Nginx installed (`NGINX_BINARY` can select its executable) to verify backend DNS recovery and request forwarding.
 
 Operational probes are `GET /health/live` and `GET /health/ready`. Readiness requires PostgreSQL, Redis, the latest migration, and access to the configured private RustFS bucket.
 

@@ -302,7 +302,9 @@ TLS terminates at an operator-managed reverse proxy in front of port `2000`. Pro
 
 Liveness checks only the process. Readiness checks dependencies and gates the web container. Nginx disables buffering for `/v1` so chat SSE and media streams pass through immediately. Synchronous image generation writes exactly one final JSON response, preserving the real non-2xx status when validation or a provider fails; long-running callers can opt into `Prefer: respond-async`.
 
-The backend runtime is non-root and its generated-media directory is owned by that dedicated UID. Docker's default seccomp profile blocks Chromium user namespaces, which was confirmed with an in-container launch test, so the Oreate signer explicitly uses `--no-sandbox`. Chromium receives an empty environment and ephemeral profile; parent-death and process-group cancellation tear down the complete browser tree. This accepted residual risk is limited to the Oreate adapter and is preferable to running the API as root or granting the container `SYS_ADMIN`/an unconfined seccomp profile.
+The backend runtime is non-root and its generated-media directory is owned by that dedicated UID. Live providers use native HTTP protocols, with Node providing Dola's offline signature. Retired Oreate, Runway, and Custom adapters are removed from startup and dispatch; Chromium and Oreate's extra certificates are no longer installed. Historical migration definitions and disabled route tombstones remain intact.
+
+Nginx resolves the backend through Docker DNS with a short cache lifetime, so a replacement backend can acquire a new address without requiring a web restart. Overview totals aggregate all enabled resources in SQL; enabled account counts describe configuration, while eligibility still depends on quota, model permissions, and concurrency.
 
 ## 13. Verification gates
 
@@ -313,12 +315,15 @@ Before release:
 cd backend
 go vet ./...
 go build ./cmd/api
+go test ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
 # Frontend
 cd ../frontend
 npm ci
 npm run lint:unused
 npm run build
+npm run test:proxy # requires Nginx; override its executable with NGINX_BINARY
 
 # Deployment syntax, from the repository root with .env present
 cd ..
@@ -327,8 +332,10 @@ docker compose config
 
 Release verification should cover:
 
-- the model set is exactly 4 text + 6 image + 9 video IDs;
-- provider-prefixed and unknown model IDs are rejected;
+- the model set is exactly 4 text + 10 image + 7 video IDs;
+- retired merged IDs, retired providers, and unknown model IDs are rejected;
+- isolated PostgreSQL integration tests cover empty/legacy/concurrent startup and quota reservations with uncertain submission outcomes (`IMAGENEXA_TEST_DSN`; never use the production database);
+- the proxy survives initially unavailable backend DNS and an address change without restarting Nginx;
 - every `/v1` endpoint rejects missing, malformed, disabled, or revoked Bearer keys;
 - one administrator can be initialized and a second cannot;
 - initialization rejects missing, weak, template, or incorrect bootstrap tokens without reflecting them;

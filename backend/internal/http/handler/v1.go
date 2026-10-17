@@ -117,7 +117,10 @@ func adminTestError(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrProviderQuota), errors.Is(err, service.ErrInsufficientFunds):
 		c.JSON(http.StatusTooManyRequests, gin.H{"detail": "所选账号额度不足"})
 	case errors.Is(err, service.ErrProviderAuth):
-		c.JSON(http.StatusBadGateway, gin.H{"detail": "所选账号凭据失效"})
+		// The origin itself is healthy; this is a validation failure for the
+		// explicitly selected provider credential. Returning 502 makes Cloudflare
+		// replace the actionable JSON body with its generic origin-error page.
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "所选账号凭据失效"})
 	case errors.Is(err, service.ErrNoProviderAccount):
 		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "所选账号不能执行该模型"})
 	case errors.Is(err, service.ErrProviderDisabled):

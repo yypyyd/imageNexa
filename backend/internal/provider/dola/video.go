@@ -18,7 +18,9 @@ import (
 )
 
 const (
-	videoPromptPrefix = "生成影片："
+	// Preserve the wording captured from successful 30-second submissions.
+	// "Generate a video" can route to the planner's 4-15s clarification flow.
+	videoReplyFormat  = "Generated video: %s"
 	videoPollInterval = 5 * time.Second
 	videoPollWindow   = 30 * time.Minute
 	videoSubmitWait   = 3 * time.Minute
@@ -31,6 +33,11 @@ const (
 // An explicit duration refusal is a terminal request error, not a transient
 // account failure. It must not fan out to other accounts or charge a generation.
 var ErrVideoNotStarted = errors.New("dola: upstream declined 30-second video before generation")
+
+// A completed assistant error is terminal for this conversation. It does not
+// prove whether Dola charged the accepted request, so keep its submission handle.
+var ErrVideoFailed = errors.New("dola: video generation failed")
+var ErrVideoPlanningFailed = fmt.Errorf("%w: upstream planning failed before returning a video task", ErrVideoFailed)
 var ErrCopyrightRejected = fmt.Errorf("%w: copyright protection", ErrContentRejected)
 var ErrAudioCopyrightRejected = fmt.Errorf("%w: audio copyright protection", ErrCopyrightRejected)
 var durationRefusalPattern = regexp.MustCompile(`(?i)video generation currently supports durations|视频生成.{0,12}支持.{0,12}(4|5).{0,12}15`)
@@ -162,9 +169,10 @@ func (c *Client) ResumeVideoTask(ctx context.Context, account Account, conversat
 }
 
 // submitVideo posts the chat completion and returns the conversation the
-// server acknowledged. The prefix is load-bearing: without it the request is
-// downgraded to image generation. The submit stream closes after the assistant
-// acknowledges; a bounded window stops a stuck stream from holding the slot.
+// server acknowledged. Preserve the instruction captured from verified 30-second
+// runs; its wording affects the upstream creation planner. The stream closes
+// after the assistant acknowledges; a bounded window stops a stuck stream from
+// holding the slot.
 func (c *Client) submitVideo(ctx context.Context, account Account, model, prompt, ratio string, duration int, imageURIs []string, webTabID string) (string, Account, error) {
 	ctx, cancel := context.WithTimeout(ctx, videoSubmitWait)
 	defer cancel()
@@ -395,6 +403,10 @@ func (c *Client) pollVideo(ctx context.Context, account Account, conversationID,
 				return "", ErrContentRejected
 			case verdict.quotaRefused:
 				return "", ErrQuotaExhausted
+			case verdict.planningFailed && !verdict.videoSubmitted:
+				return "", ErrVideoPlanningFailed
+			case verdict.generationFailed:
+				return "", ErrVideoFailed
 			}
 		} else if !errors.Is(err, errRetryableChain) {
 			return "", err
@@ -428,6 +440,8 @@ type chainVerdict struct {
 	contentRefused        bool
 	copyrightRefused      bool
 	audioCopyrightRefused bool
+	generationFailed      bool
+	planningFailed        bool
 }
 
 // chainOnce fetches one page of the conversation chain and reduces it to a
@@ -499,11 +513,14 @@ func (c *Client) chainOnce(ctx context.Context, account Account, conversationID,
 		finalAssistant := message.UserType == 2 && message.Status != nil && *message.Status == 0
 		if finalAssistant {
 			switch message.Ext["ai_creation_res_code"] {
+			case "710082022":
+				verdict.contentRefused = true
 			case "710092006", "710092007":
 				verdict.contentRefused = true
 				verdict.copyrightRefused = true
 				verdict.audioCopyrightRefused = verdict.audioCopyrightRefused || message.Ext["ai_creation_res_code"] == "710092007"
 			}
+			verdict.planningFailed = verdict.planningFailed || videoPlanningFailed(message.Ext)
 		}
 		if finalAssistant && message.Ext["ai_creation_res_code"] == "710082041" {
 			finalDurationRefusal = true
@@ -511,6 +528,11 @@ func (c *Client) chainOnce(ctx context.Context, account Account, conversationID,
 		for _, block := range message.Blocks {
 			text := strings.TrimSpace(block.Content.TextBlock.Text)
 			verdict.texts = append(verdict.texts, text)
+			// Match only Dola's complete failure reply on a finished assistant
+			// message; quoted prompts and still-streaming replies are not verdicts.
+			if finalAssistant && strings.EqualFold(strings.Join(strings.Fields(text), " "), "Something went wrong. Please try again.") {
+				verdict.generationFailed = true
+			}
 			if finalAssistant && durationRefusalPattern.MatchString(text) {
 				finalDurationRefusal = true
 			}
@@ -544,6 +566,49 @@ func (c *Client) chainOnce(ctx context.Context, account Account, conversationID,
 	}
 	verdict.notStarted = finalDurationRefusal && !verdict.videoSubmitted && verdict.videoURL == ""
 	return verdict.videoURL, verdict, nil
+}
+
+// A completed creation-plan failure can be localized, so its text alone is not
+// a reliable verdict. Require the observed upstream metadata showing no tool
+// execution or task. This still retains the accepted conversation and quota;
+// it does not authorize an automatic resubmission.
+func videoPlanningFailed(ext map[string]string) bool {
+	if ext["has_video_gen"] == "1" || ext["auto_create_creation_asset"] != "0" {
+		return false
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal([]byte(ext["ai_creation_tool_list"]), &tools) != nil || len(tools) != 0 {
+		return false
+	}
+	var stages []struct {
+		Type         int    `json:"type"`
+		TaskID       string `json:"task_id"`
+		ErrorCode    int    `json:"error_code"`
+		DurationInfo []struct {
+			StepName string `json:"step_name"`
+			Duration int64  `json:"duration"`
+		} `json:"duration_info"`
+	}
+	if json.Unmarshal([]byte(ext["ai_creation_duration_info"]), &stages) != nil || len(stages) != 1 {
+		return false
+	}
+	stage := stages[0]
+	if stage.Type != 1 || stage.TaskID != "" || stage.ErrorCode == 0 {
+		return false
+	}
+	planFailed, noToolExecution := false, false
+	for _, step := range stage.DurationInfo {
+		switch step.StepName {
+		case "plan":
+			planFailed = step.Duration > 0
+		case "fc":
+			if step.Duration != 0 {
+				return false
+			}
+			noToolExecution = true
+		}
+	}
+	return planFailed && noToolExecution
 }
 
 type chainMessage struct {
@@ -599,7 +664,7 @@ func buildVideoBody(model, prompt, ratio string, duration int, fp string, imageU
 		"ratio":             ratio,
 		"model":             model,
 		"duration":          duration,
-		"input_box_content": map[string]any{"user_input_content": prompt, "reply_message_format": "Generated video: %s"},
+		"input_box_content": map[string]any{"user_input_content": prompt, "reply_message_format": videoReplyFormat},
 	})
 
 	messages := make([]map[string]any, 0, len(imageURIs)+1)
@@ -643,7 +708,7 @@ func buildVideoBody(model, prompt, ratio string, duration int, fp string, imageU
 			"block_type": 10000,
 			"content": map[string]any{
 				"text_block": map[string]any{
-					"text":          "Generated video: " + prompt + ", " + ratio,
+					"text":          fmt.Sprintf(videoReplyFormat, prompt) + ", " + ratio,
 					"icon_url":      "",
 					"icon_url_dark": "",
 					"summary":       "",

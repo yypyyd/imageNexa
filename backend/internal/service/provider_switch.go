@@ -16,8 +16,8 @@ func providerSettingKey(pool string) string {
 	return "provider." + pool + ".enabled"
 }
 
-// deferredAccountProviders stay in the token pool map so leftover adapter code
-// can compile, but they are not console-visible, importable, or schedulable.
+// Historical rows may still reference retired providers. Keep them out of
+// dispatch and control-plane operations even when no settings store is wired.
 var deferredAccountProviders = map[string]bool{
 	"runway": true,
 	"custom": true,
@@ -74,13 +74,17 @@ func parseProviderSwitch(value string) bool {
 // filterEnabledProviderRoutes drops routes whose provider pool an administrator
 // has switched off. Routes are preserved in their incoming priority order.
 func filterEnabledProviderRoutes(ctx context.Context, settings settingValueReader, routes []model.ModelRoute) ([]model.ModelRoute, error) {
-	if settings == nil || len(routes) == 0 {
+	if len(routes) == 0 {
 		return routes, nil
 	}
 	decisions := map[string]bool{}
 	out := make([]model.ModelRoute, 0, len(routes))
 	for _, route := range routes {
 		if isDeferredAccountProvider(route.Provider) {
+			continue
+		}
+		if settings == nil {
+			out = append(out, route)
 			continue
 		}
 		enabled, seen := decisions[route.Provider]

@@ -120,6 +120,7 @@ func (m ModelConfig) EffectiveName() string {
 }
 
 type TokenAccount struct {
+	QuotaReserved   bool   `gorm:"-" json:"-"` // This attempt holds a known local image allowance.
 	ID              string `gorm:"primaryKey;size:64"`
 	Pool            string `gorm:"size:64;index;not null"`
 	Value           string `gorm:"type:text;not null;default:''"`

@@ -6,11 +6,8 @@ import (
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
-	"backend/internal/provider/custom"
 	"backend/internal/provider/dola"
 	"backend/internal/provider/grok"
-	"backend/internal/provider/oreate"
-	"backend/internal/provider/runway"
 )
 
 // Unique temporary failures one request may spend. A second wave of unused
@@ -36,16 +33,13 @@ func tempFailureSignature(err error) string {
 		return "byteplus.temporary"
 	case errors.Is(err, chatgpt.ErrTemporaryUpstream):
 		return "chatgpt.temporary"
-	case errors.Is(err, runway.ErrTemporaryUpstream):
-		return "runway.temporary"
+
 	case errors.Is(err, grok.ErrTemporaryUpstream):
 		return "grok.temporary"
-	case errors.Is(err, oreate.ErrTemporaryUpstream):
-		return "oreate.temporary"
+
 	case errors.Is(err, dola.ErrTemporaryUpstream):
 		return "dola.temporary"
-	case errors.Is(err, custom.ErrTemporaryUpstream):
-		return "custom.temporary"
+
 	default:
 		return "temporary"
 	}

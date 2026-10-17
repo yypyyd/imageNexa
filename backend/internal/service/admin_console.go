@@ -17,9 +17,7 @@ import (
 	"backend/internal/model"
 	"backend/internal/repo"
 
-	"gorm.io/datatypes"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // AdminConsoleService exposes the deliberately small 2API control plane. It
@@ -167,7 +165,12 @@ func (s *AdminConsoleService) Overview(ctx context.Context) (map[string]any, err
 	if err != nil {
 		return nil, err
 	}
+	totals, err := s.overviewTotals(ctx, providerHealth)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
+		"totals":   totals,
 		"last_24h": window, "hourly": hourly, "top_models": topModels,
 		"failures": failures, "provider_health": providerHealth,
 	}, nil
@@ -422,6 +425,8 @@ func (s *AdminConsoleService) accountRows(ctx context.Context, accounts []model.
 }
 
 func assembleAccountRow(account model.TokenAccount, bindings []model.AccountModelRoute, routesByID map[string]model.ModelRoute, buckets []model.AccountQuotaBucket, activeJobs int64) map[string]any {
+	now := time.Now()
+	buckets = accountQuotaViewBuckets(account.Pool, buckets, now)
 	routeRows := make([]map[string]any, 0, len(bindings))
 	for _, binding := range bindings {
 		route, exists := routesByID[binding.ModelRouteID]
@@ -438,14 +443,15 @@ func assembleAccountRow(account model.TokenAccount, bindings []model.AccountMode
 		quotaRows = append(quotaRows, map[string]any{
 			"name": bucket.BucketKey, "remaining": bucket.Remaining, "total": bucket.Total,
 			"reserved": bucket.Reserved, "reset_at": bucket.ResetAt, "unit": bucket.Unit,
-			"refreshed_at": bucket.RefreshedAt,
+			"refreshed_at":    bucket.RefreshedAt,
+			"next_refresh_at": bucket.RefreshAfter,
 		})
 	}
-	quotaState := accountQuotaState(account.Pool, buckets, time.Now())
+	quotaState := accountQuotaState(account.Pool, buckets, now)
 	health := "healthy"
 	if account.Dead || account.Status == "disabled" {
 		health = "unhealthy"
-	} else if account.Status == "quota" || account.Status == "pending" || account.Fails > 0 || quotaState == "empty" || quotaState == "unknown" || quotaState == "stale" {
+	} else if account.Status == "quota" || account.Status == "pending" || account.Fails > 0 || quotaState == "empty" {
 		health = "degraded"
 	}
 	readiness, readinessDetail := dolaReadinessView(account)
@@ -469,14 +475,13 @@ func assembleAccountRow(account model.TokenAccount, bindings []model.AccountMode
 		"id": account.ID, "provider": account.Pool, "label": label, "email": account.AccountEmail,
 		"status": account.Status, "weight": account.Weight, "max_concurrency": account.Concurrency,
 		"active_jobs": activeJobs, "health": health, "routes": routeRows, "quota_buckets": quotaRows,
-		"quota_state": quotaState, "primary_quota_bucket": primaryQuotaBucket(account.Pool, time.Now()),
+		"quota_state": quotaState, "primary_quota_bucket": primaryQuotaBucket(account.Pool, now),
 		"success_total": account.SuccessTotal, "fail_total": account.FailTotal,
 		"consecutive_failures": account.Fails, "upstream_failures": account.UpstreamFails,
 		"image_limited": account.ImageLimited, "video_limited": account.VideoLimited,
 		"last_used_at": account.LastUsedAt, "created_at": account.CreatedAt,
 		"session_expires_at": sessionExpiresAt, "session_state": sessionState,
 		"readiness": readiness, "readiness_detail": readinessDetail,
-		"base_url": safeCustomMeta(account, "base_url"), "models": safeCustomMeta(account, "models"),
 	}
 }
 
@@ -495,13 +500,6 @@ func bytePlusSessionStatus(account model.TokenAccount, now time.Time) (string, s
 		state = "expiring"
 	}
 	return expiry.UTC().Format(time.RFC3339), state
-}
-
-func safeCustomMeta(account model.TokenAccount, key string) string {
-	if account.Pool != "custom" || account.Meta == nil || (key != "base_url" && key != "models") {
-		return ""
-	}
-	return strings.TrimSpace(fmt.Sprint(account.Meta[key]))
 }
 
 func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountImportInput) (map[string]any, error) {
@@ -530,20 +528,13 @@ func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountIm
 				firstMapString(credential, "email", "login_identity"),
 				firstMapString(credential, "password", "login_secret"), secret)
 		}
-	case "runway":
-		account, err = s.tokenSvc.ImportRunwayToken(ctx, secret, "")
+
 	case "grok":
 		account, err = s.tokenSvc.ImportGrokToken(ctx, secret, "")
-	case "oreate":
-		account, err = s.tokenSvc.ImportOreateAccount(ctx, secret, stringFromMap(credential, "email"), stringFromMap(credential, "ouid"), stringFromMap(credential, "user_agent"), int64FromMap(credential, "reg_ts"), stringFromMap(credential, "vip"), "")
+
 	case "dola":
 		account, err = s.tokenSvc.ImportDolaAccount(ctx, secret, stringFromMap(credential, "user_agent"))
-	case "custom":
-		models := canonicalModelsFromCredential(credential)
-		if len(models) == 0 {
-			return nil, errors.New("custom accounts must bind at least one existing canonical model")
-		}
-		account, err = s.tokenSvc.ImportCustomAccount(ctx, stringFromMap(credential, "base_url"), firstMapString(credential, "api_key", "key", "token"), strings.Join(models, ","), input.Label, intFromMap(credential, "weight"), intFromMap(credential, "max_concurrency"), strings.TrimSpace(input.ID))
+
 	}
 	if err != nil {
 		return nil, err
@@ -556,15 +547,25 @@ func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountIm
 			account = updated
 		}
 	}
-	if err := s.bindAccountRoutes(ctx, *account, canonicalModelsFromCredential(credential)); err != nil {
+	if err := s.bindAccountRoutes(ctx, *account); err != nil {
 		return nil, err
 	}
 	// Import is not accepted on faith. Resolve identity (where supported) and
 	// refresh the provider balance before returning the account to the UI.
 	_, _ = s.tokenSvc.Email(ctx, account.Pool, account.ID)
-	_, quotaErr := s.RefreshAccountQuota(ctx, account.ID)
-	if quotaErr != nil {
-		return nil, quotaErr
+	if current, getErr := s.tokens.Get(ctx, account.Pool, account.ID); getErr == nil {
+		account = current
+	}
+	if account.Status != "pending" {
+		reused, quotaErr := s.tokenSvc.storeImportQuota(ctx, *account)
+		if quotaErr != nil {
+			return nil, quotaErr
+		}
+		if !reused {
+			if _, quotaErr = s.RefreshAccountQuota(ctx, account.ID); quotaErr != nil {
+				return nil, quotaErr
+			}
+		}
 	}
 	account, err = s.tokens.Get(ctx, account.Pool, account.ID)
 	if err != nil {
@@ -573,34 +574,12 @@ func (s *AdminConsoleService) ImportAccount(ctx context.Context, input AccountIm
 	return s.accountRow(ctx, *account)
 }
 
-func (s *AdminConsoleService) bindAccountRoutes(ctx context.Context, account model.TokenAccount, allowModels []string) error {
-	allowed := make(map[string]bool, len(allowModels))
-	for _, id := range allowModels {
-		allowed[id] = true
-	}
-	if account.Pool == "custom" && s.db.Migrator().HasTable(&model.AccountModelRoute{}) {
-		var existing []model.AccountModelRoute
-		if err := s.db.WithContext(ctx).Where("account_id = ?", account.ID).Find(&existing).Error; err != nil {
-			return err
-		}
-		for _, binding := range existing {
-			var route model.ModelRoute
-			if err := s.db.WithContext(ctx).First(&route, "id = ?", binding.ModelRouteID).Error; err != nil || route.Provider != "custom" || allowed[route.LogicalModelID] {
-				continue
-			}
-			binding.Enabled = false
-			if err := s.models.Routes().SetAccountRoute(ctx, &binding); err != nil {
-				return err
-			}
-		}
-	}
+func (s *AdminConsoleService) bindAccountRoutes(ctx context.Context, account model.TokenAccount) error {
 	for _, definition := range model.CanonicalRoutingCatalog() {
 		if definition.Model.ID == model.DolaPublicVideoModel && account.Pool != "dola" {
 			continue
 		}
-		if account.Pool == "custom" && !allowed[definition.Model.ID] {
-			continue
-		}
+
 		for _, route := range definition.Routes {
 			if route.Provider != account.Pool {
 				continue
@@ -613,51 +592,9 @@ func (s *AdminConsoleService) bindAccountRoutes(ctx context.Context, account mod
 				return err
 			}
 		}
-		if account.Pool == "custom" && allowed[definition.Model.ID] {
-			routeID := "custom." + definition.Model.ID
-			route := model.ModelRoute{
-				ID: routeID, LogicalModelID: definition.Model.ID, Provider: "custom",
-				RuntimeModel: definition.Model.ID, UpstreamModel: definition.Model.ID,
-				Enabled: true, Priority: 10, Weight: 1, QuotaBucketKey: "custom.unmetered",
-				QuotaCosts:   datatypes.JSON([]byte(`{"mode":"unmetered"}`)),
-				Capabilities: aggregateCapabilities(definition.Routes),
-			}
-			if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "id"}},
-				DoUpdates: clause.AssignmentColumns([]string{"enabled", "quota_costs", "capabilities", "updated_at"}),
-			}).Create(&route).Error; err != nil {
-				return err
-			}
-			if err := s.models.Routes().SetAccountRoute(ctx, &model.AccountModelRoute{
-				AccountID: account.ID, ModelRouteID: routeID, Enabled: true, Entitled: true,
-				QuotaBucketKey: route.QuotaBucketKey,
-			}); err != nil {
-				return err
-			}
-		}
+
 	}
 	return nil
-}
-
-func aggregateCapabilities(routes []model.ModelRoute) datatypes.JSON {
-	seen := make(map[string]json.RawMessage)
-	for _, route := range routes {
-		for _, profile := range model.DecodeCapabilityProfiles(route.Capabilities) {
-			raw, _ := json.Marshal(profile)
-			seen[string(raw)] = raw
-		}
-	}
-	keys := make([]string, 0, len(seen))
-	for key := range seen {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	profiles := make([]json.RawMessage, 0, len(keys))
-	for _, key := range keys {
-		profiles = append(profiles, seen[key])
-	}
-	raw, _ := json.Marshal(profiles)
-	return datatypes.JSON(raw)
 }
 
 func (s *AdminConsoleService) UpdateAccount(ctx context.Context, accountID string, patch map[string]any) (map[string]any, error) {
@@ -1325,35 +1262,6 @@ func cookieFromCredential(values map[string]any) string {
 	return strings.Join(parts, "; ")
 }
 
-func canonicalModelsFromCredential(values map[string]any) []string {
-	seen := map[string]bool{}
-	var candidates []string
-	switch raw := values["models"].(type) {
-	case string:
-		candidates = strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '\n' || r == ';' })
-	case []any:
-		for _, value := range raw {
-			candidates = append(candidates, fmt.Sprint(value))
-		}
-	case map[string]any:
-		for key := range raw {
-			candidates = append(candidates, key)
-		}
-	}
-	for _, candidate := range candidates {
-		id := strings.TrimSpace(candidate)
-		if model.IsCanonicalModelID(id) {
-			seen[id] = true
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for id := range seen {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func firstMapString(values map[string]any, keys ...string) string {
 	for _, key := range keys {
 		if value := stringFromMap(values, key); value != "" {
@@ -1368,13 +1276,6 @@ func stringFromMap(values map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprint(values[key]))
-}
-
-func intFromMap(values map[string]any, key string) int { return intValueSafe(values[key]) }
-
-func int64FromMap(values map[string]any, key string) int64 {
-	value, _ := strconv.ParseInt(strings.TrimSpace(fmt.Sprint(values[key])), 10, 64)
-	return value
 }
 
 func intValueSafe(value any) int {

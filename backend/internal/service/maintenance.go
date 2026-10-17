@@ -73,33 +73,6 @@ func (m *MaintenanceService) Run(ctx context.Context) {
 	}
 }
 
-// syncRecoveredQuota refreshes both display metadata and the authoritative
-// scheduling bucket after recovery. Bounded concurrency absorbs reset bursts.
-func (m *MaintenanceService) syncRecoveredQuota(parent context.Context, accs []model.TokenAccount) {
-	sem := make(chan struct{}, 4)
-	var wg sync.WaitGroup
-	for _, acc := range accs {
-		if _, _, scoped := providerSnapshotScope(acc.Pool); !scoped {
-			continue
-		}
-		select {
-		case sem <- struct{}{}:
-		case <-parent.Done():
-			wg.Wait()
-			return
-		}
-		wg.Add(1)
-		go func(a model.TokenAccount) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			ctx, cancel := context.WithTimeout(parent, 45*time.Second)
-			defer cancel()
-			_, _ = m.tokenSvc.Quota(ctx, a.Pool, a.ID)
-		}(acc)
-	}
-	wg.Wait()
-}
-
 // refreshDueQuota repairs zero/old buckets even when no request can select the
 // account. The database claim also throttles failed probes across processes.
 func (m *MaintenanceService) refreshDueQuota(ctx context.Context) {
@@ -121,24 +94,32 @@ func (m *MaintenanceService) refreshDueQuota(ctx context.Context) {
 			recordBookkeepingError("claim quota refresh", err)
 			return
 		}
-		accounts := make([]model.TokenAccount, 0, len(buckets))
-		seen := make(map[string]bool, len(buckets))
+		sem := make(chan struct{}, 4)
+		var wg sync.WaitGroup
 		for _, bucket := range buckets {
-			if seen[bucket.AccountID] {
-				continue
-			}
-			// The scoped probe is account-wide; never probe an obsolete text bucket
-			// with an image/media endpoint.
 			for _, pool := range SchedulableProviders() {
 				key, _, ok := providerSnapshotScope(pool)
-				if ok && key == bucket.BucketKey {
-					seen[bucket.AccountID] = true
-					accounts = append(accounts, model.TokenAccount{ID: bucket.AccountID, Pool: pool})
-					break
+				if !ok || key != bucket.BucketKey {
+					continue
 				}
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					wg.Wait()
+					return
+				}
+				wg.Add(1)
+				go func(pool string, claim model.AccountQuotaBucket) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					probeCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+					defer cancel()
+					m.tokenSvc.refreshClaimedQuota(probeCtx, pool, claim)
+				}(pool, bucket)
+				break
 			}
 		}
-		m.syncRecoveredQuota(ctx, accounts)
+		wg.Wait()
 	}()
 }
 
@@ -153,37 +134,27 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	// below releases their hold in the same tick.
 	m.reconcileUnknownSubmissions(ctx)
 	m.reconcileOpenQuotaReservations(ctx)
-	m.refreshDueQuota(ctx)
 	// 1. Re-activate quota-exhausted tokens whose reset time has passed, then
 	//    auto-sync their real balance where the provider exposes a cheap probe.
 	if recovered, err := m.tokens.RecoverQuota(ctx); err != nil {
 		log.Printf("maintenance: recover_quota failed")
 	} else if len(recovered) > 0 {
 		log.Printf("maintenance: recovered %d quota token(s)", len(recovered))
-		if m.tokenSvc != nil {
-			go m.syncRecoveredQuota(ctx, recovered)
+		if m.models != nil {
+			for _, account := range recovered {
+				if key, _, ok := providerSnapshotScope(account.Pool); ok {
+					recordBookkeepingError("schedule recovered quota", m.models.Quotas().RequestRefresh(ctx, account.ID, key))
+				}
+			}
 		}
 	}
+
+	m.refreshDueQuota(ctx)
 
 	// 1a. Roll Adobe's active reset marker forward so the admin view never shows
 	//     a stale past time. Limited accounts remain owned by RecoverQuota.
 	if _, err := m.tokens.RollResetMarkers(ctx, []string{"adobe"}); err != nil {
 		log.Printf("maintenance: roll_reset failed")
-	}
-
-	// 1b. Runway tokens have no refresh — once the JWT expiry marker passes the
-	//     token can only 401, so flip it to disabled+dead proactively instead of
-	//     leaving a doomed account "active". Grok is intentionally NOT swept here:
-	//     its reset marker is billingPeriodEnd (a credits-renewal date), not a
-	//     death deadline — a grok sso keeps working past billingPeriodEnd, so
-	//     expiring on it kills live accounts. Grok death is caught for real by the
-	//     import-time FetchSession check and by marking dead on a 401 at use.
-	for _, pool := range []string{"runway"} {
-		if n, err := m.tokens.ExpireByReset(ctx, pool); err != nil {
-			log.Printf("maintenance: expire_%s failed", pool)
-		} else if n > 0 {
-			log.Printf("maintenance: expired %d %s token(s)", n, pool)
-		}
 	}
 
 	if m.tokenSvc != nil {
@@ -192,15 +163,6 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 		} else if n > 0 {
 			log.Printf("maintenance: expired %d chatgpt token(s)", n)
 		}
-		// 1c. Re-sync Grok accounts through the authenticated credits endpoint.
-		//     It also provides liveness; subscription tier is not a video
-		//     entitlement signal and is intentionally not probed here.
-		m.tokenSvc.RefreshGrokLiveness(ctx)
-		// 1d. Refresh Oreate quota rows and active rows cached below the
-		//     operating floor. Replenished accounts return to active automatically.
-		m.tokenSvc.RefreshLowCreditOreateAccounts(ctx)
-		// 1e. Keep Oreate website sessions warm without submitting paid work.
-		m.tokenSvc.RefreshOreateSessions(ctx)
 		// 1f. Re-probe ChatGPT accounts stuck in pending past stalePending — an
 		//     import probe interrupted by a restart (or that never finished) would
 		//     otherwise strand a good freshly-registered account forever, since
@@ -352,9 +314,8 @@ func (m *MaintenanceService) reconcileUnknownSubmissions(ctx context.Context) {
 			continue
 		}
 		if event == nil || event.Status != "pending" {
-			// The event was closed by another path; the attempt row is historical.
-			// Mark it so the reservation sweep can release the hold.
-			m.finishUnknownSubmission(ctx, attempt, event)
+			// A closed client event is not evidence that the provider was uncharged.
+			m.finishUnknownSubmission(ctx, attempt, unknownSubmissionUnverified)
 			continue
 		}
 		if event.Provider != "byteplus" {
@@ -370,8 +331,9 @@ func (m *MaintenanceService) reconcileUnknownSubmissions(ctx context.Context) {
 			m.recovery.startAcceptedImageRecovery(ctx, event)
 			adopted++
 		case closeUnknownSubmission:
-			m.finishUnknownSubmission(ctx, attempt, event)
-			closed++
+			if m.finishUnknownSubmission(ctx, attempt, verdict) {
+				closed++
+			}
 		}
 	}
 	if adopted > 0 || closed > 0 {
@@ -450,27 +412,31 @@ func (m *MaintenanceService) verifyUnknownSubmission(ctx context.Context, attemp
 	return unknownSubmissionAccepted, taskID
 }
 
-// finishUnknownSubmission records the terminal verdict. The attempt becomes a
-// plain temporary failure (the reservation sweep releases its hold), the event
-// leaves pending, and the account/route binding learns about the failure.
-func (m *MaintenanceService) finishUnknownSubmission(ctx context.Context, attempt model.DispatchAttempt, event *model.EventLog) {
-	if err := m.models.Dispatch().Finish(ctx, attempt.ID, "failed", "temporary", "", ErrProviderTemporary); err != nil {
+// End client waiting without treating elapsed time as proof of no charge.
+// Only a verified absence becomes an ordinary refundable failure.
+func (m *MaintenanceService) finishUnknownSubmission(ctx context.Context, attempt model.DispatchAttempt, verdict unknownSubmissionVerdict) bool {
+	absent := verdict == unknownSubmissionAbsent
+	message := ErrGenerationOutcomeUnknown.Error()
+	if absent {
+		message = ErrProviderTemporary.Error()
+	}
+	applied, err := m.models.Dispatch().ResolveUnknown(ctx, attempt, absent, message)
+	if err != nil {
 		log.Printf("maintenance: close unknown submission failed")
-		return
+		return false
 	}
-	if event != nil && event.Status == "pending" {
-		if err := m.events.UpdateStatus(ctx, event.ID, "failed", ErrProviderTemporary.Error(), 0); err != nil {
-			log.Printf("maintenance: fail unverified pending event failed")
-		}
-		if m.inflight != nil {
-			m.inflight.Cancel(event.ID)
-		}
+	if !applied {
+		return false
 	}
-	if attempt.AccountID != "" && attempt.ModelRouteID != "" {
+	if m.inflight != nil {
+		m.inflight.Cancel(attempt.EventID)
+	}
+	if absent && attempt.AccountID != "" && attempt.ModelRouteID != "" {
 		if err := m.models.Routes().RecordAccountRouteResult(ctx, attempt.AccountID, attempt.ModelRouteID, "temporary", false); err != nil {
 			log.Printf("maintenance: record unknown submission route result failed")
 		}
 	}
+	return true
 }
 
 func (m *MaintenanceService) reconcileOpenQuotaReservations(ctx context.Context) {
@@ -558,15 +524,12 @@ func (m *MaintenanceService) refreshRecoveredQuota(ctx context.Context, account 
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	snapshot, err := m.tokenSvc.Quota(probeCtx, account.Pool, account.ID)
-	if err != nil || boolValueWithDefault(snapshot["unknown"], false) {
+	snapshot, err := m.tokenSvc.quotaWithReason(probeCtx, account.Pool, account.ID, repo.QuotaProbeRecovery)
+	remaining, _, _, trusted := trustedQuotaSnapshot(snapshot)
+	if err != nil || !trusted || boolValueWithDefault(snapshot["unchanged"], false) {
 		return nil
 	}
-	remaining, ok := anyFloat(snapshot["remaining"])
-	if !ok {
-		return nil
-	}
-	return &remaining
+	return remaining
 }
 
 func (m *MaintenanceService) pruneLogs(ctx context.Context) {

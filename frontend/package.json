@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "lint:unused": "knip"
+    "lint:unused": "knip",
+    "test:proxy": "node --test scripts/proxy.test.mjs"
   },
   "dependencies": {
     "fflate": "^0.8.3",

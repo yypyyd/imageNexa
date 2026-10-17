@@ -37,16 +37,7 @@ func optimizationTestDB(t *testing.T) *gorm.DB {
 	if db.Raw("SELECT current_database()").Scan(&name).Error != nil || !strings.HasPrefix(name, "imagenexa_optimization_test_") {
 		t.Fatal("refusing non-test database")
 	}
-	// Historical migrations extend operational tables from the pre-migration
-	// installation. Recreate that baseline, then apply every real SQL constraint.
-	if db.Exec(`CREATE TABLE IF NOT EXISTS refresh_profiles (
-		id VARCHAR(64) PRIMARY KEY, pool VARCHAR(64) NOT NULL, kind VARCHAR(64) NOT NULL
-	)`).Error != nil {
-		t.Fatal("create legacy refresh profile baseline")
-	}
-	if db.AutoMigrate(&model.EventLog{}) != nil {
-		t.Fatal("create operational event baseline")
-	}
+	// Use the same schema startup order as production, including empty databases.
 	if err := migrations.Run(context.Background(), db); err != nil {
 		t.Fatal("test migrations failed:", err)
 	}

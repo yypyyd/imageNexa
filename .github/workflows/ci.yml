@@ -58,3 +58,9 @@ jobs:
         run: npm run lint:unused
       - name: Build
         run: npm run build
+      - name: Install proxy test runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nginx-light
+      - name: Verify proxy recovery
+        run: npm run test:proxy

@@ -52,6 +52,7 @@ func TestAcceptedVideoNeverAuthorizesFailover(t *testing.T) {
 		{"grok fatal rejection", grok.AcceptedFailure(taskURL, grok.ErrVideoRejected), "failed", "request", false},
 		{"dola temporary", dola.AcceptedFailure("conversation", dola.ErrTemporaryUpstream), "accepted", "temporary", true},
 		{"dola content rejection", dola.AcceptedFailure("conversation", dola.ErrContentRejected), "failed", "request", false},
+		{"dola final generation failure", dola.AcceptedFailure("conversation", dola.ErrVideoFailed), "failed", "request", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !noRouteFailover(tc.err) || routeFailoverSafe(tc.err) {
@@ -80,7 +81,7 @@ func TestParameterErrorsPreserveCapabilityCombinations(t *testing.T) {
 	}
 }
 
-func TestQuotaViewDistinguishesUnknownEmptyAndStale(t *testing.T) {
+func TestQuotaViewDistinguishesUnknownEmptyAndCached(t *testing.T) {
 	now := time.Now()
 	stale := now.Add(-time.Hour)
 	positive := 2.0
@@ -94,7 +95,7 @@ func TestQuotaViewDistinguishesUnknownEmptyAndStale(t *testing.T) {
 		{"unknown", []model.AccountQuotaBucket{{BucketKey: "chatgpt.image"}}, "unknown"},
 		{"empty", []model.AccountQuotaBucket{{BucketKey: "chatgpt.image", Remaining: &zero, RefreshedAt: &now}}, "empty"},
 		{"positive", []model.AccountQuotaBucket{{BucketKey: "chatgpt.image", Remaining: &positive, RefreshedAt: &now}}, "available"},
-		{"stale", []model.AccountQuotaBucket{{BucketKey: "chatgpt.image", Remaining: &positive, RefreshedAt: &stale}}, "stale"},
+		{"cached balance", []model.AccountQuotaBucket{{BucketKey: "chatgpt.image", Remaining: &positive, RefreshedAt: &stale}}, "available"},
 		{"unrelated bucket", []model.AccountQuotaBucket{{BucketKey: "chatgpt.text", Remaining: &positive, RefreshedAt: &now}}, "unknown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

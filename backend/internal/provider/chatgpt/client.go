@@ -449,6 +449,14 @@ func applyAssistantEvent(raw []byte, current string, active bool) (string, bool,
 	return current, active, updated
 }
 
+type reservedImageQuotaKey struct{}
+
+// WithReservedImageQuota is used only after the gateway atomically reserves a
+// known image allowance. Standalone adapter calls retain the upstream preflight.
+func WithReservedImageQuota(ctx context.Context) context.Context {
+	return context.WithValue(ctx, reservedImageQuotaKey{}, true)
+}
+
 func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool, accepted ...func(string) error) ([]byte, map[string]any, error) {
 	// Every chatgpt.com call goes through the proxy: Cloudflare rejects the
 	// local egress with an HTML 403 on the sentinel/conversation/content
@@ -469,9 +477,11 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	// Fail over immediately when the account's image_gen allowance is spent:
 	// submitting anyway just burns the whole poll budget and surfaces as
 	// "image poll timeout". Unknown quota (init failed) proceeds as before.
-	if quota, qErr := c.fetchImageQuota(ctx, proxySession, accessToken); qErr == nil && quota["unknown"] == false {
-		if remaining, ok := quota["remaining"].(int); ok && remaining <= 0 {
-			return nil, nil, fmt.Errorf("%w: image_gen remaining 0 (resets %s)", ErrQuotaExhausted, stringValue(quota["reset_after"]))
+	if reserved, _ := ctx.Value(reservedImageQuotaKey{}).(bool); !reserved {
+		if quota, qErr := c.fetchImageQuota(ctx, proxySession, accessToken); qErr == nil && quota["unknown"] == false {
+			if remaining, ok := quota["remaining"].(int); ok && remaining <= 0 {
+				return nil, nil, fmt.Errorf("%w: image_gen remaining 0 (resets %s)", ErrQuotaExhausted, stringValue(quota["reset_after"]))
+			}
 		}
 	}
 

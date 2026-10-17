@@ -11,11 +11,8 @@ import (
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
-	"backend/internal/provider/custom"
 	"backend/internal/provider/dola"
 	"backend/internal/provider/grok"
-	"backend/internal/provider/oreate"
-	"backend/internal/provider/runway"
 	"backend/internal/repo"
 	"gorm.io/gorm"
 )
@@ -370,12 +367,10 @@ func (s *V1Service) dispatchImageRoutes(ctx context.Context, eventID string, log
 			data, url, lastErr = s.generateBytePlusImage(routeCtx, eventID, item, in, ratio, resolution, noStore)
 		case "chatgpt":
 			data, url, lastErr = s.generateChatGPTImage(routeCtx, eventID, item, in, ratio, resolution, noStore)
-		case "runway":
-			data, url, lastErr = s.generateRunwayImage(routeCtx, eventID, item, in, ratio, resolution, noStore)
+
 		case "grok":
 			data, url, lastErr = s.generateGrokImage(routeCtx, eventID, item, in, ratio, noStore)
-		case "custom":
-			data, url, lastErr = s.generateCustomImage(routeCtx, eventID, item, in, ratio, resolution, noStore)
+
 		default:
 			lastErr = ErrProviderUnsupported
 		}
@@ -414,16 +409,13 @@ func (s *V1Service) dispatchVideoRoutes(ctx context.Context, eventID string, log
 		switch route.Provider {
 		case "adobe":
 			data, url, lastErr = s.generateAdobeVideo(routeCtx, eventID, item, in, ratio, resolution, seconds, download)
-		case "runway":
-			data, url, lastErr = s.generateRunwayVideo(routeCtx, eventID, item, in, ratio, seconds, download)
+
 		case "grok":
 			data, url, lastErr = s.generateGrokVideo(routeCtx, eventID, item, in, ratio, resolution, seconds, download)
-		case "oreate":
-			data, url, lastErr = s.generateOreateVideo(routeCtx, eventID, item, in, ratio, resolution, seconds, download)
+
 		case "dola":
 			data, url, lastErr = s.generateDolaVideo(routeCtx, eventID, item, in, ratio, seconds, download)
-		case "custom":
-			data, url, lastErr = s.generateCustomVideo(routeCtx, eventID, item, in, ratio, resolution, seconds, download)
+
 		default:
 			lastErr = ErrProviderUnsupported
 		}
@@ -475,22 +467,7 @@ func evaluateRouteCost(route model.ModelRoute, req model.RouteRequirements) (flo
 			return 0, false
 		}
 		return credits, true
-	case "oreate_seedance":
-		// Reference-video pricing depends on the decoded videos' total duration.
-		// The Oreate adapter replaces this provisional unknown with its exact cost
-		// before entering the account pool; never guess from the reference count.
-		if req.ReferenceVideos > 0 {
-			return 0, false
-		}
-		providerModel := strings.TrimSpace(route.UpstreamModel)
-		if providerModel == "" {
-			providerModel = strings.TrimSpace(route.RuntimeModel)
-		}
-		credits, err := oreate.SeedanceRequiredCredits(providerModel, req.Resolution, parseDurationSeconds(req.Duration), req.GenerateAudio, 0)
-		if err != nil || credits < 0 {
-			return 0, false
-		}
-		return float64(credits), true
+
 	case "dola_video":
 		credits, err := dola.RequiredCredits(parseDurationSeconds(req.Duration))
 		if err != nil || credits < 0 {
@@ -518,11 +495,9 @@ func routeFailoverSafe(err error) bool {
 		errors.Is(err, adobe.ErrEntitlement) || errors.Is(err, adobe.ErrAuth) || errors.Is(err, adobe.ErrQuotaExhausted) || errors.Is(err, adobe.ErrTemporaryUpstream) ||
 		errors.Is(err, byteplus.ErrAuth) || errors.Is(err, byteplus.ErrQuotaExhausted) || errors.Is(err, byteplus.ErrTemporaryUpstream) ||
 		errors.Is(err, chatgpt.ErrAuth) || errors.Is(err, chatgpt.ErrQuotaExhausted) || errors.Is(err, chatgpt.ErrTemporaryUpstream) ||
-		errors.Is(err, runway.ErrAuth) || errors.Is(err, runway.ErrQuotaExhausted) || errors.Is(err, runway.ErrTemporaryUpstream) ||
 		errors.Is(err, grok.ErrAuth) || errors.Is(err, grok.ErrQuotaExhausted) || errors.Is(err, grok.ErrTemporaryUpstream) ||
-		errors.Is(err, oreate.ErrAuth) || errors.Is(err, oreate.ErrQuotaExhausted) || errors.Is(err, oreate.ErrTemporaryUpstream) ||
-		errors.Is(err, dola.ErrAuth) || errors.Is(err, dola.ErrQuotaExhausted) || errors.Is(err, dola.ErrTemporaryUpstream) ||
-		errors.Is(err, custom.ErrAuth) || errors.Is(err, custom.ErrQuotaExhausted) || errors.Is(err, custom.ErrTemporaryUpstream)
+		errors.Is(err, dola.ErrAuth) || errors.Is(err, dola.ErrQuotaExhausted) || errors.Is(err, dola.ErrTemporaryUpstream)
+
 }
 
 // runTextRouteFailover keeps route selection separate from account failover.
@@ -553,7 +528,7 @@ func dispatchFailureClass(err error) (state, class string) {
 		return "failed", "content"
 	}
 	var dolaSubmission *dola.VideoSubmissionError
-	if errors.As(err, &dolaSubmission) && errors.Is(dolaSubmission.Cause, dola.ErrContentRejected) {
+	if errors.As(err, &dolaSubmission) && (errors.Is(dolaSubmission.Cause, dola.ErrContentRejected) || errors.Is(dolaSubmission.Cause, dola.ErrVideoFailed)) {
 		// A final rejection is no longer in flight. Keep the accepted wrapper
 		// for no-retry and quota settlement, separately from dispatch lifecycle.
 		return "failed", "request"
@@ -581,9 +556,9 @@ func dispatchFailureClass(err error) (state, class string) {
 		return "unknown", "temporary"
 	case errors.Is(err, adobe.ErrEntitlement):
 		return "failed", "entitlement"
-	case errors.Is(err, adobe.ErrAuth), errors.Is(err, byteplus.ErrAuth), errors.Is(err, chatgpt.ErrAuth), errors.Is(err, runway.ErrAuth), errors.Is(err, grok.ErrAuth), errors.Is(err, oreate.ErrAuth), errors.Is(err, dola.ErrAuth), errors.Is(err, custom.ErrAuth):
+	case errors.Is(err, adobe.ErrAuth), errors.Is(err, byteplus.ErrAuth), errors.Is(err, chatgpt.ErrAuth), errors.Is(err, grok.ErrAuth), errors.Is(err, dola.ErrAuth):
 		return "failed", "auth"
-	case errors.Is(err, adobe.ErrQuotaExhausted), errors.Is(err, byteplus.ErrQuotaExhausted), errors.Is(err, chatgpt.ErrQuotaExhausted), errors.Is(err, runway.ErrQuotaExhausted), errors.Is(err, grok.ErrQuotaExhausted), errors.Is(err, oreate.ErrQuotaExhausted), errors.Is(err, dola.ErrQuotaExhausted), errors.Is(err, custom.ErrQuotaExhausted):
+	case errors.Is(err, adobe.ErrQuotaExhausted), errors.Is(err, byteplus.ErrQuotaExhausted), errors.Is(err, chatgpt.ErrQuotaExhausted), errors.Is(err, grok.ErrQuotaExhausted), errors.Is(err, dola.ErrQuotaExhausted):
 		return "failed", "quota"
 	case routeFailoverSafe(err):
 		return "failed", "temporary"

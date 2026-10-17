@@ -86,6 +86,13 @@ func Run(ctx context.Context, db *gorm.DB) error {
 	}
 	defer conn.Close()
 
+	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLock); err != nil {
+		return fmt.Errorf("acquire migration advisory lock: %w", err)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLock)
+	}()
+
 	if _, err := conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version BIGINT PRIMARY KEY,
@@ -95,13 +102,6 @@ func Run(ctx context.Context, db *gorm.DB) error {
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
-	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLock); err != nil {
-		return fmt.Errorf("acquire migration advisory lock: %w", err)
-	}
-	defer func() {
-		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLock)
-	}()
-
 	migrations, err := Load()
 	if err != nil {
 		return err
@@ -122,6 +122,18 @@ func Run(ctx context.Context, db *gorm.DB) error {
 		if record.Name != migration.Name || record.Checksum != migration.Checksum {
 			return fmt.Errorf("migration %06d checksum/name mismatch", version)
 		}
+	}
+
+	// Historical migrations 6 and 7 extend this retained operational table,
+	// which legacy installations created with AutoMigrate. Supply only their
+	// prerequisite on a fresh database, under the same startup lock. Existing
+	// tables and checksummed migration bytes must remain untouched.
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS refresh_profiles (
+		id VARCHAR(64) PRIMARY KEY,
+		pool VARCHAR(64) NOT NULL,
+		kind VARCHAR(64) NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create operational migration baseline: %w", err)
 	}
 
 	for _, migration := range migrations {

@@ -78,9 +78,8 @@ func QuotaSnapshotKey(accountID, bucketKey string) string {
 	return strings.TrimSpace(accountID) + "\x00" + strings.TrimSpace(bucketKey)
 }
 
-// ClaimRefreshDue schedules bounded background probes without changing the
-// last authoritative RefreshedAt. UpdatedAt provides a five-minute probe retry
-// delay, including failures, and row locks prevent two workers claiming a row.
+// ClaimRefreshDue claims the shared daily/recovery queue. Local deductions never
+// postpone a check; a lease prevents duplicate workers and recovers after a crash.
 func (r *QuotaRepository) ClaimRefreshDue(ctx context.Context, now time.Time, limit int) ([]model.AccountQuotaBucket, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -90,21 +89,25 @@ func (r *QuotaRepository) ClaimRefreshDue(ctx context.Context, now time.Time, li
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("bucket_key NOT LIKE ?", model.DolaDailyVideoBucket+":%").
 			Where("bucket_key IN ?", []string{"chatgpt.image", "byteplus.computing_points", "grok.media", "adobe.credits", "runway.credits", "oreate.points"}).
-			Where("updated_at <= ?", now.Add(-5*time.Minute)).
-			Where("refreshed_at IS NULL OR refreshed_at <= ? OR (reset_at <= ? AND refreshed_at < reset_at)", now.Add(-15*time.Minute), now).
+			Where("probe_until IS NULL OR probe_until <= ?", now).
+			Where("reserved = 0").
+			Where(`(refresh_after <= ? OR (refresh_after IS NULL AND (refreshed_at IS NULL OR refreshed_at <= ?)))
+				OR (refresh_failures = 0 AND remaining <= 0 AND bucket_key NOT IN ('runway.credits','oreate.points')
+				AND reset_at <= ? AND (last_probe_at IS NULL OR last_probe_at < reset_at) AND (refreshed_at IS NULL OR refreshed_at < reset_at))`, now, now.Add(-QuotaRefreshInterval), now).
 			Where(`EXISTS (SELECT 1 FROM provider_accounts a WHERE a.id = account_quota_buckets.account_id
 				AND a.dead = false AND a.status IN ('active', 'quota') AND a.value <> '' AND a.pool <> 'custom')`).
-			Order("updated_at ASC, id ASC").Limit(limit).Find(&items).Error; err != nil {
+			Order("COALESCE(refresh_after, refreshed_at, created_at) ASC, id ASC").Limit(limit).Find(&items).Error; err != nil {
 			return err
 		}
 		if len(items) == 0 {
 			return nil
 		}
-		ids := make([]string, 0, len(items))
-		for _, item := range items {
-			ids = append(ids, item.ID)
+		for i := range items {
+			if err := claimQuotaProbe(tx, &items[i], now); err != nil {
+				return err
+			}
 		}
-		return tx.Model(&model.AccountQuotaBucket{}).Where("id IN ?", ids).UpdateColumn("updated_at", now).Error
+		return nil
 	})
 	return items, err
 }
@@ -150,29 +153,15 @@ func (r *QuotaRepository) UpsertSnapshot(ctx context.Context, accountID, bucketK
 		} else if err != nil {
 			return err
 		}
-		item.Unit = unit
-		// Partial provider snapshots are common. A missing total/reset field means
-		// "not observed in this probe", not "erase the last authoritative value".
-		if total != nil {
-			item.Total = cloneFloat(total)
-		}
-		if resetAt != nil {
-			item.ResetAt = resetAt
-		}
-		if upstreamRemaining != nil {
-			available := *upstreamRemaining - item.Reserved
-			if available < 0 {
-				available = 0
-			}
-			item.Remaining = &available
-		}
-		now := time.Now()
-		item.RefreshedAt, item.Revision, item.UpdatedAt = &now, item.Revision+1, now
+		applyQuotaSnapshot(&item, unit, total, upstreamRemaining, resetAt, time.Now())
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
 		result = item
-		return nil
+		if err := syncQuotaMetadata(tx, item); err != nil {
+			return err
+		}
+		return restoreQuotaAccount(tx, item)
 	})
 	return &result, err
 }
@@ -230,8 +219,11 @@ func (r *QuotaRepository) ReserveWithUnit(ctx context.Context, eventID, attemptI
 		if err := tx.Save(&bucket).Error; err != nil {
 			return err
 		}
+		if err := syncQuotaMetadata(tx, bucket); err != nil {
+			return err
+		}
 		result = model.QuotaReservation{ID: durableID("qres_"), EventID: eventID, DispatchAttemptID: attemptID,
-			QuotaBucketID: bucket.ID, Amount: amount, Status: "held"}
+			QuotaBucketID: bucket.ID, Amount: amount, Status: "held", BalanceKnown: bucket.Remaining != nil}
 		return tx.Create(&result).Error
 	})
 	return &result, err
@@ -319,7 +311,15 @@ func (r *QuotaRepository) finishReservation(ctx context.Context, reservationID, 
 		if err := tx.Save(&bucket).Error; err != nil {
 			return err
 		}
+		if err := syncQuotaMetadata(tx, bucket); err != nil {
+			return err
+		}
 		now := time.Now()
+		if bucket.Reserved == 0 && bucket.RefreshRequestedAt != nil && bucket.RefreshFailures == 0 {
+			if err := tx.Model(&bucket).UpdateColumn("refresh_after", now).Error; err != nil {
+				return err
+			}
+		}
 		return tx.Model(&reservation).Updates(map[string]any{"status": target, "settled_at": &now, "updated_at": now}).Error
 	})
 }

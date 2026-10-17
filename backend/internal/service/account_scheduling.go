@@ -164,17 +164,17 @@ func accountDispatchable(account model.TokenAccount, pool, kind, logicalID, pinn
 	if pool == "adobe" && !adobeAccountSupportsModel(account, logicalID, kind) {
 		return false
 	}
-	if pinnedID == "" && (pool == "runway" || pool == "grok" && kind != "text") {
+	if pinnedID == "" && (pool == "grok" && kind != "text") {
 		if remaining, ok := jsonMapInt(account.Meta, "cached_quota_remaining"); ok && remaining <= 0 {
 			return false
 		}
 	}
-	return pool != "custom" || customAccountServes(account, logicalID)
+	return true
 }
 
 // routeDispatchModelID is the id accountDispatchable uses for provider-specific
-// eligibility (Adobe ordinary-vs-points video, custom model lists). Adobe
-// adapters key off RuntimeModel; custom bindings key off the public logical id.
+// eligibility. Adobe ordinary and points accounts key off RuntimeModel; other
+// providers use the public logical ID.
 func routeDispatchModelID(route model.ModelRoute) string {
 	if route.Provider == "adobe" {
 		if runtime := strings.TrimSpace(route.RuntimeModel); runtime != "" {

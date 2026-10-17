@@ -105,21 +105,29 @@ type AccountModelRoute struct {
 // AccountQuotaBucket is the durable source of truth for schedulable upstream
 // allowance. Remaining excludes Reserved; both are updated under a row lock.
 type AccountQuotaBucket struct {
-	ID          string `gorm:"primaryKey;size:191"`
-	AccountID   string `gorm:"size:64;not null;uniqueIndex:ux_account_bucket,priority:1;index"`
-	BucketKey   string `gorm:"size:128;not null;uniqueIndex:ux_account_bucket,priority:2;index"`
-	Unit        string `gorm:"size:32;not null;default:'credits'"`
-	Total       *float64
-	Remaining   *float64
-	Reserved    float64    `gorm:"not null;default:0"`
-	ResetAt     *time.Time `gorm:"index"`
-	Revision    int64      `gorm:"not null;default:0"`
-	RefreshedAt *time.Time
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ProbeAllowsReservations bool   `gorm:"-"`
+	ID                      string `gorm:"primaryKey;size:191"`
+	AccountID               string `gorm:"size:64;not null;uniqueIndex:ux_account_bucket,priority:1;index"`
+	BucketKey               string `gorm:"size:128;not null;uniqueIndex:ux_account_bucket,priority:2;index"`
+	Unit                    string `gorm:"size:32;not null;default:'credits'"`
+	Total                   *float64
+	Remaining               *float64
+	Reserved                float64    `gorm:"not null;default:0"`
+	ResetAt                 *time.Time `gorm:"index"`
+	Revision                int64      `gorm:"not null;default:0"`
+	RefreshedAt             *time.Time
+	RefreshAfter            *time.Time
+	RefreshFailures         int
+	LastProbeAt             *time.Time
+	ProbeID                 string
+	ProbeUntil              *time.Time
+	RefreshRequestedAt      *time.Time
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 type QuotaReservation struct {
+	BalanceKnown      bool    `gorm:"-"`
 	ID                string  `gorm:"primaryKey;size:64"`
 	EventID           string  `gorm:"size:64;not null;index"`
 	DispatchAttemptID string  `gorm:"size:64;index"`

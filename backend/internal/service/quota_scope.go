@@ -19,12 +19,10 @@ func providerSnapshotScope(pool string) (bucketKey, unit string, ok bool) {
 		return "byteplus.computing_points", "points", true
 	case "adobe":
 		return "adobe.credits", "credits", true
-	case "runway":
-		return "runway.credits", "credits", true
+
 	case "grok":
 		return "grok.media", "credits", true
-	case "oreate":
-		return "oreate.points", "points", true
+
 	default:
 		return "", "", false
 	}
@@ -49,7 +47,8 @@ func (s *TokenService) storeQuotaSnapshot(ctx context.Context, pool, accountID s
 }
 
 func quotaProbeUntrusted(snapshot map[string]any) bool {
-	return snapshot == nil || boolValueWithDefault(snapshot["unknown"], false) || boolValueWithDefault(snapshot["auth_failed"], false)
+	_, _, _, trusted := trustedQuotaSnapshot(snapshot)
+	return !trusted
 }
 
 func unknownQuotaSnapshot(snapshot map[string]any) map[string]any {

@@ -120,7 +120,7 @@ function firstQuota(account) {
 }
 
 function quotaStateLabel(value) {
-  return ({ available: '有额度', empty: '额度已耗尽', unknown: '额度待确认', stale: '额度待刷新', unmetered: '按上游额度' })[value] || '额度待确认'
+  return ({ available: '剩余额度', empty: '额度已耗尽', unknown: '尚无余额记录', stale: '上次余额', unmetered: '按上游额度' })[value] || '尚无余额记录'
 }
 
 function quotaPercent(bucket) {
@@ -131,7 +131,7 @@ function quotaPercent(bucket) {
 
 function quotaValue(value, unit) {
   if (value === null || value === undefined) return '—'
-  return `${Number(value).toLocaleString('zh-CN')} ${unit || ''}`.trim()
+  return `${Number(value).toLocaleString('zh-CN')} ${unit === 'generations' ? '次' : (unit || '')}`.trim()
 }
 
 function fmtTime(value) {
@@ -314,7 +314,6 @@ onUnmounted(() => clearInterval(readinessTimer))
     <div class="provider-stock" aria-label="各平台账号数量">
       <button v-for="option in PROVIDER_OPTIONS" :key="option.value" :class="provider === option.value && 'on'" @click="selectProvider(option.value)">
         <span>{{ option.label }}</span><strong>{{ Number(providerCounts[option.value] || 0).toLocaleString('zh-CN') }}</strong>
-        <small title="有额度为已启用账号的最近媒体额度快照；具体模型可用性还受权限和并发限制">有额度 <i class="ok">{{ providerHealth[option.value]?.quota_available || 0 }}</i> · 待确认 <i class="warn">{{ (providerHealth[option.value]?.quota_unknown || 0) + (providerHealth[option.value]?.quota_stale || 0) }}</i></small>
         <small>启用 {{ providerHealth[option.value]?.active || 0 }} · 失效 {{ providerHealth[option.value]?.dead || 0 }} · 无额度 {{ (providerHealth[option.value]?.quota_empty || 0) + (providerHealth[option.value]?.quota || 0) }}</small>
       </button>
     </div>
@@ -357,8 +356,11 @@ onUnmounted(() => clearInterval(readinessTimer))
                 <div class="quota-line" :title="firstQuota(account).name"><b>{{ quotaValue(firstQuota(account).remaining) }}</b><span>/ {{ quotaValue(firstQuota(account).total, firstQuota(account).unit) }}</span></div>
                 <div class="quota-bar"><span :style="{ width: `${quotaPercent(firstQuota(account))}%` }"></span></div>
               </template>
-              <span v-else class="muted">未获取</span>
-              <small class="block mt-1" :class="account.quota_state === 'available' ? 'ok' : 'warn'">{{ quotaStateLabel(account.quota_state) }}</small>
+              <span v-else class="muted">—</span>
+              <small class="block mt-1" :class="account.quota_state === 'available' ? 'ok' : account.quota_state === 'empty' ? 'warn' : 'muted'">{{ quotaStateLabel(account.quota_state) }}</small>
+              <small v-if="Number(firstQuota(account)?.reserved) > 0" class="block muted">占用 {{ quotaValue(firstQuota(account).reserved, firstQuota(account).unit) }}</small>
+              <small v-if="firstQuota(account)?.refreshed_at" class="block muted">上次核对 {{ fmtTime(firstQuota(account).refreshed_at) }}</small>
+              <small v-if="firstQuota(account)?.next_refresh_at" class="block muted">下次查询 {{ fmtTime(firstQuota(account).next_refresh_at) }}</small>
             </td>
             <td class="stats-cell"><div><b>{{ account.active_jobs || 0 }}</b> 在途</div><small><span class="ok">{{ account.success_total || 0 }}</span> / <span :class="Number(account.fail_total || 0) > 0 && 'bad'">{{ account.fail_total || 0 }}</span></small></td>
             <td class="time-cell"><div title="最后使用">{{ fmtTime(account.last_used_at) }}</div><small title="导入/创建时间">{{ fmtTime(account.created_at) }}</small><small v-if="account.provider === 'byteplus'" :class="{ warn: account.session_state === 'expiring', bad: account.session_state === 'expired' }" :title="sessionLabel(account)">{{ sessionLabel(account) }} {{ fmtTime(account.session_expires_at) }}</small></td>

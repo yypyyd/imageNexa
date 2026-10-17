@@ -15,11 +15,8 @@ import (
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/byteplus"
 	"backend/internal/provider/chatgpt"
-	"backend/internal/provider/custom"
 	"backend/internal/provider/dola"
 	"backend/internal/provider/grok"
-	"backend/internal/provider/oreate"
-	"backend/internal/provider/runway"
 	"backend/internal/repo"
 	"backend/internal/service"
 	"backend/internal/storage"
@@ -36,7 +33,7 @@ type App struct {
 	DB     *gorm.DB
 	Redis  *redis.Client
 	Engine *gin.Engine
-	oreate *oreate.Client
+
 	cancel context.CancelFunc
 }
 
@@ -107,23 +104,23 @@ func NewApp(ctx context.Context) (*App, error) {
 	adobeClient := adobe.NewClient("clio-playground-web", "")
 	bytePlusClient := byteplus.NewClient("")
 	chatGPTClient := chatgpt.NewClient("")
-	runwayClient := runway.NewClient("")
+
 	grokClient := grok.NewClient("")
-	oreateClient := oreate.NewClient("")
+
 	dolaClient := dola.NewClient("")
-	customClient := custom.NewClient()
+
 	objectStore := storage.New(cfg.RustFSEndpoint, cfg.RustFSBucket, cfg.RustFSAccessKey, cfg.RustFSSecretKey)
 
 	tokenSvc := service.NewTokenService(
 		tokenRepo, refreshRepo, eventRepo, settingsRepo,
-		adobeClient, bytePlusClient, chatGPTClient, runwayClient,
-		grokClient, oreateClient, dolaClient, customClient, modelRepo.Quotas(),
+		adobeClient, bytePlusClient, chatGPTClient,
+		grokClient, dolaClient, modelRepo.Quotas(),
 	)
 	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient, bytePlusClient, tokenSvc)
 	v1Svc := service.NewV1Service(
 		cfg, modelRepo, credentialSvc, eventRepo, tokenRepo, settingsRepo, concurrencySvc,
-		adobeClient, bytePlusClient, chatGPTClient, runwayClient,
-		grokClient, oreateClient, dolaClient, customClient, objectStore,
+		adobeClient, bytePlusClient, chatGPTClient,
+		grokClient, dolaClient, objectStore,
 	)
 	v1Svc.SetRefresh(refreshSvc)
 	v1Svc.SetBannedWords(bannedRepo)
@@ -141,7 +138,7 @@ func NewApp(ctx context.Context) (*App, error) {
 		BannedWords:    handler.NewBannedWordsHandler(bannedRepo),
 	})
 
-	return &App{Config: cfg, DB: db, Redis: rdb, Engine: engine, oreate: oreateClient, cancel: cancelMaintenance}, nil
+	return &App{Config: cfg, DB: db, Redis: rdb, Engine: engine, cancel: cancelMaintenance}, nil
 }
 
 func (a *App) Close() error {
@@ -149,9 +146,7 @@ func (a *App) Close() error {
 	if a.cancel != nil {
 		a.cancel()
 	}
-	if a.oreate != nil {
-		a.oreate.Close()
-	}
+
 	if a.Redis != nil {
 		if err := a.Redis.Close(); err != nil {
 			firstErr = err
